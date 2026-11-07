@@ -203,10 +203,23 @@ sshpf --check               # 确认配置没写坏
 ## 开发
 
 ```bash
-cargo test                    # 单元 + 集成测试（91 项）
+cargo test                    # 213 单元 + 11 集成
 cargo test --test e2e -- --ignored --test-threads=1   # 真实 sshd 端到端
 cargo clippy --all-targets    # 零警告
+cargo fmt --check             # 格式检查
 ```
+
+测试分布：
+
+| 模块 | 测试数 | 覆盖重点 |
+|---|---|---|
+| `keys` | 33 | 两阶段编辑语义、主机下拉、确认键位、未知键忽略 |
+| `app` | 54 | 就绪判定时序、重试退避、确认门控、过滤与选中 |
+| `config` | 27 | 缺省值、原子写、0600/0700 权限、字段校验、容错 |
+| `ui` | 30 | 1×1 到 40×12 极端尺寸、超长文本、NO_COLOR |
+| `model` | 24 | 三种转发 spec、失败码分类、输入缓冲边界 |
+| `ssh` | 27 | config 解析、合成配置烘焙、stderr 分类 |
+| `tunnel` | 18 | 进程组回收、PDEATHSIG、退出码、端口释放 |
 
 模块分层（每层只依赖上层）：
 
@@ -215,7 +228,8 @@ model   纯数据类型，无 I/O、无 ratatui
 ssh     ~/.ssh/config 发现、ssh 命令构造、stderr 分类
 tunnel  进程监管：spawn / stop / 进程组回收
 config  TOML 持久化（原子写、0600）
-app     状态机：持有转发、消费事件、处理按键
+app     状态机：持有转发、消费事件
+keys    按键分发（从 main 抽出以便单元测试）
 ui      ratatui 渲染（纯函数，无副作用）
 main    CLI、终端生命周期、信号处理
 ```

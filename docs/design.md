@@ -214,3 +214,54 @@ v1 初版是 `ctrl+h` 打开一个居中模态框，实际使用中很难被发�
 - 退出带运行中数量，没有在跑时不提「停止」
 
 对话框高度按文案宽度自适应（提示可能折行），避免出现大片空白。
+
+## 11. 测试策略
+
+### 为什么把按键分发搬出 main.rs
+
+`main.rs` 原本承载了约 530 行按键处理（每个 overlay 一个 handler）。二进制
+crate 里的私有函数无法被 `tests/` 下的集成测试调用，只能靠 pty 驱动真实 TUI
+来验证 —— 慢、脆、且抓不到具体分支。
+
+现在这些 handler 在 `src/keys.rs`（lib 内），签名统一是
+`fn(app: &mut App, key: KeyEvent)`，本身无副作用，于是可以像纯函数一样测：
+构造 `App`（`App::new` 不 spawn 任何进程）、喂一个 `KeyEvent`、断言 `App` 状态。
+`main.rs` 只剩终端生命周期与事件循环。
+
+### 覆盖重点
+
+优先测「错了会静默出问题」的地方，而不是追求行覆盖率：
+
+- **时序类**：ssh 的退出事件可能早于 stderr 最后几行到达，失败分类依赖
+  `StderrClosed`。测试直接调 `on_exit` / `on_line` 验证状态迁移。
+- **判定类**：`-L` 必须见过 listening 行才算就绪（防 ProxyJump 假就绪）、
+  `-R` 只认 `remote forward success`。这两个是最容易被"优化"掉的逻辑。
+- **门控类**：确认框必须在动作之前弹出，且确认前不得产生任何副作用。
+  表驱动穷举 6 类风险操作，逐项断言。
+- **边界类**：1×1 终端、4000 字符的行、CJK 宽度、空配置、损坏的状态文件、
+  越界的选中索引。这些在真实使用中一定会遇到，且往往直接 panic。
+
+### 变异测试验证有效性
+
+补齐测试后，故意改坏关键逻辑，确认测试会变红。以下变异全部被捕获：
+
+| 变异 | 捕获它的测试 |
+|---|---|
+| 交换 `-R` 的 forward_spec 参数顺序 | `forward_spec_for_each_kind` |
+| 配置权限从 0600 改成 0644（两处都改） | `save_is_0600` |
+| `-L` 就绪不再要求 listening 行 | `local_ready_requires_listening_line_first` |
+| `-R` 就绪退化为只看 Entering | `remote_ready_requires_explicit_success_marker` |
+| 停用不弹确认直接执行 | `all_risky_operations_ask_first` + `space_stops_only_after_confirmation` |
+| 删除不弹确认直接执行 | 4 个测试同时失败 |
+| 让 `clamp_selection` 失效 | `selection_survives_a_filter_that_shrinks_the_list` |
+
+变异测试也纠正了一个误解：早期一次"变异存活"其实是我的 `sed` 没匹配上，
+用 Python 精确替换后才真正生效。**验证测试本身有效，比增加测试数量更重要。**
+
+### 补测过程中发现的真实缺陷
+
+1. **表单导航态按 `esc` 静默丢失输入** —— 上一轮加确认时只改了编辑态分支，
+   导航态仍直接 `close_overlay()`。这个分支恰好是用户按一次 `esc` 就会走到的。
+2. **过滤后 `selected` 越界** —— 收窄过滤条件后索引可能指向不存在的行，
+   而 `select_next` 只在"未越界"时前进，导致选中行消失、操作落空。
+   修法是加 `clamp_selection()` 并在移动前先夹紧。
