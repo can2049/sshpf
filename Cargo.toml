@@ -23,21 +23,16 @@ anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 crossterm = "0.29"
 dirs = "7"
+hmac = "0.13"
 libc = "0.2"
 ratatui = "0.30"
+russh = { version = "0.65.1", default-features = false, features = ["ring", "flate2", "rsa"] }
 serde = { version = "1", features = ["derive"] }
+sha1 = "0.11"
 signal-hook = "0.4"
+ssh2-config = "=0.9.0"
+tokio = { version = "1.54.1", default-features = false, features = ["rt", "net", "io-util", "time", "sync", "macros"] }
 toml = "1"
-
-[target.'cfg(windows)'.dependencies]
-# Job Objects give Windows the equivalent of a Unix process group plus
-# PR_SET_PDEATHSIG: closing the job handle kills the whole child tree.
-windows-sys = { version = "0.61", features = [
-    "Win32_Foundation",
-    "Win32_Security",
-    "Win32_System_JobObjects",
-    "Win32_System_Threading",
-] }
 
 [dev-dependencies]
 tempfile = "3"

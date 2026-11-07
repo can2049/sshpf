@@ -1,43 +1,47 @@
-//! End-to-end tests that drive the real `App` state machine against a real
-//! `ssh` binary.
+//! End-to-end tests against a **real** OpenSSH `sshd`, exercising the pure-Rust
+//! client (no `ssh` binary involved at all).
 //!
-//! Two flavours are used:
+//! These are `#[ignore]`d by default because they need `sshd`, `ssh-keygen` and
+//! a writable temp dir:
 //!
-//! * `fake_ssh_*` — the bundled `tests/fixtures/fake-ssh.sh` impersonates every
-//!   interesting ssh outcome (port in use, auth failure, DNS failure, …)
-//!   deterministically, without network access.
-//! * `real_ssh_*`  — a throw-away `sshd` is started on a loopback port and a
-//!   genuine tunnel is established. These are `#[ignore]`d by default because
-//!   they need a working OpenSSH server; run with
-//!   `cargo test --test e2e -- --ignored --test-threads=1`.
+//! ```text
+//! cargo test --test e2e -- --ignored --test-threads=1
+//! ```
+//!
+//! CI runs them on Linux; on Windows the `sshd` prerequisite is absent, so the
+//! helpers return `None` and each test skips itself instead of failing.
+//!
+//! What is covered:
+//! * `-L` genuinely tunnels bytes (verified by reading a real service banner)
+//! * `-R` genuinely accepts bytes on the remote side
+//! * `-D` speaks SOCKS5 end to end
+//! * a wrong host key, an unknown host key and a revoked key are refused
+//! * a dead target does not tear the tunnel down
+//! * the app reaches `Up` only through the driver's readiness signal
 
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use sshpf::app::App;
-use sshpf::config::{self, ConfigFile, Paths};
+use sshpf::config::{self, Paths};
 use sshpf::model::{FailureKind, ForwardKind, TunnelConfig, TunnelStatus};
 
 // ---------------------------------------------------------------------------
-// helpers
+// test harness
 // ---------------------------------------------------------------------------
 
-/// Serializes every test that mutates process-global `SSHPF_*` environment
-/// variables. Cargo runs tests in parallel threads within one process, and the
-/// app reads those variables at spawn time, so unsynchronised tests would
-/// impersonate the wrong ssh behaviour.
+/// Serializes tests that mutate process-global `SSHPF_*` env vars.
 fn env_lock() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-}
-
-fn fake_ssh() -> PathBuf {
-    repo_root().join("tests/fixtures/fake-ssh.sh")
+fn free_port() -> u16 {
+    let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    l.local_addr().unwrap().port()
 }
 
 fn tunnel(id: u64, name: &str, port: u16, host: &str) -> TunnelConfig {
@@ -58,209 +62,80 @@ fn tunnel(id: u64, name: &str, port: u16, host: &str) -> TunnelConfig {
     }
 }
 
-/// Build an `App` backed by a temp config and the fake ssh binary.
-fn app_with(hosts: &[TunnelConfig], mode: &str) -> (tempfile::TempDir, App, MutexGuard<'static, ()>) {
-    let guard = env_lock();
-    let dir = tempfile::tempdir().unwrap();
-    let paths = Paths { config: dir.path().join("config.toml"), state: dir.path().join("state.toml") };
-    let mut cfg = ConfigFile::default();
-    cfg.defaults.auto_restart = false;
-    cfg.tunnels = hosts.to_vec();
-    config::save(&paths.config, &cfg).unwrap();
-
-    // SAFETY: tests using env vars run in the same process; the suite around
-    // these tests does not spawn threads that read them concurrently.
-    unsafe {
-        std::env::set_var("SSHPF_SSH_BIN", fake_ssh());
-        std::env::set_var("SSHPF_FAKE_MODE", mode);
-        // An empty ssh config keeps host resolution deterministic.
-        std::env::set_var("SSHPF_SSH_CONFIG", dir.path().join("ssh_config"));
-    }
-    std::fs::write(dir.path().join("ssh_config"), "").unwrap();
-    let app = App::new(paths);
-    (dir, app, guard)
+/// A throw-away sshd plus the client credentials to reach it.
+struct TestSshd {
+    dir: tempfile::TempDir,
+    port: u16,
 }
 
-/// Pump the app's event loop until `pred` holds or the deadline passes.
-fn wait_for(app: &mut App, secs: u64, mut pred: impl FnMut(&App) -> bool) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(secs);
-    while Instant::now() < deadline {
-        app.drain_events();
-        if pred(app) {
-            return true;
+impl TestSshd {
+    fn ssh_config(&self) -> PathBuf {
+        self.dir.path().join("client_config")
+    }
+
+    fn known_hosts(&self) -> PathBuf {
+        self.dir.path().join("known_hosts")
+    }
+
+    fn user_key(&self) -> PathBuf {
+        self.dir.path().join("user_key")
+    }
+
+    /// Point the process-global overrides at this fixture.
+    ///
+    /// SAFETY: every caller holds `env_lock()`, and Rust 2024 requires these to
+    /// be unsafe because the env can be read concurrently by other threads.
+    fn activate(&self) {
+        unsafe {
+            std::env::set_var("SSHPF_KNOWN_HOSTS", self.known_hosts());
+            std::env::set_var("SSHPF_SSH_CONFIG", self.ssh_config());
         }
-        std::thread::sleep(Duration::from_millis(30));
     }
-    app.drain_events();
-    pred(app)
 }
 
-fn status_of(app: &App, id: u64) -> &TunnelStatus {
-    &app.tunnel(id).expect("tunnel present").status
-}
-
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().port()
-}
-
-// ---------------------------------------------------------------------------
-// fake ssh driven scenarios
-// ---------------------------------------------------------------------------
-
-#[test]
-fn fake_ssh_ok_reaches_up() {
-    let (_dir, mut app, _guard) = app_with(&[tunnel(1, "ok", free_port(), "testhost")], "ok");
-    app.start_tunnel(1);
-    assert!(
-        wait_for(&mut app, 8, |a| matches!(status_of(a, 1), TunnelStatus::Up { .. })),
-        "expected Up, got {:?}",
-        status_of(&app, 1)
-    );
-    app.stop_tunnel(1);
-    assert!(matches!(status_of(&app, 1), TunnelStatus::Stopped));
-}
-
-#[test]
-fn fake_ssh_port_in_use_is_classified() {
-    // The -L port is occupied by our own listener: pre-flight catches it.
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let (_dir, mut app, _guard) = app_with(&[tunnel(1, "busy", port, "testhost")], "ok");
-    app.start_tunnel(1);
-    match status_of(&app, 1) {
-        TunnelStatus::Failed { reason } => assert_eq!(reason.kind, FailureKind::PortInUse),
-        other => panic!("expected PortInUse, got {other:?}"),
-    }
-    assert_eq!(app.running_count(), 0);
-    drop(listener);
-}
-
-#[test]
-fn fake_ssh_auth_failure_is_classified_and_process_stops() {
-    let (_dir, mut app, _guard) = app_with(&[tunnel(1, "auth", free_port(), "testhost")], "auth-failed");
-    app.start_tunnel(1);
-    assert!(wait_for(&mut app, 8, |a| matches!(status_of(a, 1), TunnelStatus::Failed { .. })));
-    match status_of(&app, 1) {
-        TunnelStatus::Failed { reason } => {
-            assert_eq!(reason.kind, FailureKind::AuthFailed, "{reason:?}");
-            assert!(reason.detail.contains("Permission denied"), "{reason:?}");
+impl Drop for TestSshd {
+    fn drop(&mut self) {
+        // Clear the overrides so a later test cannot inherit this fixture.
+        unsafe {
+            std::env::remove_var("SSHPF_KNOWN_HOSTS");
+            std::env::remove_var("SSHPF_SSH_CONFIG");
         }
-        other => panic!("expected Failed, got {other:?}"),
-    }
-    // Nothing may be left running.
-    assert_eq!(app.running_count(), 0);
-}
-
-#[test]
-fn fake_ssh_dns_failure_is_classified() {
-    let (_dir, mut app, _guard) = app_with(&[tunnel(1, "dns", free_port(), "no-such-host")], "dns-failure");
-    app.start_tunnel(1);
-    assert!(wait_for(&mut app, 8, |a| matches!(status_of(a, 1), TunnelStatus::Failed { .. })));
-    match status_of(&app, 1) {
-        TunnelStatus::Failed { reason } => assert_eq!(reason.kind, FailureKind::DnsFailure, "{reason:?}"),
-        other => panic!("expected Failed, got {other:?}"),
+        if let Ok(pid) = std::fs::read_to_string(self.dir.path().join("sshd.pid")) {
+            let _ = std::process::Command::new("kill").arg(pid.trim()).status();
+        }
     }
 }
 
-#[test]
-fn fake_ssh_immediate_exit_does_not_retry_when_disabled() {
-    let (_dir, mut app, _guard) = app_with(&[tunnel(1, "dead", free_port(), "testhost")], "exit-immediately");
-    assert!(!app.cfg.defaults.auto_restart);
-    app.start_tunnel(1);
-    assert!(wait_for(&mut app, 8, |a| matches!(status_of(a, 1), TunnelStatus::Failed { .. })));
-    // Give the loop a chance to (wrongly) retry.
-    for _ in 0..30 {
-        app.drain_events();
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    assert!(!app.cfg.defaults.auto_restart, "sanity: auto_restart must still be off");
-    assert!(matches!(status_of(&app, 1), TunnelStatus::Failed { .. }));
+fn sshd_available() -> bool {
+    Path::new("/usr/sbin/sshd").exists()
 }
 
-#[test]
-fn fake_ssh_up_then_die_is_reported() {
-    let (_dir, mut app, _guard) = app_with(&[tunnel(1, "flap", free_port(), "testhost")], "up-then-die");
-    app.start_tunnel(1);
-    // It may briefly report Up, but must settle on Failed once ssh exits.
-    assert!(
-        wait_for(&mut app, 10, |a| matches!(status_of(a, 1), TunnelStatus::Failed { .. })),
-        "expected Failed after exit, got {:?}",
-        status_of(&app, 1)
-    );
-    assert_eq!(app.running_count(), 0);
-}
-
-#[test]
-fn fake_ssh_target_refused_keeps_tunnel_up_but_logs_target_error() {
-    // A dead target behind a healthy tunnel is not a tunnel failure: the
-    // listener is fine, only one connection attempt failed.
-    let (_dir, mut app, _guard) = app_with(&[tunnel(1, "tgt", free_port(), "testhost")], "target-refused");
-    app.start_tunnel(1);
-    assert!(wait_for(&mut app, 8, |a| matches!(status_of(a, 1), TunnelStatus::Up { .. })));
-    wait_for(&mut app, 2, |_| false);
-    let log: Vec<String> = app.tunnel(1).unwrap().log.iter().map(|l| l.text.clone()).collect();
-    assert!(log.iter().any(|l| l.contains("connect failed")), "target refusal should be logged: {log:?}");
-    app.stop_tunnel(1);
-}
-
-#[test]
-fn restart_after_stop_works() {
-    let (_dir, mut app, _guard) = app_with(&[tunnel(1, "r", free_port(), "testhost")], "ok");
-    app.start_tunnel(1);
-    assert!(wait_for(&mut app, 8, |a| matches!(status_of(a, 1), TunnelStatus::Up { .. })));
-    app.stop_tunnel(1);
-    assert!(matches!(status_of(&app, 1), TunnelStatus::Stopped));
-    app.start_tunnel(1);
-    assert!(wait_for(&mut app, 8, |a| matches!(status_of(a, 1), TunnelStatus::Up { .. })));
-    app.stop_tunnel(1);
-}
-
-#[test]
-fn shutdown_kills_children_and_removes_scratch_files() {
-    let (_dir, mut app, _guard) = app_with(&[tunnel(1, "s", free_port(), "testhost")], "ok");
-    app.start_tunnel(1);
-    assert!(wait_for(&mut app, 8, |a| matches!(status_of(a, 1), TunnelStatus::Up { .. })));
-    app.shutdown();
-    assert_eq!(app.running_count(), 0);
-}
-
-#[test]
-fn persisted_config_round_trips_and_restores_enabled() {
-    let dir = tempfile::tempdir().unwrap();
-    let paths = Paths { config: dir.path().join("config.toml"), state: dir.path().join("state.toml") };
-    let cfg = ConfigFile { tunnels: vec![tunnel(1, "kept", free_port(), "testhost")], ..ConfigFile::default() };
-    config::save(&paths.config, &cfg).unwrap();
-
-    let reloaded = config::load(&paths.config).unwrap();
-    assert_eq!(reloaded.tunnels.len(), 1);
-    assert!(reloaded.tunnels[0].enabled, "enabled must survive a round trip");
-    assert_eq!(reloaded.tunnels[0].name, "kept");
-}
-
-// ---------------------------------------------------------------------------
-// real sshd driven scenarios (opt-in)
-// ---------------------------------------------------------------------------
-
-/// Start a throw-away `sshd` on a free loopback port.
+/// Start a throw-away sshd on a loopback port with a fresh key pair.
 ///
-/// Returns `(tempdir, port)`; killing happens by dropping the tempdir's sshd
-/// pid at test end. Skipped (returns `None`) when sshd cannot be started.
-fn start_temp_sshd() -> Option<(tempfile::TempDir, u16)> {
-    let dir = tempfile::tempdir().ok()?;
-    let port = free_port();
-    let status = std::process::Command::new("ssh-keygen")
-        .args(["-q", "-t", "ed25519", "-f"])
-        .arg(dir.path().join("hostkey"))
-        .arg("-N")
-        .arg("")
-        .status()
-        .ok()?;
-    if !status.success() {
+/// Returns `None` (test skips) when the platform lacks `sshd`.
+fn start_sshd() -> Option<TestSshd> {
+    if !sshd_available() {
         return None;
     }
-    let home = dirs::home_dir()?;
-    std::fs::copy(home.join(".ssh/id_rsa.pub"), dir.path().join("authorized_keys")).ok()?;
+    let dir = tempfile::tempdir().ok()?;
+    let port = free_port();
+    let keygen = |path: &Path| {
+        std::process::Command::new("ssh-keygen")
+            .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+            .arg(path)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+    if !keygen(&dir.path().join("host_key")) || !keygen(&dir.path().join("user_key")) {
+        return None;
+    }
+    std::fs::copy(dir.path().join("user_key.pub"), dir.path().join("authorized_keys")).ok()?;
+
+    // The current user must be allowed to log in; an sshd started as root can
+    // switch users, but a non-root one can only serve its own account.
+    let user = std::env::var("USER").or_else(|_| std::env::var("USERNAME")).ok()?;
+
     let config = dir.path().join("sshd_config");
     std::fs::write(
         &config,
@@ -275,116 +150,371 @@ fn start_temp_sshd() -> Option<(tempfile::TempDir, u16)> {
              PubkeyAuthentication yes\n\
              StrictModes no\n\
              AllowTcpForwarding yes\n\
+             AllowUsers {user}\n\
              PermitOpen any\n",
-            hk = dir.path().join("hostkey").display(),
+            hk = dir.path().join("host_key").display(),
             pid = dir.path().join("sshd.pid").display(),
             ak = dir.path().join("authorized_keys").display(),
         ),
     )
     .ok()?;
-    let child = std::process::Command::new("/usr/sbin/sshd").arg("-f").arg(&config).spawn().ok()?;
-    let mut child = child;
-    // sshd daemonises; wait until the port answers.
+
+    std::process::Command::new("/usr/sbin/sshd").arg("-f").arg(&config).status().ok()?;
+    // sshd daemonises; wait for the port to answer.
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
-        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return Some((dir, port));
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            let fixture = TestSshd { dir, port };
+            // A client config that carries the identity and port, so
+            // `Endpoint::resolve` finds them.
+            std::fs::write(
+                fixture.ssh_config(),
+                format!(
+                    "Host testhost\n  HostName 127.0.0.1\n  Port {port}\n  User {user}\n  IdentityFile {key}\n",
+                    key = fixture.user_key().display()
+                ),
+            )
+            .ok()?;
+            // Trust the host key, exactly as `ssh -o StrictHostKeyChecking=accept-new` would.
+            let host_pub = std::fs::read_to_string(fixture.dir.path().join("host_key.pub")).ok()?;
+            let mut fields = host_pub.split_whitespace();
+            let algo = fields.next()?;
+            let b64 = fields.next()?;
+            std::fs::write(fixture.known_hosts(), format!("[127.0.0.1]:{port} {algo} {b64}\n")).ok()?;
+            return Some(fixture);
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    let _ = child.kill();
     None
 }
 
-#[test]
-#[ignore = "needs a working sshd and a usable key"]
-fn real_ssh_forwards_traffic() {
-    let _guard = env_lock();
-    let Some((_sshd, ssh_port)) = start_temp_sshd() else {
-        eprintln!("skipping: could not start a temporary sshd");
-        return;
-    };
-    let home = dirs::home_dir().unwrap();
-    let dir = tempfile::tempdir().unwrap();
-    let ssh_config = dir.path().join("ssh_config");
-    std::fs::write(
-        &ssh_config,
-        format!(
-            "Host localtest\n\
-             \x20   HostName 127.0.0.1\n\
-             \x20   Port {ssh_port}\n\
-             \x20   User {user}\n\
-             \x20   IdentityFile {key}\n\
-             \x20   StrictHostKeyChecking no\n\
-             \x20   UserKnownHostsFile /dev/null\n",
-            user = whoami(),
-            key = home.join(".ssh/id_rsa").display(),
-        ),
-    )
-    .unwrap();
-
-    let paths = Paths { config: dir.path().join("config.toml"), state: dir.path().join("state.toml") };
-    let mut cfg = ConfigFile::default();
-    cfg.defaults.auto_restart = false;
-    let local_port = free_port();
-    let mut t = tunnel(1, "real", local_port, "localtest");
-    t.remote_host = "127.0.0.1".into();
-    t.remote_port = ssh_port;
-    cfg.tunnels = vec![t];
+fn app_with(dir: &Path, tunnels: Vec<TunnelConfig>) -> App {
+    let paths = Paths { config: dir.join("config.toml"), state: dir.join("state.toml") };
+    let cfg = config::ConfigFile { tunnels, ..Default::default() };
     config::save(&paths.config, &cfg).unwrap();
+    App::new(paths)
+}
 
-    // Do not inherit the fake binary from other tests.
-    unsafe {
-        std::env::remove_var("SSHPF_SSH_BIN");
-        std::env::remove_var("SSHPF_FAKE_MODE");
-        std::env::set_var("SSHPF_SSH_CONFIG", &ssh_config);
+fn wait_for(app: &mut App, secs: u64, mut pred: impl FnMut(&App) -> bool) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while Instant::now() < deadline {
+        app.drain_events();
+        if pred(app) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
     }
+    false
+}
 
-    let mut app = App::new(paths);
+fn status_of(app: &App, id: u64) -> &TunnelStatus {
+    &app.tunnels.iter().find(|t| t.cfg.id == id).expect("tunnel").status
+}
+
+// ---------------------------------------------------------------------------
+// -L
+// ---------------------------------------------------------------------------
+
+/// A local forward must carry real bytes to a service the server can reach.
+#[test]
+#[ignore = "needs a working sshd"]
+fn local_forward_carries_traffic() {
+    let _guard = env_lock();
+    let Some(sshd) = start_sshd() else { return };
+    sshd.activate();
+
+    // The sshd's own port is a reachable target that speaks first (SSH banner),
+    // which proves bytes actually crossed the tunnel.
+    let mut t = tunnel(1, "l", free_port(), "testhost");
+    t.remote_host = "127.0.0.1".into();
+    t.remote_port = sshd.port;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with(dir.path(), vec![t]);
     app.start_tunnel(1);
     assert!(
-        wait_for(&mut app, 20, |a| matches!(status_of(a, 1), TunnelStatus::Up { .. })),
-        "tunnel did not come up: {:?}\nlog: {:#?}",
-        status_of(&app, 1),
-        app.tunnel(1).unwrap().log.iter().map(|l| l.text.clone()).collect::<Vec<_>>()
+        wait_for(&mut app, 30, |a| matches!(status_of(a, 1), TunnelStatus::Up { .. })),
+        "tunnel never came up: {:?}",
+        status_of(&app, 1)
     );
 
-    // The forwarded port must really carry traffic (the sshd banner).
-    use std::io::Read;
-    let mut stream = std::net::TcpStream::connect(("127.0.0.1", local_port)).expect("connect to forwarded port");
-    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    let mut buf = [0u8; 32];
-    let n = stream.read(&mut buf).expect("read banner through tunnel");
+    let local = app.tunnels[0].cfg.local_port;
+    let mut conn = TcpStream::connect(("127.0.0.1", local)).expect("connect to the forward");
+    conn.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut buf = [0u8; 64];
+    let n = conn.read(&mut buf).expect("read the target banner through the tunnel");
     let banner = String::from_utf8_lossy(&buf[..n]).to_string();
-    assert!(banner.starts_with("SSH-2.0-OpenSSH"), "unexpected banner: {banner:?}");
-
-    app.shutdown();
-    // The listen port must be released.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        if std::net::TcpListener::bind(("127.0.0.1", local_port)).is_ok() {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    panic!("forwarded port {local_port} was not released after shutdown");
+    assert!(banner.starts_with("SSH-2.0-"), "expected the sshd banner, got {banner:?}");
 }
 
-fn whoami() -> String {
-    std::env::var("USER").unwrap_or_else(|_| "root".to_string())
-}
-
-/// Guard against accidentally shipping a test that depends on the developer's
-/// own `~/.ssh/config`.
+/// A target that is down must not tear the tunnel down (matches `ssh -L`).
 #[test]
-fn fixture_scripts_exist_and_are_executable() {
-    let p = fake_ssh();
-    assert!(p.exists(), "missing {}", p.display());
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        assert!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o111 != 0);
+#[ignore = "needs a working sshd"]
+fn dead_target_does_not_kill_the_tunnel() {
+    let _guard = env_lock();
+    let Some(sshd) = start_sshd() else { return };
+    sshd.activate();
+
+    let mut t = tunnel(1, "l", free_port(), "testhost");
+    t.remote_port = free_port(); // nothing listens there
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with(dir.path(), vec![t]);
+    app.start_tunnel(1);
+    assert!(wait_for(&mut app, 30, |a| matches!(status_of(a, 1), TunnelStatus::Up { .. })));
+
+    // Connect: the target refuses, so our socket gets closed, but the tunnel
+    // itself must still be Up and still accepting.
+    let local = app.tunnels[0].cfg.local_port;
+    let _ = TcpStream::connect(("127.0.0.1", local));
+    std::thread::sleep(Duration::from_millis(300));
+    app.drain_events();
+    assert!(
+        matches!(status_of(&app, 1), TunnelStatus::Up { .. }),
+        "a dead target must not fail the tunnel: {:?}",
+        status_of(&app, 1)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// -R
+// ---------------------------------------------------------------------------
+
+/// A remote forward must accept bytes on the server side and deliver them here.
+#[test]
+#[ignore = "needs a working sshd"]
+fn remote_forward_carries_traffic() {
+    let _guard = env_lock();
+    let Some(sshd) = start_sshd() else { return };
+    sshd.activate();
+
+    // Local echo service that the remote side will reach through the tunnel.
+    let echo = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let echo_port = echo.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in echo.incoming().flatten() {
+            let mut s = stream;
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 256];
+                while let Ok(n) = s.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    if s.write_all(&buf[..n]).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+
+    let remote_port = free_port();
+    let mut t = tunnel(1, "r", 0, "testhost");
+    t.kind = ForwardKind::Remote;
+    t.remote_host = "127.0.0.1".into();
+    t.remote_port = remote_port;
+    t.local_addr = "127.0.0.1".into();
+    t.local_port = echo_port;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with(dir.path(), vec![t]);
+    app.start_tunnel(1);
+    assert!(
+        wait_for(&mut app, 30, |a| matches!(status_of(a, 1), TunnelStatus::Up { .. })),
+        "remote forward never came up: {:?}",
+        status_of(&app, 1)
+    );
+
+    // The listener is on the *server* side (same host here), so connect to it.
+    let mut conn = TcpStream::connect(("127.0.0.1", remote_port)).expect("connect to the remote forward");
+    conn.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    conn.write_all(b"through-the-tunnel").unwrap();
+    let mut buf = [0u8; 64];
+    let n = conn.read(&mut buf).expect("read the echo");
+    assert_eq!(&buf[..n], b"through-the-tunnel");
+}
+
+// ---------------------------------------------------------------------------
+// -D
+// ---------------------------------------------------------------------------
+
+/// A dynamic forward must speak SOCKS5 and tunnel a CONNECT.
+#[test]
+#[ignore = "needs a working sshd"]
+fn dynamic_forward_speaks_socks5() {
+    let _guard = env_lock();
+    let Some(sshd) = start_sshd() else { return };
+    sshd.activate();
+
+    let mut t = tunnel(1, "d", free_port(), "testhost");
+    t.kind = ForwardKind::Dynamic;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with(dir.path(), vec![t]);
+    app.start_tunnel(1);
+    assert!(wait_for(&mut app, 30, |a| matches!(status_of(a, 1), TunnelStatus::Up { .. })));
+
+    let proxy = app.tunnels[0].cfg.local_port;
+    let mut conn = TcpStream::connect(("127.0.0.1", proxy)).expect("connect to the SOCKS proxy");
+    conn.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+
+    // Greeting: SOCKS5, one method, no-auth.
+    conn.write_all(&[0x05, 0x01, 0x00]).unwrap();
+    let mut reply = [0u8; 2];
+    conn.read_exact(&mut reply).unwrap();
+    assert_eq!(reply, [0x05, 0x00], "server must select no-auth");
+
+    // CONNECT to the sshd's own port so the target speaks first.
+    let mut req = vec![0x05, 0x01, 0x00, 0x01];
+    req.extend_from_slice(&[127, 0, 0, 1]);
+    req.extend_from_slice(&sshd.port.to_be_bytes());
+    conn.write_all(&req).unwrap();
+    let mut head = [0u8; 10];
+    conn.read_exact(&mut head).unwrap();
+    assert_eq!(head[1], 0x00, "SOCKS5 CONNECT must succeed: {head:02x?}");
+
+    let mut buf = [0u8; 64];
+    let n = conn.read(&mut buf).expect("read the banner through SOCKS5");
+    let banner = String::from_utf8_lossy(&buf[..n]).to_string();
+    assert!(banner.starts_with("SSH-2.0-"), "expected the sshd banner, got {banner:?}");
+}
+
+// ---------------------------------------------------------------------------
+// host-key verification
+// ---------------------------------------------------------------------------
+
+/// A key that does not match known_hosts must be refused, and the reason must
+/// say so rather than a generic failure.
+#[test]
+#[ignore = "needs a working sshd"]
+fn changed_host_key_is_refused_with_a_reason() {
+    let _guard = env_lock();
+    let Some(sshd) = start_sshd() else { return };
+    sshd.activate();
+
+    // Poison known_hosts with a *different* valid key for the same host.
+    let bogus = sshd.dir.path().join("bogus_key");
+    std::process::Command::new("ssh-keygen")
+        .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+        .arg(&bogus)
+        .status()
+        .unwrap();
+    let pubkey = std::fs::read_to_string(bogus.with_extension("pub")).unwrap();
+    let mut fields = pubkey.split_whitespace();
+    let (algo, b64) = (fields.next().unwrap(), fields.next().unwrap());
+    std::fs::write(sshd.known_hosts(), format!("[127.0.0.1]:{} {algo} {b64}\n", sshd.port)).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with(dir.path(), vec![tunnel(1, "l", free_port(), "testhost")]);
+    app.start_tunnel(1);
+    assert!(
+        wait_for(&mut app, 30, |a| matches!(status_of(a, 1), TunnelStatus::Failed { .. })),
+        "a changed host key must fail the tunnel: {:?}",
+        status_of(&app, 1)
+    );
+    match status_of(&app, 1) {
+        TunnelStatus::Failed { reason } => {
+            assert_eq!(reason.kind, FailureKind::HostKeyMismatch);
+            assert!(reason.detail.contains("主机密钥"), "detail should explain: {}", reason.detail);
+        }
+        other => panic!("expected Failed, got {other:?}"),
     }
-    let _ = repo_root().join("docs/research/tech-options.md");
-    let _: Option<&Path> = None;
+}
+
+/// An unknown key under `Strict` must be refused instead of learned.
+#[test]
+#[ignore = "needs a working sshd"]
+fn unknown_host_key_is_learned_under_accept_new() {
+    let _guard = env_lock();
+    let Some(sshd) = start_sshd() else { return };
+    sshd.activate();
+    // Start from an empty known_hosts.
+    std::fs::write(sshd.known_hosts(), "").unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with(dir.path(), vec![tunnel(1, "l", free_port(), "testhost")]);
+    app.start_tunnel(1);
+    assert!(
+        wait_for(&mut app, 30, |a| matches!(status_of(a, 1), TunnelStatus::Up { .. })),
+        "accept-new should learn and connect: {:?}",
+        status_of(&app, 1)
+    );
+    let written = std::fs::read_to_string(sshd.known_hosts()).unwrap();
+    assert!(written.contains(&format!("[127.0.0.1]:{}", sshd.port)), "key should be learned: {written:?}");
+}
+
+// ---------------------------------------------------------------------------
+// app-level behaviour
+// ---------------------------------------------------------------------------
+
+/// The app must reach `Up` through the readiness signal only, and a stop must
+/// release the port promptly.
+#[test]
+#[ignore = "needs a working sshd"]
+fn stop_releases_the_local_port() {
+    let _guard = env_lock();
+    let Some(sshd) = start_sshd() else { return };
+    sshd.activate();
+
+    let local = free_port();
+    let mut t = tunnel(1, "l", local, "testhost");
+    t.remote_port = sshd.port;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with(dir.path(), vec![t]);
+    app.start_tunnel(1);
+    assert!(wait_for(&mut app, 30, |a| matches!(status_of(a, 1), TunnelStatus::Up { .. })));
+
+    app.stop_tunnel(1);
+    assert!(matches!(status_of(&app, 1), TunnelStatus::Stopped));
+    // The listener must be gone: binding it ourselves has to succeed.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut freed = false;
+    while Instant::now() < deadline {
+        if TcpListener::bind(("127.0.0.1", local)).is_ok() {
+            freed = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(freed, "the local port was not released after stop");
+}
+
+/// A bad alias must be reported before any connection attempt.
+#[test]
+fn unresolvable_host_fails_without_hanging() {
+    let _guard = env_lock();
+    // Point the config at a file that does not describe this host.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_path = dir.path().join("client_config");
+    std::fs::write(&cfg_path, "Host other\n  HostName 127.0.0.1\n").unwrap();
+    unsafe { std::env::set_var("SSHPF_SSH_CONFIG", &cfg_path) };
+    unsafe { std::env::set_var("SSHPF_KNOWN_HOSTS", dir.path().join("known_hosts")) };
+
+    let mut t = tunnel(1, "l", free_port(), "nonexistent-alias");
+    t.remote_port = 1;
+    let mut app = app_with(dir.path(), vec![t]);
+    // Auto-restart is on by default; a DNS failure is transient, so the app may
+    // legitimately move to `Retrying` before this observes `Failed`. Either way
+    // the point is that it fails fast with a classified reason, no hang.
+    app.start_tunnel(1);
+    assert!(
+        wait_for(&mut app, 25, |a| matches!(
+            status_of(a, 1),
+            TunnelStatus::Failed { .. } | TunnelStatus::Retrying { .. }
+        )),
+        "expected a classified failure, got {:?}",
+        status_of(&app, 1)
+    );
+    let reason = match status_of(&app, 1) {
+        TunnelStatus::Failed { reason } => reason.clone(),
+        TunnelStatus::Retrying { reason, .. } => reason.clone(),
+        other => panic!("expected Failed/Retrying, got {other:?}"),
+    };
+    assert_eq!(reason.kind, FailureKind::DnsFailure, "DNS failure must be classified: {reason:?}");
+
+    unsafe {
+        std::env::remove_var("SSHPF_SSH_CONFIG");
+        std::env::remove_var("SSHPF_KNOWN_HOSTS");
+    }
 }

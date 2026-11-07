@@ -25,22 +25,27 @@ SSH 端口转发管理器，命令行 TUI 表格界面。Linux 与 Windows 均�
 
 ## 设计要点
 
-**SSH 连接交给系统 `ssh`，不自己实现 SSH 协议。** 这样 ProxyJump、IdentityFile、ssh-agent、known_hosts、`Include`、`Host *` 通配等语义原生可用，无需重新实现一遍（这是 `ssh2`/`russh` 方案最难补齐的部分，见 `docs/research/tech-options.md`）。
+**SSH 由 Rust 直接实现，不再调用系统 `ssh` 子进程。** 用的是 [`russh`](https://crates.io/crates/russh)（纯 Rust SSH 协议栈）。这样 Linux 和 Windows 走**完全相同的代码路径**，行为一致；而且失败原因来自结构化错误，不再靠正则解析 `ssh -v` 的 stderr 文本。
 
-**主机来自 `~/.ssh/config`，转发条目由本工具管理。** 职责分离：ssh config 负责「怎么连」，sshpf 负责「转发什么」。不会往 `~/.ssh/config` 写入任何内容。
+**主机来自 `~/.ssh/config`，转发条目由本工具管理。** 职责分离：ssh config 负责「怎么连」，sshpf 负责「转发什么」。不会往 `~/.ssh/config` 写入任何内容。`Include`、`Host` 通配、否定、`Host *` 继承、`ProxyJump` 都由 [`ssh2-config`](https://crates.io/crates/ssh2-config) 解析（它名字里的 "ssh2" 有误导性，实际是纯 Rust、零 C 依赖）。
 
-**每条转发 = 一个独立的 `ssh -N` 进程。** 状态清晰、失败原因准确、可独立启停。进程以 `process_group(0)` 启动，停止时 `kill(-pgid)` 连 ProxyJump fork 出的 `ssh -W` 子进程一起收掉；同时设了 `PR_SET_PDEATHSIG`，所以即使 sshpf 被 `SIGKILL` 或 OOM 杀掉，内核也会通知子进程退出，不会留下占着端口的孤儿。
+**每条转发 = 一个后台线程 + 独立的 tokio runtime。** UI 线程保持同步（`crossterm::event::poll(200ms)`），事件通过 `std::sync::mpsc` 回灌，所以界面永不被网络阻塞。三种转发都由 SSH 协议原语实现：
 
-**就绪判定不靠进程存活，靠 ssh 的 debug 输出。** 这是实测踩出来的：
+- `-L`：本地 `TcpListener` + `direct-tcpip` channel
+- `-R`：`tcpip-forward` 请求 + `forwarded-tcpip` 回调
+- `-D`：内置 SOCKS5 服务端（自己写的，约 150 行，含 IPv4/域名/IPv6）
 
-- `-L`/`-D` 认 `Local forwarding listening on …` + `Entering interactive session.`
-- `-R` 必须认 `remote forward success for` —— `Entering interactive session.` 在 `-R` 场景下会**先于**远端监听结果打印，只看它会误判成功。
+**就绪判定不看日志，看真实结果。** `-L`/`-D` 的"就绪"是 `TcpListener::bind` 真的成功了；`-R` 的"就绪"是 `tcpip_forward()` 等到了服务端的协议回复。旧版本靠 stderr 里的 `Entering interactive session.` / `remote forward success for` 判断，有两个实测过的误判场景（ProxyJump 子进程的行会混入、`-R` 的成功标记晚于 `Entering`）——换实现后这类 bug 从根上消失。
 
-**转发被拒绝时主动杀掉进程。** `ssh -N` 在远端拒绝转发（`-R` 端口被占、`-L` 只绑上一半地址族）后仍然活着：会话是通的，但隧道没用。不处理就会留下「界面显示失败、实际有进程占着端口」的假象。
+**主机密钥校验自己实现。** `russh` 自带的 known_hosts 校验实测有缺陷（不支持通配符、Tab 分隔漏判，且 `@revoked` 与正常条目并存时**会放行被吊销的密钥**），所以匹配逻辑自己写：支持 `*`/`?` 通配、`!` 否定、`[host]:port`、`|1|` 哈希条目、`@revoked` 优先拒绝。默认策略 `accept-new`（首次连接自动记录，密钥变更则拒绝）。
+
+**失败原因分类来自结构化错误。** 不再解析 stderr：`ConnectionRefused`/`Timeout`/`AddrInUse`/`PermissionDenied`/`RequestDenied` 等直接来自 `russh::Error` 变体。主机密钥被拒时会明确显示是"已改变"还是"已吊销"，并指向 known_hosts 的行号。
+
+**转发被拒绝时主动停止会话。** 会话建立但转发请求被拒（`-R` 端口被占等）时，隧道是没用的；主动停掉，界面和现实才一致。
 
 ## 安装
 
-从源码构建（需要 Rust 1.88+）：
+从源码构建（需要 Rust 1.89+）：
 
 ```bash
 git clone https://github.com/can2049/sshpf.git
@@ -55,12 +60,14 @@ install -m755 target/release/sshpf ~/.local/bin/sshpf
 cargo install --git https://github.com/can2049/sshpf
 ```
 
-依赖：OpenSSH 客户端（`ssh` 在 `PATH` 里）。没有其他运行时依赖。
+**运行时零外部依赖**：不再需要系统 `ssh`。认证走 `~/.ssh/config` 里的 `IdentityFile` 或 ssh-agent。
+
+构建期需要 C 工具链（`ring` 加密后端，Windows 上即预装的 MSVC），因为密码学汇编需要编译；产物本身是自包含的。
 
 | 平台 | 状态 | 说明 |
 |---|---|---|
-| Linux | ✅ 完整支持 | 进程组 + `PR_SET_PDEATHSIG` 回收子进程树 |
-| Windows | ✅ 支持 | Job Object 实现同样的进程树回收语义 |
+| Linux | ✅ 完整支持 | 端到端测试跑真实 sshd |
+| Windows | ✅ 支持 | 同一套纯 Rust 代码路径，无需安装 OpenSSH |
 | macOS | ⚠️ 未测试 | 代码走 Unix 分支，预期可用 |
 
 CI 在 `ubuntu-latest` 与 `windows-latest` 上分别编译并运行单元测试。
@@ -190,7 +197,7 @@ ssh_options = []          # 额外 ssh -o 选项，如 ["Compression=yes"]
 note = ""
 ```
 
-**不存任何密码或密钥口令。** 认证完全交给 ssh-agent / IdentityFile。遇到需要密码的主机，`BatchMode` 会让它立即失败并在表格里显示「认证失败」，提示你先配好免密登录——TUI 不会卡在密码提示上。
+**不存任何密码或密钥口令。** 认证只走 `~/.ssh/config` 的 `IdentityFile` 或 ssh-agent（与旧版本的 `BatchMode=yes` 行为一致）。需要密码/2FA 的主机会立即失败并在表格里显示「认证失败」，提示你先配好免密登录——TUI 不会卡在密码提示上。密码与键盘交互登录暂不支持。
 
 ## 失败原因分类
 
@@ -235,19 +242,19 @@ cargo fmt --check             # 格式检查
 | 模块 | 测试数 | 覆盖重点 |
 |---|---|---|
 | `keys` | 33 | 两阶段编辑语义、主机下拉、确认键位、未知键忽略 |
-| `app` | 54 | 就绪判定时序、重试退避、确认门控、过滤与选中 |
+| `app` | 54 | 就绪信号、重试退避、确认门控、过滤与选中 |
 | `config` | 27 | 缺省值、原子写、0600/0700 权限、字段校验、容错 |
 | `ui` | 30 | 1×1 到 40×12 极端尺寸、超长文本、NO_COLOR |
 | `model` | 24 | 三种转发 spec、失败码分类、输入缓冲边界 |
-| `ssh` | 27 | config 解析、合成配置烘焙、stderr 分类 |
-| `tunnel` | 18 | 进程组回收、PDEATHSIG、退出码、端口释放 |
+| `ssh` | 57 | config 解析（含 Match 污染防护）、known_hosts 匹配、SOCKS5、错误分类 |
+| `tunnel` | 10 | 启停、事件顺序、重复启动、停止幂等 |
 
 模块分层（每层只依赖上层）：
 
 ```
 model   纯数据类型，无 I/O、无 ratatui
-ssh     ~/.ssh/config 发现、ssh 命令构造、stderr 分类
-tunnel  进程监管：spawn / stop / 进程组回收
+ssh     ~/.ssh/config 解析、known_hosts 校验、SOCKS5、russh 客户端
+tunnel  隧道线程监管：启动 / 停止 / 事件
 config  TOML 持久化（原子写、0600）
 app     状态机：持有转发、消费事件
 keys    按键分发（从 main 抽出以便单元测试）
@@ -255,15 +262,17 @@ ui      ratatui 渲染（纯函数，无副作用）
 main    CLI、终端生命周期、信号处理
 ```
 
-调研依据：`docs/research/tech-options.md`（技术选型与实测证据）、`docs/research/prior-art.md`（竞品与交互设计）。
+调研依据：`docs/research/pure-rust-ssh-plan.md`（纯 Rust 化的决策与实测）、
+`docs/research/pure-rust-ssh-spike.md`（三种转发的端到端验证）、
+`docs/research/tech-options.md`（早期技术选型）、`docs/research/prior-art.md`（竞品与交互设计）。
 
 ## 已知限制（v1）
 
 - **端口占用反查进程**仅 Linux 可用（依赖 `/proc`）。其它平台该信息显示为空，不影响转发本身。
-- 子进程树回收：Linux 用进程组 + `PR_SET_PDEATHSIG`，Windows 用 Job Object；
+- 隧道既是 tokio task，杀进程即关闭 socket，会话随之结束——不需要单独的孤儿回收机制；
   macOS 走 Unix 分支。
 - 只支持公钥 / ssh-agent 认证，TUI 内不接管密码输入。
-- 不统计流量（`ssh -v` 只在退出时打印一次，实时统计需 `/proc/<pid>/io` 汇总，留待后续）。
+- 不统计流量（需要按 channel 累计字节，留待后续）。
 - 同一主机多条转发各自建连，未做连接复用（ControlMaster 的 `-O forward` 绑定失败仍返回 exit 0，无法可靠判定成败，故不采用）。
 
 ## 许可证
