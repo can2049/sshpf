@@ -1,6 +1,7 @@
 # sshpf
 
 [![CI](https://github.com/can2049/sshpf/actions/workflows/ci.yml/badge.svg)](https://github.com/can2049/sshpf/actions/workflows/ci.yml)
+[![Crates.io](https://img.shields.io/crates/v/sshpf.svg)](https://crates.io/crates/sshpf)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 SSH 端口转发管理器，命令行 TUI 表格界面。Linux 与 Windows 均支持。
@@ -45,7 +46,15 @@ SSH 端口转发管理器，命令行 TUI 表格界面。Linux 与 Windows 均�
 
 ## 安装
 
-从源码构建（需要 Rust 1.89+）：
+从 crates.io 安装（需要 Rust 1.89+）：
+
+```bash
+cargo install sshpf
+```
+
+预编译二进制可从 [GitHub Releases](https://github.com/can2049/sshpf/releases) 下载（Linux x86_64 / Windows x86_64）。
+
+从源码构建：
 
 ```bash
 git clone https://github.com/can2049/sshpf.git
@@ -54,7 +63,7 @@ cargo build --release
 install -m755 target/release/sshpf ~/.local/bin/sshpf
 ```
 
-或直接用 cargo 安装：
+也可以直接装 git 上的最新版：
 
 ```bash
 cargo install --git https://github.com/can2049/sshpf
