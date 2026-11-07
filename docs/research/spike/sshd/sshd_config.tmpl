@@ -1,0 +1,16 @@
+Port @PORT@
+ListenAddress 127.0.0.1
+HostKey @DIR@/host_ed25519
+PidFile @DIR@/sshd.pid
+AuthorizedKeysFile @DIR@/authorized_keys
+PasswordAuthentication no
+ChallengeResponseAuthentication no
+UsePAM no
+StrictModes no
+AllowTcpForwarding yes
+GatewayPorts no
+AllowUsers @USER@
+LogLevel VERBOSE
+PrintMotd no
+AllowAgentForwarding no
+X11Forwarding no
