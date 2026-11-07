@@ -265,3 +265,60 @@ crate 里的私有函数无法被 `tests/` 下的集成测试调用，只能靠 
 2. **过滤后 `selected` 越界** —— 收窄过滤条件后索引可能指向不存在的行，
    而 `select_next` 只在"未越界"时前进，导致选中行消失、操作落空。
    修法是加 `clamp_selection()` 并在移动前先夹紧。
+
+## 12. Windows 支持
+
+### 差异只有三处
+
+移植时先做了一件事：统计到底有多少代码是 OS 专有的。结果是生产代码里只有
+三处，合计不到 60 行：
+
+| 关注点 | Unix | Windows |
+|---|---|---|
+| 进程树回收 | 进程组 + `kill(-pgid)` | Job Object + `TerminateJobObject` |
+| 父进程死亡 | `PR_SET_PDEATHSIG` | `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` |
+| 文件私密性 | `chmod 0600/0700` | 用户配置文件 ACL 继承（无需操作）|
+| 可执行判定 | `+x` 位 | 扩展名 `.exe/.cmd/.bat/.com` |
+
+因此没有做「双份实现」，而是加了一层 `src/sys/`：平台无关代码一行不改，
+两个平台各自实现同名函数。其余 95% 的代码两个平台共用同一份。
+
+### Job Object 为什么够用
+
+它不是「凑合的替代品」。Unix 侧需要两套机制（进程组 + PDEATHSIG），
+Windows 的 Job Object 一套就覆盖了：
+
+* `TerminateJobObject` 杀掉 job 内所有进程——包括 ProxyJump fork 出的
+  `ssh -W` 子进程；
+* `KILL_ON_JOB_CLOSE` 在句柄关闭时杀掉整棵进程树——正好对应「sshpf 被
+  SIGKILL/OOM 杀掉，析构函数没跑」的场景。
+
+每条隧道一个 job，保持了与 Unix 一致的「可独立停止」粒度。
+
+### 测试夹具的坑（CI 抓到的真实问题）
+
+第一版 Windows CI 失败 7 个测试，原因不是被测代码，而是夹具：假 `ssh` 写成
+`#!/bin/sh` 脚本，Windows 的 `CreateProcess` 直接拒绝执行（`os error 193`）。
+
+改为**测试期用 `rustc` 编译一个几行的 Rust 程序**作为假 ssh/假子进程：
+
+* Rust 必然存在（测试本身在 cargo 下跑）；
+* 产物是原生可执行文件，两个平台都能跑；
+* 比维护两份等价的 sh/cmd 脚本更可读，也不会有「两份实现慢慢漂移」的老问题。
+
+顺带发现一个**真实的实现缺陷**：`sys::windows::pid_is_alive` 原本只判断
+「能否 `OpenProcess` 拿到句柄」，但 Windows 上已终止尚未回收的进程仍可打开句柄，
+于是把死进程报告为存活——陈旧临时目录会永远清不掉。改为
+`GetExitCodeProcess == STILL_ACTIVE`。这个 bug 是 Job Object 测试暴露的，
+在 Linux 上跑再多测试也发现不了。
+
+### 分支保护
+
+`main` 开启了保护，合并必须满足：
+
+* 4 个 CI 检查全绿（`strict: true`，即分支落后也要先 rebase）
+* 至少 1 个 review 批准
+* 禁止强推、禁止删除分支
+* `enforce_admins: true` —— 管理员也不能绕过
+
+实测验证过：CI 全绿但未 review 时，`gh pr merge` 被拒绝。

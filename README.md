@@ -3,7 +3,7 @@
 [![CI](https://github.com/can2049/sshpf/actions/workflows/ci.yml/badge.svg)](https://github.com/can2049/sshpf/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-SSH 端口转发管理器，命令行 TUI 表格界面。Linux 优先（v1），后续可移植 Windows。
+SSH 端口转发管理器，命令行 TUI 表格界面。Linux 与 Windows 均支持。
 
 在不离开终端的情况下查看、新增、启停、删除端口转发，每条转发实时显示状态与失败原因；配置持久化，重启后自动恢复上次启用的条目。
 
@@ -55,7 +55,15 @@ install -m755 target/release/sshpf ~/.local/bin/sshpf
 cargo install --git https://github.com/can2049/sshpf
 ```
 
-依赖：Linux + OpenSSH 客户端（`ssh` 在 `PATH` 里）。没有其他运行时依赖。
+依赖：OpenSSH 客户端（`ssh` 在 `PATH` 里）。没有其他运行时依赖。
+
+| 平台 | 状态 | 说明 |
+|---|---|---|
+| Linux | ✅ 完整支持 | 进程组 + `PR_SET_PDEATHSIG` 回收子进程树 |
+| Windows | ✅ 支持 | Job Object 实现同样的进程树回收语义 |
+| macOS | ⚠️ 未测试 | 代码走 Unix 分支，预期可用 |
+
+CI 在 `ubuntu-latest` 与 `windows-latest` 上分别编译并运行单元测试。
 
 ## 使用
 
@@ -251,7 +259,9 @@ main    CLI、终端生命周期、信号处理
 
 ## 已知限制（v1）
 
-- 仅 Linux（`/proc` 用于端口占用反查、`kill(-pgid)` 用于进程树回收）。
+- **端口占用反查进程**仅 Linux 可用（依赖 `/proc`）。其它平台该信息显示为空，不影响转发本身。
+- 子进程树回收：Linux 用进程组 + `PR_SET_PDEATHSIG`，Windows 用 Job Object；
+  macOS 走 Unix 分支。
 - 只支持公钥 / ssh-agent 认证，TUI 内不接管密码输入。
 - 不统计流量（`ssh -v` 只在退出时打印一次，实时统计需 `/proc/<pid>/io` 汇总，留待后续）。
 - 同一主机多条转发各自建连，未做连接复用（ControlMaster 的 `-O forward` 绑定失败仍返回 exit 0，无法可靠判定成败，故不采用）。
