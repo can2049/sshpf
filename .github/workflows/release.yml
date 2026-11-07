@@ -27,17 +27,30 @@ jobs:
         include:
           - os: ubuntu-latest
             artifact: sshpf-linux-x86_64
-            binary: target/release/sshpf
+            # musl target: the binary is statically linked, so it runs on any
+            # glibc version. A plain `ubuntu-latest` build links against the
+            # runner's glibc (~2.39) and fails on older distros with
+            # "version `GLIBC_2.39' not found".
+            target: x86_64-unknown-linux-musl
+            binary: target/x86_64-unknown-linux-musl/release/sshpf
             asset: sshpf-linux-x86_64
           - os: windows-latest
             artifact: sshpf-windows-x86_64
-            binary: target/release/sshpf.exe
+            target: x86_64-pc-windows-msvc
+            binary: target/x86_64-pc-windows-msvc/release/sshpf.exe
             asset: sshpf-windows-x86_64.exe
     steps:
       - uses: actions/checkout@v4
 
+      # `ring` compiles C code, so the musl target needs a musl C compiler.
+      - name: Install musl toolchain
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
@@ -57,7 +70,22 @@ jobs:
           echo "tag and Cargo.toml agree on $ver"
 
       - name: Build (release)
-        run: cargo build --release --locked
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # Fail loudly instead of shipping a binary that only runs on the runner's
+      # glibc. This is the regression that shipped in the very first release.
+      - name: Verify Linux binary is static
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          set -eu
+          bin="${{ matrix.binary }}"
+          if ldd "$bin" 2>&1 | grep -q 'not a dynamic executable\|statically linked'; then
+            echo "OK: $bin is statically linked"
+          else
+            echo "::error::$bin is dynamically linked; it would fail on older glibc"
+            ldd "$bin" || true
+            exit 1
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

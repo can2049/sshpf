@@ -53,6 +53,7 @@ cargo install sshpf
 ```
 
 预编译二进制可从 [GitHub Releases](https://github.com/can2049/sshpf/releases) 下载（Linux x86_64 / Windows x86_64）。
+Linux 版是静态链接（musl），不依赖系统 glibc 版本，任意发行版可直接运行。
 
 从源码构建：
 
