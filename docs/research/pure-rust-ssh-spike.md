@@ -470,8 +470,8 @@ ssh2-config query(web1) → user=Some("ignored")  port=Some(9999)   ❌ 被 Matc
 
 其他两个需要应用层补的语义：
 
-1. **HostName 缺省回退到 alias**：OpenSSH 里 `Host code.deeproute.ai` + 只有 `Port 2222`
-   时，hostname 是 `code.deeproute.ai`；`ssh2-config` 返回 `None`。
+1. **HostName 缺省回退到 alias**：OpenSSH 里 `Host git.example.com` + 只有 `Port 2222`
+   时，hostname 是 `git.example.com`；`ssh2-config` 返回 `None`。
    ```rust
    let hostname = p.host_name.unwrap_or_else(|| alias.to_string());
    ```

@@ -19,7 +19,7 @@
 //!
 //! Every tunnel owns one background thread with a `current_thread` tokio
 //! runtime (see [`crate::tunnel`]). The UI thread stays synchronous and receives
-//! [`TunnelEvent`](crate::tunnel::TunnelEvent)s over a `std::sync::mpsc`
+//! [`TunnelEvent`]s over a `std::sync::mpsc`
 //! channel, exactly as it did with child processes.
 
 use std::sync::mpsc::Sender;

@@ -1,6 +1,7 @@
 //! Per-tunnel runtime orchestration: start, stop, restart, and the event pump.
 //!
-//! This is the layer that talks to the [`Supervisor`] and turns ssh's stderr
+//! This is the layer that talks to the [`Supervisor`](crate::tunnel::Supervisor)
+//! and turns ssh's stderr
 //! into state transitions. It is deliberately separate from `App`'s own
 //! bookkeeping (selection, filters, overlays) so the tricky timing rules —
 //! staged readiness, deferred exit classification, retry backoff — sit together

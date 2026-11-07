@@ -10,6 +10,11 @@ homepage = "https://github.com/can2049/sshpf"
 readme = "README.md"
 keywords = ["ssh", "port-forwarding", "tui", "tunnel", "cli"]
 categories = ["command-line-utilities"]
+# Keep the published tarball to what a user of the crate actually needs.
+# `docs/research/` is development history (and contains scratch test fixtures),
+# `.github/` is CI-only, `rustfmt.toml` is not needed at build time. All of it
+# stays in the git repo — this only trims the crates.io download.
+exclude = ["docs/research/**", ".github/**", "rustfmt.toml"]
 
 [[bin]]
 name = "sshpf"

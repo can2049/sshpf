@@ -31,7 +31,7 @@
 //!    [`strip_match_blocks`] removes them before parsing, and is unit-tested.
 //! 2. **`HostName` does not fall back to the alias.** OpenSSH uses the alias as
 //!    the hostname when a block only sets `Port`; `ssh2-config` returns `None`.
-//!    [`SshHost::from_params`] applies the fallback.
+//!    `SshHost::from_params` applies the fallback.
 
 use std::io::BufReader;
 use std::path::PathBuf;
