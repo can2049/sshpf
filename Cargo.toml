@@ -3,6 +3,12 @@ name = "sshpf"
 version = "0.1.0"
 edition = "2024"
 description = "SSH port forward manager with a TUI dashboard (Linux first)"
+license = "MIT"
+repository = "https://github.com/can2049/sshpf"
+homepage = "https://github.com/can2049/sshpf"
+readme = "README.md"
+keywords = ["ssh", "port-forwarding", "tui", "tunnel", "cli"]
+categories = ["command-line-utilities"]
 
 [[bin]]
 name = "sshpf"

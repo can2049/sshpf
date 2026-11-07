@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    name: Test / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --all-targets
+
+      - name: Build release
+        run: cargo build --release
+
+  # The end-to-end test starts a throw-away sshd on loopback. It is `#[ignore]`d
+  # by default because it needs a working OpenSSH server and a usable key; this
+  # job runs it explicitly so the real forwarding path stays covered.
+  e2e:
+    name: End-to-end (real sshd)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Prepare a key for the temp sshd
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keygen -q -t rsa -b 2048 -f ~/.ssh/id_rsa -N ''
+          chmod 600 ~/.ssh/id_rsa
+
+      - name: Run e2e
+        run: cargo test --test e2e -- --ignored --test-threads=1
