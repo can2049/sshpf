@@ -7,14 +7,13 @@
 //! `docs/research/tech-options.md` §3.3.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use crate::config::{self, ConfigFile, Paths};
 use crate::model::{
-    FormMode, ForwardKind, HostPicker, StatusMsg, TunnelConfig, TunnelId, TunnelStatus, TunnelView, fuzzy_match,
-    now_unix,
+    FailureInfo, FormMode, ForwardKind, HostPicker, StatusMsg, TunnelConfig, TunnelId, TunnelStatus, TunnelView,
+    fuzzy_match, now_unix,
 };
 use crate::ssh::{self, SshHost};
 use crate::tunnel::{Supervisor, TunnelEvent};
@@ -105,21 +104,20 @@ pub struct App {
     supervisor: Supervisor,
     event_tx: Sender<TunnelEvent>,
     event_rx: Receiver<TunnelEvent>,
-    /// Scratch dir holding generated per-tunnel ssh configs.
-    synth_dir: PathBuf,
     retry_state: HashMap<TunnelId, RetryState>,
-    /// Per-tunnel generated config paths, removed on stop.
-    synth_paths: HashMap<TunnelId, PathBuf>,
+    /// How to treat unknown / changed server host keys.
+    pub(crate) host_key_policy: crate::ssh::known_hosts::HostKeyPolicy,
     /// A validated edit waiting for the user to confirm it, so the running
     /// process is not bounced before the dialog is answered.
     pending_form: Option<TunnelConfig>,
-    /// Exits observed but not yet classified: ssh writes its diagnostic to
-    /// stderr and exits immediately, so the exit can arrive before the last
-    /// lines. Keyed by tunnel, valued by (exit code, when we saw it).
+    /// Exits observed but not yet classified. Kept because the completion
+    /// signal and the final log lines can arrive in either order.
     pending_exit: HashMap<TunnelId, (Option<i32>, Instant)>,
-    /// Tunnels that have printed "Local forwarding listening on ..." for the
-    /// current attempt. Guards staged readiness when `ProxyJump` forks a child
-    /// whose own "Entering interactive session." line arrives first.
+    /// The failure reason carried by a just-observed exit, waiting to be paired
+    /// with its `Exited`/`StderrClosed` counterpart.
+    pending_reason: HashMap<TunnelId, Option<FailureInfo>>,
+    /// Tunnels whose driver reported readiness. Retained for compatibility with
+    /// the stop/restart bookkeeping (`forget_runtime_state`).
     saw_listening: std::collections::HashSet<TunnelId>,
 }
 
@@ -130,8 +128,6 @@ impl App {
             ConfigFile::default()
         });
         let (event_tx, event_rx) = mpsc::channel();
-        let synth_dir = std::env::temp_dir().join(format!("sshpf-{}", std::process::id()));
-        cleanup_stale_scratch_dirs();
         let tunnels = build_views(&cfg);
         App {
             cfg,
@@ -152,11 +148,11 @@ impl App {
             supervisor: Supervisor::new(),
             event_tx,
             event_rx,
-            synth_dir,
             retry_state: HashMap::new(),
-            synth_paths: HashMap::new(),
+            host_key_policy: crate::ssh::known_hosts::HostKeyPolicy::default(),
             pending_form: None,
             pending_exit: HashMap::new(),
+            pending_reason: HashMap::new(),
             saw_listening: std::collections::HashSet::new(),
         }
     }
@@ -363,13 +359,9 @@ impl App {
         }
     }
 
-    /// Stop every child immediately without touching persisted intent.
+    /// Stop every tunnel immediately without touching persisted intent.
     pub fn shutdown(&mut self) {
         self.supervisor.stop_all();
-        for (_, p) in self.synth_paths.drain() {
-            let _ = std::fs::remove_file(p);
-        }
-        let _ = std::fs::remove_dir_all(&self.synth_dir);
         self.save_state();
     }
 
@@ -445,34 +437,6 @@ pub struct Counts {
     pub failed: usize,
     pub off: usize,
     pub total: usize,
-}
-
-/// Remove scratch dirs left behind by sshpf processes that no longer exist
-/// (SIGKILL, OOM kill, a panic during teardown). These only ever contain
-/// generated per-tunnel ssh configs, so deleting them is always safe.
-///
-/// Called once at start-up; a live process's own dir is skipped because its pid
-/// is still alive.
-fn cleanup_stale_scratch_dirs() {
-    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
-        return;
-    };
-    let me = std::process::id();
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(pid) = name.to_string_lossy().strip_prefix("sshpf-").and_then(|p| p.parse::<u32>().ok()) else {
-            continue;
-        };
-        if pid == me {
-            continue;
-        }
-        // `kill(pid, 0)` succeeds for any process we may signal, which is the
-        // right liveness test for "is this scratch dir still in use".
-        let alive = crate::sys::pid_is_alive(pid);
-        if !alive {
-            let _ = std::fs::remove_dir_all(entry.path());
-        }
-    }
 }
 
 fn build_views(cfg: &ConfigFile) -> Vec<TunnelView> {
@@ -947,12 +911,12 @@ mod tests {
 
     #[test]
     fn exit_after_failure_keeps_the_specific_reason() {
-        // The classified failure must survive the process exit that follows it.
+        // The classified failure must survive the exit that follows it.
         let dir = tempfile::tempdir().unwrap();
         let mut app = app_with(dir.path(), vec![sample_tunnel(1, "x", 18021)]);
         app.cfg.defaults.auto_restart = false;
-        app.set_state(1, TunnelStatus::Starting { since: Instant::now() });
-        app.on_line(1, "alice@host: Permission denied (publickey).".into());
+        let reason = FailureInfo::with_short(FailureKind::AuthFailed, "认证失败", "权限不足");
+        app.set_state(1, TunnelStatus::Failed { reason });
         let before = app.tunnels[0].status.clone();
         app.on_exit(1, Some(255));
         assert_eq!(app.tunnels[0].status, before, "exit must not overwrite a specific failure");
@@ -990,8 +954,9 @@ mod tests {
         app.cfg.defaults.auto_restart = true;
         app.set_state(1, TunnelStatus::Starting { since: Instant::now() });
         app.arm_retry(1);
-        // Authentication cannot fix itself.
-        app.on_line(1, "alice@host: Permission denied (publickey).".into());
+        // Authentication cannot fix itself, so the reason is terminal.
+        let reason = FailureInfo::with_short(FailureKind::AuthFailed, "认证失败", "权限不足");
+        app.set_state(1, TunnelStatus::Failed { reason });
         app.on_exit(1, Some(255));
         assert!(
             matches!(app.tunnels[0].status, TunnelStatus::Failed { .. }),
@@ -1041,10 +1006,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut app = app_with(dir.path(), vec![sample_tunnel(1, "x", 18027)]);
         app.set_state(1, TunnelStatus::Up { since: Instant::now() });
-        app.on_line(1, "debug1: channel 2: open failed: connect failed: Connection refused".into());
-        assert!(matches!(app.tunnels[0].status, TunnelStatus::Up { .. }));
+        app.on_line(1, "转发到 10.0.0.9:80 失败: ConnectFailed".into());
+        assert!(matches!(app.tunnels[0].status, TunnelStatus::Up { .. }), "a dead target must not fail the tunnel");
         let logs: Vec<String> = app.tunnels[0].log.iter().map(|l| l.text.clone()).collect();
-        assert!(logs.iter().any(|l| l.contains("connect failed")), "should still be logged: {logs:?}");
+        assert!(logs.iter().any(|l| l.contains("ConnectFailed")), "should still be logged: {logs:?}");
     }
 
     #[test]
@@ -1058,15 +1023,22 @@ mod tests {
     }
 
     #[test]
-    fn full_happy_path_starting_to_up() {
+    fn happy_path_starting_to_up_is_driven_by_the_driver() {
+        // Readiness is no longer guessed from stderr: the tunnel driver reports
+        // it only once `bind`/`tcpip_forward` actually succeeded, so the app
+        // just records that transition.
         let dir = tempfile::tempdir().unwrap();
         let mut app = app_with(dir.path(), vec![sample_tunnel(1, "x", 18028)]);
         app.set_state(1, TunnelStatus::Starting { since: Instant::now() });
-        app.on_line(1, "debug1: Local forwarding listening on 127.0.0.1 port 18028.".into());
-        assert!(matches!(app.tunnels[0].status, TunnelStatus::Starting { .. }), "must wait for ready");
-        app.on_line(1, "debug1: Entering interactive session.".into());
+        app.on_ready(1);
         assert!(matches!(app.tunnels[0].status, TunnelStatus::Up { .. }));
         assert!(app.tunnels[0].retries == 0, "a successful start resets retries");
+
+        // A stale log line must never move the status on its own.
+        let mut app2 = app_with(dir.path(), vec![sample_tunnel(2, "y", 18038)]);
+        app2.set_state(2, TunnelStatus::Starting { since: Instant::now() });
+        app2.on_line(2, "debug1: Entering interactive session.".into());
+        assert!(matches!(app2.tunnels[0].status, TunnelStatus::Starting { .. }));
     }
 
     #[test]
@@ -1300,25 +1272,6 @@ mod tests {
     }
 
     #[test]
-    fn stale_scratch_dirs_are_reaped() {
-        // A crashed sshpf (SIGKILL/OOM) cannot run `shutdown`, so its scratch
-        // dir survives. Start-up must sweep dirs whose pid is gone.
-        let base = std::env::temp_dir();
-        let dead = base.join("sshpf-999999999");
-        let _ = std::fs::create_dir_all(&dead);
-        assert!(dead.exists());
-        cleanup_stale_scratch_dirs();
-        assert!(!dead.exists(), "dead process scratch dir should be removed");
-
-        // A directory belonging to this very process must be preserved.
-        let mine = base.join(format!("sshpf-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&mine);
-        cleanup_stale_scratch_dirs();
-        assert!(mine.exists(), "live process scratch dir must be kept");
-        let _ = std::fs::remove_dir_all(&mine);
-    }
-
-    #[test]
     fn arm_retry_placeholder_never_triggers_reconnect() {
         // Regression: `arm_retry` inserting `next_at = now` used to make
         // `tick_retries` reconnect in a tight loop right after a start,
@@ -1345,56 +1298,17 @@ mod tests {
     }
 
     #[test]
-    fn failure_to_establish_stops_the_process() {
-        // A rejected forward leaves `ssh -N` alive; we must kill it so the
-        // table never shows "failed" backed by a live process.
+    fn a_failed_forward_never_leaves_a_supervised_tunnel() {
+        // A rejected forward must not leave a live session behind, and the
+        // table must not show "failed" backed by a running tunnel.
         let dir = tempfile::tempdir().unwrap();
         let mut app = app_with(dir.path(), vec![sample_tunnel(1, "a", 18093)]);
-        app.start_tunnel(1);
-        let spawned = app.running_count();
-        // Directly exercise the failure path (no network involved).
         app.set_state(1, TunnelStatus::Starting { since: Instant::now() });
-        app.stop_after_failure(1);
+        app.cfg.defaults.auto_restart = false;
+        let reason = FailureInfo::with_short(FailureKind::RemoteForwardFailed, "远程转发失败", "端口被占用");
+        app.set_state(1, TunnelStatus::Failed { reason });
+        app.on_exit(1, Some(1));
         assert_eq!(app.running_count(), 0);
-        let _ = spawned;
-    }
-
-    #[test]
-    fn remote_ready_requires_explicit_success_marker() {
-        // Measured on OpenSSH 8.2: `-R` prints "Entering interactive session."
-        // *before* it knows whether the remote listener was accepted.
-        let dir = tempfile::tempdir().unwrap();
-        let mut t = sample_tunnel(1, "r", 18094);
-        t.kind = ForwardKind::Remote;
-        t.remote_host = "127.0.0.1".into();
-        t.remote_port = 18094;
-        let mut app = app_with(dir.path(), vec![t]);
-        app.set_state(1, TunnelStatus::Starting { since: Instant::now() });
-        app.on_line(1, "debug1: Entering interactive session.".into());
-        assert!(
-            matches!(app.tunnels[0].status, TunnelStatus::Starting { .. }),
-            "Entering must not mark a -R tunnel Up, got {:?}",
-            app.tunnels[0].status
-        );
-        app.on_line(1, "debug1: remote forward success for: listen 127.0.0.1:18094, connect 127.0.0.1:22".into());
-        assert!(matches!(app.tunnels[0].status, TunnelStatus::Up { .. }));
-    }
-
-    #[test]
-    fn local_ready_requires_listening_line_first() {
-        // ProxyJump merges the jump child's "Entering interactive session."
-        // into our stderr before the final hop authenticates.
-        let dir = tempfile::tempdir().unwrap();
-        let mut app = app_with(dir.path(), vec![sample_tunnel(1, "l", 18095)]);
-        app.set_state(1, TunnelStatus::Starting { since: Instant::now() });
-        app.on_line(1, "debug1: Entering interactive session.".into());
-        assert!(
-            matches!(app.tunnels[0].status, TunnelStatus::Starting { .. }),
-            "premature Entering must not mark -L Up"
-        );
-        app.on_line(1, "debug1: Local forwarding listening on 127.0.0.1 port 18095.".into());
-        app.on_line(1, "debug1: Entering interactive session.".into());
-        assert!(matches!(app.tunnels[0].status, TunnelStatus::Up { .. }));
     }
 
     #[test]

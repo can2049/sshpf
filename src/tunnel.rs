@@ -1,188 +1,183 @@
-//! Process supervision for the `ssh` children.
+//! Tunnel supervision: one background thread per tunnel, each driving a
+//! `current_thread` tokio runtime that runs the russh session.
 //!
-//! Every tunnel is exactly one `ssh` process (plus, possibly, `ssh -W` children
-//! forked by `ProxyJump`). Those children share a process group because we
-//! spawn with `process_group(0)`, so a single `kill(-pgid, SIGTERM)` reaps the
-//! whole tree. Verified experimentally — see `docs/research/tech-options.md` §5.
+//! # Why this shape
 //!
-//! The supervisor never blocks the UI: each child gets a stderr reader thread
-//! that forwards lines over an [`mpsc::Sender`], and the app polls
-//! `try_wait()` once per frame.
+//! The UI thread must stay synchronous — `app.rs` polls `crossterm` events with a
+//! 200 ms timeout and must never block. `russh` is async, so each tunnel gets its
+//! own thread + runtime and reports back over a `std::sync::mpsc` channel. The
+//! event vocabulary is unchanged from the subprocess era, so the app's event
+//! pump logic is untouched.
 //!
-//! Orphan protection: `Drop`/`shutdown` handle the orderly paths, but a
-//! `SIGKILL`ed or OOM-killed sshpf runs no destructor at all, which used to
-//! leave the ssh children owning their listen ports forever. Children are
-//! therefore spawned with `PR_SET_PDEATHSIG`, so the kernel sends them SIGTERM
-//! when the parent dies by any means.
+//! # What replaced what
+//!
+//! | subprocess era | now |
+//! |---|---|
+//! | `Child` + process group | `JoinHandle` of a runtime thread |
+//! | `kill(-pgid, SIGTERM→SIGKILL)` | `task::abort()` + `disconnect()` |
+//! | `PR_SET_PDEATHSIG` orphan guard | unnecessary — no child process exists |
+//! | Windows Job Object | unnecessary — ditto |
+//! | stderr reader thread → `Line` | the driver sends `Line` for milestones |
+//! | `try_wait()` polling | thread completion is reported once |
+//!
+//! A hard `SIGKILL` of sshpf still leaves nothing behind: the OS closes the
+//! sockets, which closes the SSH sessions.
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader};
-use std::path::Path;
-use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::Sender;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use crate::model::TunnelId;
 
-/// How long to wait after SIGTERM before escalating to SIGKILL.
-const TERM_GRACE: Duration = Duration::from_secs(2);
+/// A tunnel that has been started and not yet observed to finish.
+struct Running {
+    /// Requested shutdown. The thread checks this between driver steps.
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: JoinHandle<()>,
+}
 
-/// Events produced by supervised processes.
+/// Events produced by supervised tunnels.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TunnelEvent {
-    /// One line of ssh stderr (already includes the `debug1:` prefix).
+    /// The forward is genuinely established (the local `bind` succeeded, or the
+    /// server accepted `tcpip-forward`). This replaces every stderr heuristic.
+    Ready { id: TunnelId },
+    /// One progress/diagnostic line for the tunnel log.
     Line { id: TunnelId, line: String },
-    /// The process exited; `code` is `None` when killed by a signal.
+    /// The session ended.
     ///
-    /// Deliberately *not* the last word on a failure: ssh typically writes its
-    /// diagnostic to stderr and exits immediately, so the exit can be observed
-    /// before the reader thread has forwarded the final lines. Consumers must
-    /// wait for [`TunnelEvent::StderrClosed`] (or a timeout) before deciding
-    /// what the failure was.
-    Exited { id: TunnelId, code: Option<i32> },
-    /// stderr hit EOF: every line the child wrote has been delivered.
+    /// `reason` carries the failure the driver already classified — unlike the
+    /// subprocess era, there is nothing left to infer from a log tail, so the
+    /// precise cause travels with the event. `None` means a clean shutdown.
+    Exited { id: TunnelId, code: Option<i32>, reason: Option<crate::model::FailureInfo> },
+    /// Every line for this run has been delivered, so the consumer may now
+    /// classify the failure using the complete log.
     StderrClosed { id: TunnelId },
-    /// `ssh` could not be spawned at all (missing binary, EACCES, ...).
+    /// The tunnel could not even be started.
     SpawnFailed { id: TunnelId, error: String },
 }
 
-/// Result of a non-blocking child check.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ChildState {
-    Alive,
-    Exited(Option<i32>),
-}
-
-/// A spawned child plus its platform grouping handle.
-///
-/// On Unix this is the process-group id; on Windows a Job Object handle.
-struct Running {
-    child: Child,
-    group: crate::sys::GroupId,
-}
-
-impl Running {
-    fn check(&mut self) -> ChildState {
-        match self.child.try_wait() {
-            Ok(Some(status)) => ChildState::Exited(status.code()),
-            Ok(None) => ChildState::Alive,
-            // ECHILD and friends: the child is not waitable any more.
-            Err(_) => ChildState::Exited(None),
-        }
-    }
-}
-
-/// Owns every live `ssh` child. Dropping it stops them all.
+/// Owns every live tunnel thread. Dropping it stops them all.
 #[derive(Default)]
 pub struct Supervisor {
-    children: HashMap<TunnelId, Running>,
+    running: HashMap<TunnelId, Running>,
 }
 
 impl Supervisor {
     pub fn new() -> Self {
-        Supervisor { children: HashMap::new() }
+        Supervisor { running: HashMap::new() }
     }
 
-    /// Spawn `program` with `args` in its own process group.
+    /// Start one tunnel on its own thread + runtime.
     ///
-    /// stderr is piped and drained by a dedicated thread that forwards each
-    /// line as [`TunnelEvent::Line`]; stdout/stdin are discarded because
-    /// `-N` never needs them.
+    /// `ready` fires when the forward is genuinely established; the app maps
+    /// that to `TunnelStatus::Up`.
     pub fn spawn(
         &mut self,
-        id: TunnelId,
-        program: &Path,
-        args: &[String],
+        cfg: crate::model::TunnelConfig,
+        host_key_policy: crate::ssh::known_hosts::HostKeyPolicy,
         tx: Sender<TunnelEvent>,
     ) -> std::io::Result<()> {
-        // Never leave a stale child behind under the same id.
+        let id = cfg.id;
         self.stop(id);
 
-        let mut cmd = Command::new(program);
-        cmd.args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
-        // Process grouping differs per OS; `sys` hides the difference.
-        crate::sys::configure_child(&mut cmd);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_thread = stop.clone();
 
-        let mut child = cmd.spawn()?;
-        let group = crate::sys::group_of(&child);
-        let stderr = child.stderr.take();
-
-        if let Some(stderr) = stderr {
-            thread::Builder::new()
-                .name(format!("sshpf-stderr-{id}"))
-                .spawn(move || {
-                    for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                        if tx.send(TunnelEvent::Line { id, line }).is_err() {
-                            return; // app gone; stop reading
-                        }
-                    }
-                    // Every buffered line has been delivered, so the consumer
-                    // may now classify the failure using the complete log.
+        let handle = std::thread::Builder::new().name(format!("sshpf-tunnel-{id}")).spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    let _ = tx.send(TunnelEvent::SpawnFailed { id, error: format!("创建 runtime 失败: {e}") });
                     let _ = tx.send(TunnelEvent::StderrClosed { id });
-                })
-                .ok();
-        }
+                    return;
+                }
+            };
 
-        self.children.insert(id, Running { child, group });
+            let tx_ready = tx.clone();
+            let ready = move || {
+                let _ = tx_ready.send(TunnelEvent::Ready { id });
+            };
+
+            let result = rt.block_on(async {
+                let opts = crate::ssh::client::Options { host_key_policy };
+                let run = crate::ssh::client::run(&cfg, &opts, id, tx.clone(), ready);
+                tokio::pin!(run);
+                // Race the driver against the shutdown flag. `select!` already
+                // loops internally until one branch completes, so both branches
+                // are terminal and no outer loop is needed.
+                tokio::select! {
+                    biased;
+                    _ = wait_for_stop(&stop_thread) => Ok::<(), anyhow::Error>(()),
+                    res = &mut run => res,
+                }
+            });
+
+            match result {
+                Ok(()) => {
+                    let _ = tx.send(TunnelEvent::Exited { id, code: Some(0), reason: None });
+                }
+                Err(e) => {
+                    let info = crate::ssh::client::classify(&e);
+                    // Keep the detail in the log *and* on the event: the event is
+                    // what selects the status message, the log is what the user
+                    // reads in the detail panel.
+                    let _ = tx.send(TunnelEvent::Line { id, line: info.detail.clone() });
+                    let _ = tx.send(TunnelEvent::Exited { id, code: Some(1), reason: Some(info) });
+                }
+            }
+            // Always last: lets the app classify with the complete log.
+            let _ = tx.send(TunnelEvent::StderrClosed { id });
+        })?;
+
+        self.running.insert(id, Running { stop, handle });
         Ok(())
     }
 
-    /// True when the process is still supervised.
+    /// True when the tunnel thread is still supervised.
     pub fn is_running(&self, id: TunnelId) -> bool {
-        self.children.contains_key(&id)
+        self.running.contains_key(&id)
     }
 
     pub fn running_count(&self) -> usize {
-        self.children.len()
+        self.running.len()
     }
 
-    /// Non-blocking reap. Returns `Some(exit_code)` when the child has just
+    /// Non-blocking reap. Returns `Some(exit_code)` when the tunnel has just
     /// finished (and forgets it); `None` while it is still alive.
     pub fn poll(&mut self, id: TunnelId) -> Option<Option<i32>> {
-        let state = self.children.get_mut(&id)?.check();
-        match state {
-            ChildState::Alive => None,
-            ChildState::Exited(code) => {
-                self.children.remove(&id);
-                Some(code)
-            }
+        let running = self.running.get(&id)?;
+        if !running.handle.is_finished() {
+            return None;
         }
+        self.running.remove(&id);
+        Some(Some(0))
     }
 
-    /// Stop one tunnel: SIGTERM the group, then SIGKILL after a grace period.
-    ///
-    /// Always reaps the child so no zombie is left behind.
+    /// Ask one tunnel to stop and wait for its thread to finish.
     pub fn stop(&mut self, id: TunnelId) {
-        self.stop_with_grace(id, TERM_GRACE);
+        self.stop_with_grace(id, Duration::from_secs(2));
     }
 
     fn stop_with_grace(&mut self, id: TunnelId, grace: Duration) {
-        let Some(mut running) = self.children.remove(&id) else {
+        let Some(running) = self.running.remove(&id) else {
             return;
         };
-        crate::sys::terminate_group(running.group);
-        let deadline = Instant::now() + grace;
-        loop {
-            match running.check() {
-                ChildState::Exited(_) => return, // reaped by check()
-                ChildState::Alive => {
-                    if Instant::now() >= deadline {
-                        break;
-                    }
-                    thread::sleep(Duration::from_millis(25));
-                }
-            }
+        running.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        // The driver notices the flag within one select tick; join with a bound
+        // so a stuck driver cannot freeze the UI.
+        let deadline = std::time::Instant::now() + grace;
+        while !running.handle.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
         }
-        crate::sys::kill_group(running.group);
-        let _ = running.check();
-        let _ = running.child.wait();
-        crate::sys::release_group(running.group);
+        // The thread owns its runtime; dropping it aborts remaining tasks and
+        // closes the sockets.
     }
 
     /// Stop everything (used on quit and in `Drop`).
     pub fn stop_all(&mut self) {
-        let ids: Vec<TunnelId> = self.children.keys().copied().collect();
+        let ids: Vec<TunnelId> = self.running.keys().copied().collect();
         for id in ids {
             self.stop(id);
         }
@@ -190,7 +185,7 @@ impl Supervisor {
 
     /// Ids currently supervised.
     pub fn ids(&self) -> Vec<TunnelId> {
-        self.children.keys().copied().collect()
+        self.running.keys().copied().collect()
     }
 }
 
@@ -200,468 +195,116 @@ impl Drop for Supervisor {
     }
 }
 
+/// Resolve as soon as the stop flag is set (polled cheaply).
+async fn wait_for_stop(stop: &std::sync::atomic::AtomicBool) {
+    loop {
+        if stop.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{ForwardKind, TunnelConfig};
     use std::sync::mpsc;
 
-    /// Write an executable shell script (Unix-only helpers below).
-    #[cfg(unix)]
-    fn unix_script(dir: &Path, name: &str, body: &str) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let path = dir.join(name);
-        std::fs::write(&path, body).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        path
+    fn cfg(id: TunnelId, port: u16) -> TunnelConfig {
+        TunnelConfig {
+            id,
+            name: format!("t{id}"),
+            kind: ForwardKind::Local,
+            // Nothing listens here; the connect attempt fails fast, which is
+            // all these supervision tests need.
+            ssh_host: "127.0.0.1:1".into(),
+            local_addr: "127.0.0.1".into(),
+            local_port: port,
+            remote_host: "127.0.0.1".into(),
+            remote_port: 9,
+            enabled: false,
+            auto_restart: false,
+            ssh_options: vec![],
+            note: String::new(),
+            created_at: 0,
+        }
     }
 
-    /// A stand-in tunnel child: prints the readiness markers, then idles.
-    ///
-    /// Compiled rather than written as a shell script so the same fixture works
-    /// on Windows (which cannot exec `.sh`). See `ssh::testutil`.
-    fn sleeper_child(tag: &str) -> Option<(tempfile::TempDir, std::path::PathBuf)> {
-        let dir = tempfile::tempdir().ok()?;
-        let exe = crate::ssh::testutil::fake_tunnel_child(
-            dir.path(),
-            tag,
-            &["debug1: Local forwarding listening on 127.0.0.1 port 1234.", "debug1: Entering interactive session."],
-            30,
-            0,
-        )?;
-        Some((dir, exe))
-    }
-
+    /// A tunnel that cannot connect must report SpawnFailed/Exited + StderrClosed
+    /// and leave nothing supervised.
     #[test]
-    fn captures_lines_and_exit() {
-        let Some((_dir, script)) = sleeper_child("sleeper") else { return };
+    fn failed_connect_reports_events_and_cleans_up() {
         let (tx, rx) = mpsc::channel();
         let mut sup = Supervisor::new();
-        sup.spawn(7, &script, &[], tx).unwrap();
+        // Port 1 on loopback refuses immediately.
+        sup.spawn(cfg(1, 0), crate::ssh::known_hosts::HostKeyPolicy::AcceptNew, tx).unwrap();
 
-        let mut lines = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while lines.len() < 2 && Instant::now() < deadline {
-            if let Ok(TunnelEvent::Line { line, .. }) = rx.recv_timeout(Duration::from_millis(200)) {
-                lines.push(line);
-            }
-        }
-        assert!(lines.iter().any(|l| l.contains("Entering interactive session")), "{lines:?}");
-        assert!(sup.is_running(7));
-
-        sup.stop(7);
-        assert!(!sup.is_running(7));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn stop_kills_process_group_including_children() {
-        let dir = tempfile::tempdir().unwrap();
-        let script = unix_script(dir.path(), "spawner.sh", "#!/bin/sh\nsleep 60 &\necho \"child=$!\" >&2\nsleep 60\n");
-
-        let (tx, rx) = mpsc::channel();
-        let mut sup = Supervisor::new();
-        sup.spawn(1, &script, &[], tx).unwrap();
-
-        let mut grandchild = None;
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while grandchild.is_none() && Instant::now() < deadline {
-            if let Ok(TunnelEvent::Line { line, .. }) = rx.recv_timeout(Duration::from_millis(200))
-                && let Some(rest) = line.strip_prefix("child=")
-            {
-                grandchild = rest.trim().parse::<i32>().ok();
-            }
-        }
-        let grandchild = grandchild.expect("grandchild pid");
-        assert!(process_alive(grandchild), "grandchild should be running");
-
-        sup.stop(1);
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while process_alive(grandchild) && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(50));
-        }
-        assert!(!process_alive(grandchild), "grandchild survived stop()");
-    }
-
-    fn process_alive(pid: i32) -> bool {
-        crate::sys::pid_is_alive(pid as u32)
-    }
-
-    #[test]
-    fn poll_reports_exit_code() {
-        let dir = tempfile::tempdir().unwrap();
-        let Some(script) = crate::ssh::testutil::fake_tunnel_child(
-            dir.path(),
-            "fail",
-            &["bind [127.0.0.1]:80: Permission denied"],
-            0,
-            255,
-        ) else {
-            return;
-        };
-
-        let (tx, rx) = mpsc::channel();
-        let mut sup = Supervisor::new();
-        sup.spawn(3, &script, &[], tx).unwrap();
-
-        // Do NOT stop at the first exit: the child can exit before its stderr
-        // has been forwarded (ssh behaves exactly like this), so keep draining
-        // until both the exit code and the line have been observed.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut code = None;
-        let mut saw_line = false;
-        while Instant::now() < deadline && (code.is_none() || !saw_line) {
-            while let Ok(ev) = rx.try_recv() {
-                if let TunnelEvent::Line { .. } = ev {
-                    saw_line = true;
+        let mut saw_exit = false;
+        let mut saw_closed = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while std::time::Instant::now() < deadline && !(saw_exit && saw_closed) {
+            match rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(TunnelEvent::Exited { .. }) => saw_exit = true,
+                Ok(TunnelEvent::StderrClosed { .. }) => saw_closed = true,
+                Ok(_) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if sup.poll(1).is_some() {
+                        saw_exit = true;
+                    }
                 }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
-            if code.is_none()
-                && let Some(exit) = sup.poll(3)
-            {
-                code = Some(exit);
-            }
-            if code.is_some() && saw_line {
-                break;
-            }
-            thread::sleep(Duration::from_millis(20));
         }
-        assert!(saw_line, "stderr line was never forwarded");
-        assert_eq!(code, Some(Some(255)));
-        assert!(!sup.is_running(3));
+        assert!(saw_exit, "no Exited event");
+        assert!(saw_closed, "no StderrClosed event");
     }
 
     #[test]
-    fn every_child_emits_stderr_closed() {
-        // The consumer relies on StderrClosed to know the log is complete
-        // before classifying a failure; ssh prints its diagnostic and exits at
-        // once, so the exit often arrives first.
-        let dir = tempfile::tempdir().unwrap();
-        let Some(script) =
-            crate::ssh::testutil::fake_tunnel_child(dir.path(), "quick", &["ssh: Connection refused"], 0, 255)
-        else {
-            return;
-        };
-        let (tx, rx) = mpsc::channel();
-        let mut sup = Supervisor::new();
-        sup.spawn(5, &script, &[], tx).unwrap();
-
-        let mut lines = Vec::new();
-        let mut closed = false;
-        let mut exited = false;
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline && !(closed && exited) {
-            if let Ok(ev) = rx.recv_timeout(Duration::from_millis(100)) {
-                match ev {
-                    TunnelEvent::Line { line, .. } => lines.push(line),
-                    TunnelEvent::StderrClosed { .. } => closed = true,
-                    TunnelEvent::Exited { .. } => exited = true,
-                    _ => {}
-                }
-            }
-            if !exited && sup.poll(5).is_some() {
-                exited = true;
-            }
-        }
-        assert!(exited, "child exit not observed");
-        assert!(closed, "StderrClosed never emitted");
-        assert!(lines.iter().any(|l| l.contains("Connection refused")), "{lines:?}");
-        // StderrClosed must come after the last line, never before.
-        let mut saw_closed_after_line = false;
-        let mut count = 0;
-        while let Ok(ev) = rx.try_recv() {
-            match ev {
-                TunnelEvent::Line { .. } => {
-                    count += 1;
-                    assert!(!saw_closed_after_line, "line delivered after StderrClosed")
-                }
-                TunnelEvent::StderrClosed { .. } => saw_closed_after_line = true,
-                _ => {}
-            }
-        }
-        let _ = count;
-    }
-
-    #[test]
-    fn spawn_missing_binary_is_err() {
+    fn stop_is_idempotent_and_forgets_the_tunnel() {
         let (tx, _rx) = mpsc::channel();
         let mut sup = Supervisor::new();
-        assert!(sup.spawn(1, Path::new("/nonexistent/ssh-binary"), &[], tx).is_err());
-        assert!(!sup.is_running(1));
-    }
-
-    #[test]
-    fn respawn_replaces_previous_child() {
-        let Some((_dir, script)) = sleeper_child("sleeper") else { return };
-        let (tx, _rx) = mpsc::channel();
-        let mut sup = Supervisor::new();
-        sup.spawn(1, &script, &[], tx.clone()).unwrap();
+        sup.spawn(cfg(2, 0), crate::ssh::known_hosts::HostKeyPolicy::AcceptNew, tx).unwrap();
         assert_eq!(sup.running_count(), 1);
-        sup.spawn(1, &script, &[], tx).unwrap();
-        assert_eq!(sup.running_count(), 1);
-        sup.stop_all();
-        assert_eq!(sup.running_count(), 0);
-    }
-
-    #[test]
-    fn drop_stops_everything() {
-        let Some((_dir, script)) = sleeper_child("sleeper") else { return };
-        let (tx, _rx) = mpsc::channel();
-        let pid;
-        {
-            let mut sup = Supervisor::new();
-            sup.spawn(1, &script, &[], tx).unwrap();
-            pid = sup.children.get(&1).unwrap().child.id() as i32;
-            assert!(process_alive(pid));
-        }
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while process_alive(pid) && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(50));
-        }
-        assert!(!process_alive(pid), "child survived Supervisor::drop");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn child_dies_with_parent_via_pdeathsig() {
-        // `Drop` cannot run when the process is SIGKILLed, so children carry
-        // PR_SET_PDEATHSIG and die with us. Verified end-to-end against a real
-        // ssh: the listen port was released within 0.4s of the parent dying.
-        //
-        // This test spawns a real helper process and kills it, so it exercises
-        // the actual kernel path rather than mocks.
-        let Some((_dir, script)) = sleeper_child("alive") else { return };
-        let (tx, _rx) = mpsc::channel();
-
-        let mut sup = Supervisor::new();
-        sup.spawn(1, &script, &[], tx).unwrap();
-        let child_pid = sup.children.get(&1).unwrap().child.id() as i32;
-
-        // Ask the child itself what its parent-death signal is. `/proc` does not
-        // expose it, so instead assert the hook ran by checking the child is a
-        // session/group leader (proxy for a successful pre_exec) and then that
-        // killing the *group* reaps it.
-        assert!(process_alive(child_pid));
-        sup.stop(1);
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while process_alive(child_pid) && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(25));
-        }
-        assert!(!process_alive(child_pid));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn pre_exec_hook_rejects_dead_parent() {
-        // The hook returns Err when the observed parent differs from the
-        // expected one, which is how the fork/prctl race is closed.
-        //
-        // Only the negative case is asserted: `PR_SET_PDEATHSIG` is a property
-        // of the *current* process, and this test body runs in a real test
-        // thread whose parent pid legitimately differs from `getpid()`, so the
-        // positive path belongs in `set_parent_death_signal`'s actual caller
-        // (a freshly forked child) rather than here.
-        let me = unsafe { libc::getpid() };
-        let mut bogus = me;
-        while bogus == unsafe { libc::getppid() } || bogus == me {
-            bogus += 1;
-        }
-        assert!(unsafe { crate::sys::arm_parent_death_signal_for_test(bogus) }.is_err());
-    }
-
-    #[test]
-    fn stop_is_idempotent() {
-        // Stopping twice (or stopping something never started) must be safe:
-        // both the user's space key and shutdown paths can race here.
-        let dir = tempfile::tempdir().unwrap();
-        let Some(script) = crate::ssh::testutil::fake_tunnel_child(dir.path(), "idle", &[], 30, 0) else { return };
-        let (tx, _rx) = mpsc::channel();
-        let mut sup = Supervisor::new();
-        sup.spawn(1, &script, &[], tx).unwrap();
-        sup.stop(1);
-        assert!(!sup.is_running(1));
-        sup.stop(1); // second stop: no panic, no block
-        assert_eq!(sup.running_count(), 0);
-        sup.stop(999); // never existed
-    }
-
-    #[test]
-    fn supervisor_tracks_multiple_children_independently() {
-        let dir = tempfile::tempdir().unwrap();
-        let Some(script) = crate::ssh::testutil::fake_tunnel_child(dir.path(), "multi", &[], 30, 0) else { return };
-        let (tx, _rx) = mpsc::channel();
-        let mut sup = Supervisor::new();
-        for id in [1u64, 2, 3] {
-            sup.spawn(id, &script, &[], tx.clone()).unwrap();
-        }
-        assert_eq!(sup.running_count(), 3);
-        // Stopping one leaves the others supervised.
         sup.stop(2);
-        assert_eq!(sup.running_count(), 2);
-        assert!(sup.is_running(1));
-        assert!(!sup.is_running(2));
-        assert!(sup.is_running(3));
-        let mut ids = sup.ids();
-        ids.sort();
-        assert_eq!(ids, vec![1, 3]);
-        sup.stop_all();
+        assert_eq!(sup.running_count(), 0);
+        sup.stop(2); // second stop is a no-op
         assert_eq!(sup.running_count(), 0);
     }
 
     #[test]
-    fn poll_returns_none_while_the_child_is_alive() {
-        let Some((_dir, script)) = sleeper_child("idle") else { return };
+    fn stop_all_clears_everything() {
         let (tx, _rx) = mpsc::channel();
         let mut sup = Supervisor::new();
-        sup.spawn(1, &script, &[], tx).unwrap();
-        for _ in 0..3 {
-            assert_eq!(sup.poll(1), None, "a live child must not report an exit");
-            thread::sleep(Duration::from_millis(20));
-        }
-        sup.stop(1);
-    }
-
-    #[test]
-    fn poll_of_unknown_id_returns_none() {
-        let mut sup = Supervisor::new();
-        assert_eq!(sup.poll(42), None);
-        assert!(!sup.is_running(42));
-    }
-
-    #[test]
-    fn stdout_is_discarded_so_a_chatty_child_cannot_block() {
-        // ssh -N should not write to stdout, but a wedged child filling a pipe
-        // would otherwise stall the supervisor. stdout goes to /dev/null.
-        let dir = tempfile::tempdir().unwrap();
-        let Some(script) = crate::ssh::testutil::fake_chatty_child(dir.path(), "chatty", 2000, 1, 7) else { return };
-        let (tx, _rx) = mpsc::channel();
-        let mut sup = Supervisor::new();
-        sup.spawn(1, &script, &[], tx).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut code = None;
-        while Instant::now() < deadline {
-            if let Some(c) = sup.poll(1) {
-                code = c;
-                break;
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
-        assert_eq!(code, Some(7), "child should finish despite the noisy stdout");
-    }
-
-    #[test]
-    fn multibyte_and_long_lines_survive_the_reader_thread() {
-        // The reader must not choke on UTF-8 or on a very long line.
-        let dir = tempfile::tempdir().unwrap();
-        let long = "x".repeat(4000);
-        let Some(script) =
-            crate::ssh::testutil::fake_tunnel_child(dir.path(), "utf8", &["调试信息：连接失败", long.as_str()], 0, 0)
-        else {
-            return;
-        };
-        let (tx, rx) = mpsc::channel();
-        let mut sup = Supervisor::new();
-        sup.spawn(1, &script, &[], tx).unwrap();
-
-        let mut lines = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
-            match rx.recv_timeout(Duration::from_millis(100)) {
-                Ok(TunnelEvent::Line { line, .. }) => lines.push(line),
-                Ok(TunnelEvent::StderrClosed { .. }) if !lines.is_empty() => break,
-                Err(_) if lines.len() >= 2 => break,
-                _ => {}
-            }
-        }
-        assert!(lines.iter().any(|l| l.contains("调试信息")), "CJK line lost: {lines:?}");
-        assert!(lines.iter().any(|l| l.len() >= 4000), "long line truncated");
-        let _ = sup.poll(1);
-    }
-
-    #[test]
-    fn child_exit_code_is_reported_verbatim() {
-        let dir = tempfile::tempdir().unwrap();
-        for want in [0i32, 1, 127, 255] {
-            let tag = format!("exit{want}");
-            let Some(script) = crate::ssh::testutil::fake_tunnel_child(dir.path(), &tag, &[], 0, want) else {
-                return;
-            };
-            let (tx, _rx) = mpsc::channel();
-            let mut sup = Supervisor::new();
-            sup.spawn(1, &script, &[], tx).unwrap();
-            let deadline = Instant::now() + Duration::from_secs(5);
-            let mut got = None;
-            while Instant::now() < deadline {
-                if let Some(c) = sup.poll(1) {
-                    got = c;
-                    break;
-                }
-                thread::sleep(Duration::from_millis(10));
-            }
-            assert_eq!(got, Some(want), "exit code {want} not propagated");
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn shutting_down_all_children_releases_their_ports() {
-        // End-to-end-ish: bind a real port from a child, then assert the port is
-        // free after stop_all. This catches "process killed but fd leaked".
-        let dir = tempfile::tempdir().unwrap();
-        let port_holder = |port: u16, f: &Path| {
-            unix_script(
-                f,
-                &format!("hold{port}.sh"),
-                &format!(
-                    "#!/bin/sh\npython3 -c \"import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(('127.0.0.1',{port})); s.listen(1); time.sleep(30)\"\n"
-                ),
-            )
-        };
-        let port = {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            l.local_addr().unwrap().port()
-        };
-        let f = std::fs::canonicalize(dir.path()).unwrap();
-        let script = port_holder(port, &f);
-        let (tx, _rx) = mpsc::channel();
-        let mut sup = Supervisor::new();
-        sup.spawn(1, &script, &[], tx).unwrap();
-
-        // Wait for the child to actually grab the port.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let mut bound = false;
-        while Instant::now() < deadline {
-            if std::net::TcpListener::bind(("127.0.0.1", port)).is_err() {
-                bound = true;
-                break;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        if !bound {
-            sup.stop_all();
-            return; // python3 unavailable: nothing to assert
-        }
+        sup.spawn(cfg(3, 0), crate::ssh::known_hosts::HostKeyPolicy::AcceptNew, tx.clone()).unwrap();
+        sup.spawn(cfg(4, 0), crate::ssh::known_hosts::HostKeyPolicy::AcceptNew, tx).unwrap();
+        assert_eq!(sup.running_count(), 2);
         sup.stop_all();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
-            if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
-                return;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        panic!("port {port} still held after stop_all");
+        assert_eq!(sup.running_count(), 0);
+        assert!(sup.ids().is_empty());
     }
 
-    #[cfg(unix)]
     #[test]
-    fn process_group_isolation_is_sane() {
-        // Guards the assumption behind `process_group(0)`: a child in its own
-        // group has pgid == pid.
-        use std::os::unix::process::CommandExt;
-        use std::process::Command as StdCommand;
-        let mut child = StdCommand::new("/bin/sh").arg("-c").arg("sleep 5").process_group(0).spawn().unwrap();
-        let pid = child.id() as i32;
-        assert_eq!(unsafe { libc::getpgid(pid) }, pid);
-        let _ = child.kill();
-        let _ = child.wait();
+    fn respawn_replaces_the_previous_run() {
+        let (tx, _rx) = mpsc::channel();
+        let mut sup = Supervisor::new();
+        sup.spawn(cfg(5, 0), crate::ssh::known_hosts::HostKeyPolicy::AcceptNew, tx.clone()).unwrap();
+        sup.spawn(cfg(5, 0), crate::ssh::known_hosts::HostKeyPolicy::AcceptNew, tx).unwrap();
+        assert_eq!(sup.running_count(), 1, "same id must not accumulate");
+    }
+
+    #[test]
+    fn wait_for_stop_returns_when_flag_is_set() {
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let fut = wait_for_stop(&flag);
+            tokio::pin!(fut);
+            // Not set yet: should not resolve.
+            let timed_out = tokio::time::timeout(Duration::from_millis(60), &mut fut).await.is_err();
+            assert!(timed_out, "wait_for_stop resolved without the flag");
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::timeout(Duration::from_secs(2), &mut fut).await.expect("did not resolve after flag set");
+        });
     }
 }

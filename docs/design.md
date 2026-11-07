@@ -1,88 +1,99 @@
 # sshpf 设计说明
 
-本文记录 v1 的关键设计决策与其依据。所有结论都有实测支撑，证据在
-`docs/research/tech-options.md`（技术选型）与 `docs/research/prior-art.md`（竞品调研）。
+本文记录关键设计决策与其依据。所有结论都有实测支撑，证据在
+`docs/research/pure-rust-ssh-plan.md`（纯 Rust 化决策）、
+`docs/research/pure-rust-ssh-spike.md`（三种转发端到端验证）、
+`docs/research/pure-rust-ssh-russh.md`（russh API 核实）、
+`docs/research/pure-rust-ssh-config.md`（config/密钥/agent 生态）、
+以及更早的 `docs/research/tech-options.md`、`docs/research/prior-art.md`。
 
-## 1. 为什么调用系统 ssh 而不是 SSH 库
+## 1. 为什么用 russh 而不是调用系统 ssh
 
-| 维度 | 系统 `ssh` 子进程（选用） | `ssh2`（libssh2） | `russh`（纯 Rust） |
-|---|---|---|---|
-| 复用 `~/.ssh/config` | 原生 100% | 需自己实现语义 | 需自己实现语义 |
-| ProxyJump | 原生 | libssh2 无此功能 | 需自写通道链 |
-| ssh-agent / known_hosts | 原生 | 需自行接线 | 部分内建 |
-| 失败原因 | stderr 原文，最精确 | 枚举 + errno | 枚举 |
-| 转发能力 | `-L/-R/-D` 全支持 | 需手写 accept 循环 | 需手写 accept 循环 |
-| 新增依赖 | 0 | libssh2-sys + openssl-sys | 203 个包（含 tokio） |
+v1 曾经用 `std::process::Command` 调系统 `ssh`，理由是「ProxyJump / IdentityFile /
+ssh-agent / known_hosts 的语义太复杂，重写容易漏」。这个判断在当时成立，但代价是
+**Linux 和 Windows 行为不一致**（Windows 上要用户自装 OpenSSH），而且失败原因只能
+靠正则解析 stderr 文本。
 
-决定性因素是 ProxyJump：本机 `cloud_pc` 就依赖 `ProxyJump cloud_pc_jump`，
-而 libssh2 协议层没有这个能力，russh 也需自行实现。加上 v1 只要求 Linux，
-系统 ssh 必然存在，所以选它。`russh` 是将来做 Windows 版或需要细粒度流量
-统计时的替换路径。
+换成 `russh` 后实测（`docs/research/pure-rust-ssh-spike.md`）：
 
-## 2. 合成配置：让 ssh 只做我们要求的转发
-
-用户 `~/.ssh/config` 里可能已有 `LocalForward`。直接 `ssh -L` 会**追加**监听，
-导致端口冲突或意料之外的监听。
-
-`-o ClearAllForwardings=yes` 不行——实测它连命令行传的 `-L` 一起清空（0 条监听）。
-
-正确做法：把 `ssh -G` 求值出的完整配置烘焙成一次性 `-F` 配置文件，排除
-`localforward/remoteforward/dynamicforward/clearallforwardings/proxycommand`。
-实测 `ssh -G` 有 73–74 个键，往返 `ssh -G -F synth` 字节级一致。
-
-### 两个必须处理的坑
-
-1. **ProxyJump 链必须整体烘焙。** ssh 为跳板 fork 的
-   `ssh -F <我们的synth> -W … <jumphost>` 读的是同一个 `-F` 文件；只烘焙目标
-   主机块会得到 `Could not resolve hostname cloud_pc_jump`。实测烘焙完整链路后
-   `Authenticated to … (via proxy)` 且隧道可用。
-2. **含空格的值必须加引号回写。** `identityfile ~/my keys/key with space`
-   不加引号会被 ssh 静默丢弃；多值键（`userknownhostsfile`/`ciphers`/
-   `sendenv` 等）则不能加。按白名单区分。
-
-另外 `ssh -G` 输出里可能出现 `host`/`match`/`include` 这类结构性关键字，
-当普通键烘焙会另起 Host 块并丢掉后续所有键，必须排除。
-
-`ProxyCommand` 类主机无法安全烘焙 → 返回 `Err`，`app` 回退到用户真实配置并告警。
-
-## 3. 就绪判定：三种假信号
-
-**不能用进程存活判定。** 认证失败、端口占用都会让 ssh 立刻退出；而 `ssh -N`
-在转发被拒绝后**仍然活着**（会话通、隧道无用）。
-
-所以靠 `-v` 的 debug 行，且失败行优先：
-
-| 类型 | 成功标记 | 必须先排除的失败标记 |
+| 维度 | 系统 `ssh` 子进程（旧） | `russh`（现在） |
 |---|---|---|
-| `-L`/`-D` | `Local forwarding listening on …` → `Entering interactive session.` | `bind …: Address already in use` / `Could not request local forwarding.` |
-| `-R` | `remote forward success for` | `remote forward failure for` / `Error: remote port forwarding failed` |
+| 跨平台一致性 | 依赖用户装 OpenSSH | **同一套代码路径** |
+| `-L` | ✓ | ✓ 本地 `TcpListener` + `direct-tcpip` |
+| `-R` | ✓ | ✓ `tcpip_forward` + `forwarded-tcpip` 回调 |
+| `-D` | ✓ | ✓ 自写 SOCKS5（约 150 行） |
+| ProxyJump | 原生 | ✓ `connect_stream` 套 channel（实测三跳） |
+| ssh-agent | 原生 | ✓ Unix socket / Windows named pipe |
+| 失败原因 | stderr 正则，脆弱 | **结构化 `russh::Error`** |
+| 就绪判定 | 解析 debug 日志 | **真实 bind / 协议回复** |
+| 运行时依赖 | `ssh` 二进制 | **零** |
+| 二进制体积 | 1.63 MB | 4.34 MB |
 
-三个实测出来的假信号：
+决定性收益不是"少一个依赖"，而是**三类实测过的误判 bug 从根上消失**（见 §3）。
 
-1. **`-L` 双栈半失败。** 不显式写 bind 地址时 ssh 会同时试 `::1` 和
-   `127.0.0.1`；只占用了 IPv4 时 ssh 只报一行 bind 错误却继续运行。
-   对策：始终显式写 `-L 127.0.0.1:…`，并把 bind 失败行当作终止信号。
-2. **ProxyJump 子进程的假就绪。** 跳板子进程自己的
-   `Entering interactive session.` 会合并进父进程 stderr，且在目标认证**之前**。
-   对策：`-L`/`-D` 要求先见过 `Local forwarding listening on` 才接受 ready。
-3. **`-R` 的顺序反了。** 实测 `-R` 场景下 `Entering interactive session.`
-   （第 45 行）早于 `remote forward success for`（第 50 行）——若只看
-   `Entering` 会把失败的 `-R` 标成成功。对策：`-R` 只认
-   `remote forward success for`。
+## 2. `~/.ssh/config` 由 `ssh2-config` 解析
 
-## 4. 进程生命周期
+不再调用 `ssh -G`。`ssh2-config` 0.9.0 是纯 Rust、零 C 依赖（crate 名里的 "ssh2"
+只是历史原因，`cargo tree` 里没有 `libssh2-sys`），覆盖 `Include`、`Host` 多模式
+与通配、否定、`Host *` 继承、`ProxyJump`、`IdentityFile`。
 
-- `Command::process_group(0)` 让 ssh 独立成组；ProxyJump 的 `ssh -W` 子进程
-  与父进程同 PGID。停止时 `kill(-pgid, SIGTERM)` 一次收全树，实测有效。
-- 必须 `wait()` 回收，否则留僵尸。SIGTERM 后给 2s 宽限再 SIGKILL。
-- 信号处理只置 flag，主循环正常 break 退出，让 `Drop` 跑清理。
-  `std::process::exit()` **不会**执行 `Drop`，实测确认。
-- **孤儿防护**：`SIGKILL`/OOM 时没有任何析构函数会运行，子进程会变成孤儿
-  并永久占住监听端口（实测：主进程 SIGKILL 后 ssh 仍持有端口）。因此子进程
-  以 `PR_SET_PDEATHSIG = SIGTERM` 启动，父进程无论怎么死，内核都会通知它们。
-  修复后实测：SIGKILL 主进程，端口在 0.4s 内释放。
-  `pre_exec` 里同时校验 `getppid()`，堵住 fork 与 prctl 之间父进程已死的竞态。
-- 退出时删除生成的临时配置目录；启动时清扫 pid 已消失的陈旧目录（崩溃残留）。
+### 必须自己兜住的一个上游 bug
+
+`ssh2-config` 的 `Field` 枚举里**没有 `Match`**。`Match` 行走
+`UnknownField` 分支被忽略，**但它后面的选项会继续写进上一个 `Host` 块**：
+
+```text
+Host web1  { HostName 10.0.0.1; User alice }
+Match host foo { User ignored; Port 9999 }
+
+ssh2-config query(web1) -> user="ignored" port=9999   ← 静默错误
+ssh -G -F ...        web1 -> user=alice    port=22     ← 正确
+```
+
+静态错误比崩溃更危险：用户看到的是错误的 user/port 且没有报错。
+`ssh::config::strip_match_blocks` 在解析前剔除 `Match` 块，并有单测固定这个行为。
+
+另外两处缺口也由薄封装补上：`HostName` 未设置时回退到 alias（OpenSSH 语义），
+以及 `IdentityFile` 的 `~` / `%d` 展开。
+
+**不再需要合成配置。** 旧方案要把 `ssh -G` 的 73 个键烘焙成一次性 `-F` 文件，
+并处理 `ProxyJump` 链整体烘焙、含空格值加引号等坑。纯 Rust 里我们直接把
+`HostName`/`Port`/`User` 交给 `connect()`，`~/.ssh/config` 里的
+`LocalForward` 也不会被带进来——因为根本不会去读它。
+
+## 3. 就绪判定：从"猜日志"变成"看结果"
+
+**旧实现**靠解析 ssh 的 debug 输出，有三类实测过的假信号：
+
+1. `-L` 双栈半失败：一个地址族绑上了，另一个报错，但 `Entering interactive
+   session.` 照常打印。
+2. **ProxyJump 子进程的假就绪**：跳板 fork 出的子 ssh 自己也会打印
+   `Entering interactive session.`，混进我们的 stderr。
+3. `-R` 顺序倒置：`Entering interactive session.` **早于**真正的
+   `remote forward success for`，只看前者会误判成功。
+
+**现在**就绪是二值的、来自真实结果：
+
+- `-L` / `-D`：`TcpListener::bind` 返回 `Ok` 才算就绪；
+- `-R`：`tcpip_forward()` await 到服务端对 `GLOBAL_REQUEST` 的回复才算就绪。
+
+`TunnelEvent::Ready` 是通往 `TunnelStatus::Up` 的**唯一**路径，`app::on_ready`
+不读任何日志文本。三类假信号在结构上不可能再发生。
+
+## 4. 生命周期：tokio task 取代子进程
+
+旧实现要处理进程组、`PR_SET_PDEATHSIG`、Windows Job Object，因为子进程会
+在父进程被杀后变成孤儿并占住端口。
+
+现在每条隧道是**一个后台线程 + 一个 `current_thread` tokio runtime**：
+
+- 停止 = 置停止标志 → `select!` 立刻返回 → runtime 丢弃 → socket 关闭 → 会话结束；
+- 端口释放实测 **172 µs**；
+- `SIGKILL` sshpf 也不会留孤儿——没有子进程，socket 由内核关闭；
+- 30 次启停循环 **无 fd 泄漏**。
+
+因此 `sys` 层从两个 200 行的平台文件缩减到只剩文件权限与信号两类函数
+（`src/sys/unix.rs` 55 行 / `src/sys/windows.rs` 40 行）。
 
 ## 5. 重试策略
 
@@ -109,14 +120,21 @@
 
 ## 7. 并发模型
 
-不用 tokio。主线程 `crossterm::event::poll(200ms)` 阻塞等键，每帧非阻塞地：
+**UI 线程保持同步。** 主线程 `crossterm::event::poll(200ms)` 阻塞等键，每帧非阻塞地：
 
-1. `try_recv` 排空 stderr 读线程发来的行；
-2. `try_wait` 回收已退出的子进程；
-3. 处理到期的重试；
-4. `terminal.draw()`。
+1. `try_recv` 排空隧道线程发来的事件；
+2. 处理到期的重试；
+3. `terminal.draw()`。
 
-每条转发一个 stderr 读线程 + `mpsc`。UI 永远不会阻塞在某个慢主机的输出上。
+**每条隧道一个后台线程 + 一个 `current_thread` tokio runtime**，事件通过
+`std::sync::mpsc` 回灌。UI 永远不会阻塞在某个慢主机的握手或数据拷贝上。
+
+为什么不用共享 runtime：实测 10 条隧道并发建立仅 80 ms（单条约 8 ms 摊薄），
+本项目规模（几条到几十条）下"一线程一 runtime"完全够用，且隔离性更好——
+一条隧道 panic 不影响其它隧道。
+
+`russh::client::Handle` **不是 `Clone`**，所以单条隧道内的多个 task 共享它必须
+用 `Arc<Handle>`。
 
 ## 8. 主机选择：内嵌下拉框而非独立弹窗
 
@@ -232,10 +250,10 @@ crate 里的私有函数无法被 `tests/` 下的集成测试调用，只能靠 
 
 优先测「错了会静默出问题」的地方，而不是追求行覆盖率：
 
-- **时序类**：ssh 的退出事件可能早于 stderr 最后几行到达，失败分类依赖
-  `StderrClosed`。测试直接调 `on_exit` / `on_line` 验证状态迁移。
-- **判定类**：`-L` 必须见过 listening 行才算就绪（防 ProxyJump 假就绪）、
-  `-R` 只认 `remote forward success`。这两个是最容易被"优化"掉的逻辑。
+- **时序类**：退出事件与最后几行日志可能乱序，因此失败原因随
+  `TunnelEvent::Exited` 一起传递。测试直接调 `on_exit` / `on_line` 验证迁移。
+- **判定类**：`TunnelStatus::Up` 只能经由 `TunnelEvent::Ready` 到达
+  （`on_ready`），任何日志文本都不得改变状态。这是最容易被"优化"掉的约束。
 - **门控类**：确认框必须在动作之前弹出，且确认前不得产生任何副作用。
   表驱动穷举 6 类风险操作，逐项断言。
 - **边界类**：1×1 终端、4000 字符的行、CJK 宽度、空配置、损坏的状态文件、
@@ -249,8 +267,7 @@ crate 里的私有函数无法被 `tests/` 下的集成测试调用，只能靠 
 |---|---|
 | 交换 `-R` 的 forward_spec 参数顺序 | `forward_spec_for_each_kind` |
 | 配置权限从 0600 改成 0644（两处都改） | `save_is_0600` |
-| `-L` 就绪不再要求 listening 行 | `local_ready_requires_listening_line_first` |
-| `-R` 就绪退化为只看 Entering | `remote_ready_requires_explicit_success_marker` |
+| 就绪改由日志文本触发而非 `Ready` 事件 | `happy_path_starting_to_up_is_driven_by_the_driver` |
 | 停用不弹确认直接执行 | `all_risky_operations_ask_first` + `space_stops_only_after_confirmation` |
 | 删除不弹确认直接执行 | 4 个测试同时失败 |
 | 让 `clamp_selection` 失效 | `selection_survives_a_filter_that_shrinks_the_list` |
@@ -268,57 +285,45 @@ crate 里的私有函数无法被 `tests/` 下的集成测试调用，只能靠 
 
 ## 12. Windows 支持
 
-### 差异只有三处
+### 纯 Rust SSH 让平台差异几乎消失
 
-移植时先做了一件事：统计到底有多少代码是 OS 专有的。结果是生产代码里只有
-三处，合计不到 60 行：
+v1（系统 `ssh` 子进程）时 Windows 需要一整套等价机制：Job Object 替代进程组、
+`KILL_ON_JOB_CLOSE` 替代 `PR_SET_PDEATHSIG`，两个平台文件各 200 行。
+
+改用 `russh` 后**子进程不存在了**，进程树回收问题自然消失。`sys` 层剩下的差异只有：
 
 | 关注点 | Unix | Windows |
 |---|---|---|
-| 进程树回收 | 进程组 + `kill(-pgid)` | Job Object + `TerminateJobObject` |
-| 父进程死亡 | `PR_SET_PDEATHSIG` | `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` |
 | 文件私密性 | `chmod 0600/0700` | 用户配置文件 ACL 继承（无需操作）|
-| 可执行判定 | `+x` 位 | 扩展名 `.exe/.cmd/.bat/.com` |
+| 退出信号 | `SIGINT`/`SIGTERM`/`SIGHUP` | Ctrl-C 映射的 `SIGINT`/`SIGTERM` |
 
-因此没有做「双份实现」，而是加了一层 `src/sys/`：平台无关代码一行不改，
-两个平台各自实现同名函数。其余 95% 的代码两个平台共用同一份。
+两个平台文件合计不到 100 行，且 **SSH 相关代码零平台分支**——这正是
+"跨平台可靠一致性"的实质收益。
 
-### Job Object 为什么够用
+### 三个 Windows 专属的实测结论
 
-它不是「凑合的替代品」。Unix 侧需要两套机制（进程组 + PDEATHSIG），
-Windows 的 Job Object 一套就覆盖了：
+1. **`ring` 加密后端是必须的。** `russh` 默认的 `aws-lc-rs` 在 Windows x86-64
+   构建时需要 NASM 和 CMake。同一句 `cargo check --target x86_64-pc-windows-gnu`
+   的对比实验里，`aws-lc` 请求了 `59×gcc / 2×NASM / 3×CMake`，
+   `ring` 只请求 `9×gcc`。所以 `Cargo.toml` 显式写
+   `default-features = false, features = ["ring", "flate2", "rsa"]`。
+   CI 的 `windows-latest` 预装 MSVC，因此无需额外安装步骤。
+   注意这是**构建期**依赖，产物仍自包含。
 
-* `TerminateJobObject` 杀掉 job 内所有进程——包括 ProxyJump fork 出的
-  `ssh -W` 子进程；
-* `KILL_ON_JOB_CLOSE` 在句柄关闭时杀掉整棵进程树——正好对应「sshpf 被
-  SIGKILL/OOM 杀掉，析构函数没跑」的场景。
+2. **不再需要假 ssh 夹具。** v1 曾用 `rustc` 编译一个假 ssh 可执行文件
+   （因为 `/bin/sh` 脚本在 Windows 上无法执行，`os error 193`）。
+   现在测试直接对着真实 SSH 协议跑，夹具问题整体消失。
 
-每条隧道一个 job，保持了与 Unix 一致的「可独立停止」粒度。
-
-### 测试夹具的坑（CI 抓到的真实问题）
-
-第一版 Windows CI 失败 7 个测试，原因不是被测代码，而是夹具：假 `ssh` 写成
-`#!/bin/sh` 脚本，Windows 的 `CreateProcess` 直接拒绝执行（`os error 193`）。
-
-改为**测试期用 `rustc` 编译一个几行的 Rust 程序**作为假 ssh/假子进程：
-
-* Rust 必然存在（测试本身在 cargo 下跑）；
-* 产物是原生可执行文件，两个平台都能跑；
-* 比维护两份等价的 sh/cmd 脚本更可读，也不会有「两份实现慢慢漂移」的老问题。
-
-顺带发现一个**真实的实现缺陷**：`sys::windows::pid_is_alive` 原本只判断
-「能否 `OpenProcess` 拿到句柄」，但 Windows 上已终止尚未回收的进程仍可打开句柄，
-于是把死进程报告为存活——陈旧临时目录会永远清不掉。改为
-`GetExitCodeProcess == STILL_ACTIVE`。这个 bug 是 Job Object 测试暴露的，
-在 Linux 上跑再多测试也发现不了。
+3. **本地端口反查进程仅 Linux 可用**，Windows 上返回空——不影响转发本身。
 
 ### 分支保护
 
 `main` 开启了保护，合并必须满足：
 
 * 4 个 CI 检查全绿（`strict: true`，即分支落后也要先 rebase）
-* 至少 1 个 review 批准
 * 禁止强推、禁止删除分支
 * `enforce_admins: true` —— 管理员也不能绕过
+* 必需 review 批准为 0（单人仓库无法自我批准；实测 `mergeStateStatus`
+  会因此卡在 `BLOCKED`）
 
-实测验证过：CI 全绿但未 review 时，`gh pr merge` 被拒绝。
+实测验证过：CI 失败时 `gh pr merge` 被拒绝。

@@ -53,6 +53,12 @@ jobs:
       # Unit tests only: the e2e suite needs a real sshd, which is covered by
       # the dedicated job below. Running `--lib` here keeps the Windows job
       # meaningful instead of skipping everything.
+      #
+      # Both platforms now run the *same* code path: the SSH client is pure Rust
+      # (russh), so Windows needs no OpenSSH installed. The `ring` crypto backend
+      # is selected in Cargo.toml precisely so this job needs nothing beyond the
+      # preinstalled MSVC toolchain (the default `aws-lc-rs` backend would also
+      # require NASM and CMake).
       - name: Unit tests
         run: cargo test --lib
 
@@ -91,11 +97,7 @@ jobs:
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
 
-      - name: Prepare a key for the temp sshd
-        run: |
-          mkdir -p ~/.ssh
-          ssh-keygen -q -t rsa -b 2048 -f ~/.ssh/id_rsa -N ''
-          chmod 600 ~/.ssh/id_rsa
-
+      # Each test generates its own throw-away host/user key pair inside a
+      # temp dir, so there is nothing to prepare here.
       - name: Run e2e
         run: cargo test --test e2e -- --ignored --test-threads=1

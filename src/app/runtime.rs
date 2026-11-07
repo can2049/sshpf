@@ -68,15 +68,6 @@ impl App {
             return;
         }
 
-        // 2. ssh binary present?
-        if !ssh::ssh_available() {
-            let info = FailureInfo::with_short(FailureKind::SpawnFailed, "未找到 ssh 可执行文件", "PATH 中没有 ssh");
-            self.set_state(id, TunnelStatus::Failed { reason: info });
-            self.log(id, LogLevel::Error, "未在 PATH 中找到 ssh");
-            self.set_status(StatusMsg::error("未找到 ssh 可执行文件"));
-            return;
-        }
-
         // 3. Pre-flight bind check. A `-R` listen happens on the server, so we
         //    can only check our own side for -L/-D.
         if cfg.kind != ForwardKind::Remote {
@@ -96,36 +87,45 @@ impl App {
             }
         }
 
-        // 4. Generate the synthetic ssh config (tech-options.md §2.7/§2.8).
-        let synth = match ssh::write_synth_config(&cfg, &self.synth_dir) {
-            Ok(p) => Some(p),
-            Err(e) => {
-                self.log(id, LogLevel::Warn, format!("生成合成配置失败，回退到用户配置: {e}"));
-                None
+        // 4. Resolve the host from ~/.ssh/config and start the tunnel.
+        //
+        //    Resolution happens on the UI thread (it is a file parse, no I/O
+        //    wait) so a bad alias is reported immediately instead of appearing
+        //    as an async failure a moment later.
+        match ssh::config::endpoint_for(&cfg) {
+            Ok(endpoint) => {
+                self.log(
+                    id,
+                    LogLevel::Info,
+                    format!("连接 {}@{}:{}", endpoint.user_or_current(), endpoint.hostname, endpoint.port),
+                );
+                if !endpoint.proxy_jump.is_empty() {
+                    self.log(id, LogLevel::Info, format!("经跳板机: {}", endpoint.proxy_jump.join(" → ")));
+                }
             }
-        };
-        let args = ssh::build_ssh_args(&cfg, synth.as_deref());
-        let program = ssh::ssh_binary();
+            Err(e) => {
+                let info = FailureInfo::with_short(FailureKind::AuthFailed, "无法解析 SSH 主机", format!("{e:#}"));
+                self.set_state(id, TunnelStatus::Failed { reason: info });
+                self.log(id, LogLevel::Error, format!("解析 SSH 主机失败: {e:#}"));
+                self.set_status(StatusMsg::error(format!("{}: 无法解析 SSH 主机", cfg.name)));
+                return;
+            }
+        }
 
-        self.log(id, LogLevel::Info, format!("启动: ssh {}", args.join(" ")));
         self.saw_listening.remove(&id);
         self.set_state(id, TunnelStatus::Starting { since: Instant::now() });
         self.set_enabled(id, true);
 
-        match self.supervisor.spawn(id, &program, &args, self.event_tx.clone()) {
+        let policy = self.host_key_policy;
+        match self.supervisor.spawn(cfg.clone(), policy, self.event_tx.clone()) {
             Ok(()) => {
-                if let Some(p) = synth
-                    && let Some(old) = self.synth_paths.insert(id, p)
-                {
-                    let _ = std::fs::remove_file(old);
-                }
                 self.set_status(StatusMsg::info(format!("{} 正在连接…", cfg.name)));
             }
             Err(e) => {
                 let short: String = e.to_string().chars().take(28).collect();
-                let info = FailureInfo::with_short(FailureKind::SpawnFailed, short, format!("启动 ssh 失败: {e}"));
+                let info = FailureInfo::with_short(FailureKind::SpawnFailed, short, format!("启动隧道失败: {e}"));
                 self.set_state(id, TunnelStatus::Failed { reason: info });
-                self.log(id, LogLevel::Error, format!("启动 ssh 失败: {e}"));
+                self.log(id, LogLevel::Error, format!("启动隧道失败: {e}"));
                 self.set_status(StatusMsg::error(format!("{} 启动失败: {e}", cfg.name)));
             }
         }
@@ -176,9 +176,12 @@ impl App {
     pub fn drain_events(&mut self) {
         while let Ok(ev) = self.event_rx.try_recv() {
             match ev {
+                TunnelEvent::Ready { id } => self.on_ready(id),
                 TunnelEvent::Line { id, line } => self.on_line(id, line),
-                TunnelEvent::Exited { id, code } => {
-                    // Defer: the failure classification needs the whole stderr.
+                TunnelEvent::Exited { id, code, reason } => {
+                    // Remember the classified cause; `StderrClosed` may arrive
+                    // before or after this.
+                    self.pending_reason.insert(id, reason);
                     self.pending_exit.insert(id, (code, Instant::now()));
                 }
                 TunnelEvent::StderrClosed { id } => {
@@ -216,69 +219,40 @@ impl App {
         }
     }
 
-    pub(crate) fn on_line(&mut self, id: TunnelId, line: String) {
-        let Some(kind) = self.tunnels.iter().find(|t| t.cfg.id == id).map(|t| t.cfg.kind) else {
+    /// The tunnel driver reported a genuinely established forward.
+    ///
+    /// This is the *only* path to `TunnelStatus::Up`. Because it comes from the
+    /// real `bind` / `tcpip_forward` result, none of the old false-ready cases
+    /// (ProxyJump's merged stderr, `-R`'s early "Entering interactive session.")
+    /// can trigger it.
+    pub(crate) fn on_ready(&mut self, id: TunnelId) {
+        let Some(view) = self.tunnels.iter().find(|t| t.cfg.id == id) else {
             return;
         };
+        if matches!(view.status, TunnelStatus::Up { .. }) {
+            return;
+        }
+        let name = view.cfg.name.clone();
+        self.set_state(id, TunnelStatus::Up { since: Instant::now() });
+        self.retry_state.remove(&id);
+        self.pending_exit.remove(&id);
+        self.saw_listening.insert(id);
+        if let Some(v) = self.tunnels.iter_mut().find(|t| t.cfg.id == id) {
+            v.retries = 0;
+        }
+        self.set_status(StatusMsg::ok(format!("✓ {name} 已连通")));
+    }
 
-        // Failure lines win over ready lines: a partially-bound `-L` still
-        // prints "Entering interactive session" while one address family failed.
-        let classified = ssh::classify_failure(&line);
-        let ready = ssh::is_ready_line(kind, &line);
-        let listening = ssh::is_local_listening_line(&line);
-        // `-R` announces success *after* "Entering interactive session."
-        // (measured: line 42 = Entering, line 47 = remote forward failure).
-        let remote_established = line.contains("remote forward success for");
-
-        let level = if classified.is_some() {
-            LogLevel::Warn
-        } else if ready {
-            LogLevel::Info
-        } else {
-            LogLevel::Debug
-        };
+    /// Handle one progress line from a tunnel.
+    ///
+    /// Readiness is **not** inferred here any more: the driver signals it from
+    /// the actual `bind` / `tcpip_forward` result, so the old staged-readiness
+    /// state machine (`saw_listening`, `Entering interactive session.`,
+    /// `remote forward success for`) is gone along with the false-ready bugs it
+    /// worked around.
+    pub(crate) fn on_line(&mut self, id: TunnelId, line: String) {
+        let level = if line.contains("失败") || line.contains("错误") { LogLevel::Warn } else { LogLevel::Info };
         self.log(id, level, line);
-
-        // Staged readiness. Two independent hazards, both measured:
-        //  * `ProxyJump` forks `ssh -W`; that child's own
-        //    "Entering interactive session." is merged into our stderr before
-        //    the final hop authenticates.
-        //  * `-R` prints "Entering interactive session." *before* it knows
-        //    whether the remote listener was accepted.
-        // So `-L`/`-D` need a preceding "Local forwarding listening on" and
-        // `-R` needs the explicit "remote forward success for" marker.
-        if listening {
-            self.saw_listening.insert(id);
-        }
-        let staged_ready = match kind {
-            ForwardKind::Local | ForwardKind::Dynamic => ready && self.saw_listening.contains(&id),
-            ForwardKind::Remote => remote_established,
-        };
-
-        let status = self.tunnels.iter().find(|t| t.cfg.id == id).map(|t| t.status.clone());
-        match (classified, status) {
-            (Some(info), Some(TunnelStatus::Starting { .. })) => {
-                self.set_state(id, TunnelStatus::Failed { reason: info });
-                // A tunnel whose forward was rejected is useless even though
-                // ssh keeps the session open (`-R` failure, partially bound
-                // `-L`): stop it so the UI and reality agree.
-                self.stop_after_failure(id);
-            }
-            (Some(info), Some(TunnelStatus::Up { .. })) => {
-                self.log(id, LogLevel::Warn, format!("连接目标失败: {}", info.detail));
-            }
-            (None, Some(TunnelStatus::Starting { .. })) if staged_ready => {
-                self.set_state(id, TunnelStatus::Up { since: Instant::now() });
-                self.retry_state.remove(&id);
-                self.pending_exit.remove(&id);
-                if let Some(v) = self.tunnels.iter_mut().find(|t| t.cfg.id == id) {
-                    v.retries = 0;
-                }
-                let name = self.tunnel(id).map(|t| t.cfg.name.clone()).unwrap_or_default();
-                self.set_status(StatusMsg::ok(format!("✓ {name} 已连通")));
-            }
-            _ => {}
-        }
     }
 
     /// Forget everything we know about a tunnel's *current* run.
@@ -287,28 +261,14 @@ impl App {
     /// hand-roll this cleanup and they had already drifted apart (some forgot
     /// `saw_listening`), so it lives in one place now.
     pub(crate) fn forget_runtime_state(&mut self, id: TunnelId) {
-        if let Some(path) = self.synth_paths.remove(&id) {
-            let _ = std::fs::remove_file(path);
-        }
         self.retry_state.remove(&id);
         self.pending_exit.remove(&id);
+        self.pending_reason.remove(&id);
         self.saw_listening.remove(&id);
     }
 
-    /// Kill the ssh child of a tunnel that failed to establish its forward.
-    ///
-    /// `ssh -N` keeps running when a forwarding request is rejected (`-R`
-    /// remote forward failure, or a partially bound `-L`): the session is up
-    /// but the tunnel is useless. We stop it so the table never shows a
-    /// "failed" row backed by a live process, and so the local port is not
-    /// held.
-    pub(crate) fn stop_after_failure(&mut self, id: TunnelId) {
-        self.supervisor.stop(id);
-        self.forget_runtime_state(id);
-        // Keep `enabled` as the user set it; only the process goes away.
-    }
-
     pub(crate) fn on_exit(&mut self, id: TunnelId, code: Option<i32>) {
+        let classified = self.pending_reason.remove(&id).flatten();
         let Some(view) = self.tunnels.iter().find(|t| t.cfg.id == id) else {
             return;
         };
@@ -318,9 +278,9 @@ impl App {
             return;
         }
         let was_up = matches!(status, TunnelStatus::Up { .. });
-        self.log(id, if was_up { LogLevel::Warn } else { LogLevel::Error }, format!("ssh 进程退出 (code {code:?})"));
+        self.log(id, if was_up { LogLevel::Warn } else { LogLevel::Error }, format!("连接已结束 (code {code:?})"));
 
-        let reason = match status.failure().cloned() {
+        let reason = match status.failure().cloned().or(classified) {
             Some(f) => f,
             None => {
                 let tail = self
@@ -328,10 +288,16 @@ impl App {
                     .iter()
                     .find(|t| t.cfg.id == id)
                     .and_then(|t| t.log.iter().rev().find(|l| l.level != LogLevel::Debug).map(|l| l.text.clone()))
-                    .unwrap_or_else(|| format!("ssh 退出，退出码 {code:?}"));
-                FailureInfo::with_short(FailureKind::Exited, "ssh 异常退出", tail)
+                    .unwrap_or_else(|| format!("连接已结束，代码 {code:?}"));
+                FailureInfo::with_short(FailureKind::Exited, "连接异常结束", tail)
             }
         };
+
+        // The session is already gone, but make sure no thread is left
+        // supervised for a tunnel that never established its forward.
+        if !was_up && !matches!(reason.kind, FailureKind::Exited) {
+            self.supervisor.stop(id);
+        }
 
         let auto = self.cfg.defaults.auto_restart;
         let retryable = reason.kind.is_retryable() || was_up;
