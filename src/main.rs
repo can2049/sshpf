@@ -8,7 +8,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind};
+use crossterm::execute;
 use ratatui::DefaultTerminal;
 
 use sshpf::app::App;
@@ -175,10 +176,21 @@ fn run_tui(paths: Paths, no_restore: bool) -> std::io::Result<ExitCode> {
     }
 
     let mut terminal: DefaultTerminal = ratatui::init();
+    // Mouse capture is on for the whole session: the import table's filtering and
+    // the table's row selection are click-driven, and terminals cannot report a
+    // click without it. It is best-effort — a terminal that refuses capture (some
+    // multiplexers, some CI ptys) must still give a working keyboard-only UI, so
+    // a failure is ignored rather than fatal.
+    let mouse = execute!(std::io::stdout(), EnableMouseCapture).is_ok();
     let result = event_loop(&mut terminal, &mut app, &quit);
     // Stop children and remove scratch files before restoring the terminal, so
     // a stray panic cannot leave the user's terminal in raw mode.
     app.shutdown();
+    if mouse {
+        // Releasing capture matters more than the return value: leaving it on
+        // makes the shell that regains control print garbage on every move.
+        let _ = execute!(std::io::stdout(), DisableMouseCapture);
+    }
     ratatui::restore();
     result.map(|()| ExitCode::SUCCESS)
 }
@@ -190,11 +202,15 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, quit: &Arc<AtomicBo
         if app.should_quit {
             break;
         }
-        if event::poll(TICK)?
-            && let Event::Key(key) = event::read()?
-            && key.kind == KeyEventKind::Press
-        {
-            keys::handle_key(app, key);
+        if event::poll(TICK)? {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => keys::handle_key(app, key),
+                // Mouse events are dispatched through the hit map the renderer
+                // recorded on the frame just drawn, so `App` resolves the target
+                // without `main` knowing anything about overlays or layout.
+                Event::Mouse(m) => keys::handle_mouse(app, m),
+                _ => {}
+            }
         }
     }
     Ok(())

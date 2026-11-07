@@ -5,11 +5,10 @@
 //! and drives it from key events.
 
 use crate::app::{App, ConfirmAction};
-use crate::model::{FormField, FormMode, ForwardKind, InputBuf, TunnelConfig, TunnelId, TunnelView, now_unix};
+use crate::model::{
+    self, FormField, FormMode, ForwardKind, ImportTable, InputBuf, TunnelConfig, TunnelId, TunnelView, now_unix,
+};
 use crate::ssh;
-
-/// How many candidate ports the local-port suggester probes before giving up.
-const PORT_SCAN_LIMIT: usize = 200;
 
 /// How the form is currently being driven.
 ///
@@ -48,6 +47,16 @@ pub struct FormState {
     pub local_port_auto: bool,
     /// Explanation of the current suggestion, shown under the fields.
     pub local_port_note: Option<String>,
+    /// Forwards discovered in `~/.ssh/config` for the selected host, with the
+    /// user's tick marks. Only used for a *new* tunnel: the rows the user keeps
+    /// become one tunnel each, because a `TunnelConfig` describes a single
+    /// forward. Empty means "no host picked yet".
+    pub import: ImportTable,
+    /// Show the import table (space-toggled from the SSH HOST field) even when
+    /// the user is not currently on that field.
+    pub import_open: bool,
+    /// The host whose forwards are in `import`; changing SSH HOST re-discovers.
+    import_host: String,
 }
 
 impl FormState {
@@ -68,6 +77,9 @@ impl FormState {
             port_hint: None,
             local_port_auto: true,
             local_port_note: None,
+            import: ImportTable::empty(),
+            import_open: false,
+            import_host: String::new(),
         }
     }
 
@@ -89,7 +101,25 @@ impl FormState {
             port_hint: None,
             local_port_auto: false, // editing an existing tunnel: keep its port
             local_port_note: None,
+            import: ImportTable::empty(),
+            import_open: false,
+            import_host: String::new(),
         }
+    }
+
+    /// Host whose forwards are currently in `import`.
+    pub fn import_host_name(&self) -> &str {
+        &self.import_host
+    }
+
+    /// Install a freshly discovered import table for `host`.
+    pub fn set_import_table(&mut self, host: impl Into<String>, table: ImportTable) {
+        self.import_host = host.into();
+        self.import = table;
+        // A new host's rows must not inherit the previous host's filter, but the
+        // pane-open state is a UI preference the user just expressed.
+        self.import.filters = std::array::from_fn(|_| String::new());
+        self.import.end_filter();
     }
 
     pub fn kind(&self) -> ForwardKind {
@@ -155,50 +185,19 @@ impl FormState {
         let addr = self.local_addr.value().trim().to_string();
         let probe_addr = if addr.is_empty() { "127.0.0.1" } else { addr.as_str() };
 
-        // Candidate order: the remote port itself, then upward.
-        //
-        // Privileged ports (<1024) are skipped: binding them needs root, so
-        // `port_available` would report every one of them as busy and the scan
-        // would burn its whole budget below 1024 without ever finding a usable
-        // port — which is exactly what happens for a remote port of 22.
-        // `taken` covers ports another managed tunnel owns but is not yet
-        // listening on.
-        let usable = |c: u16| !taken.contains(&c) && ssh::port_available(probe_addr, c);
-
-        // Candidate order:
-        //   1. the remote port itself (the intuitive "same number on both ends");
-        //   2. for privileged ports, a friendly unprivileged alias like 2222 for
-        //      ssh's 22 — that is what people type by hand anyway;
-        //   3. a plain upward scan from the first unprivileged port.
-        let mut chosen = None;
-        if remote >= 1024 && usable(remote) {
-            chosen = Some(remote);
-        }
-        if chosen.is_none() && remote < 1024 {
-            let alias = 2000u16.saturating_add(remote).saturating_add(200);
-            if usable(alias) {
-                chosen = Some(alias);
-            }
-        }
-        if chosen.is_none() {
-            for candidate in (remote.max(1024)..=u16::MAX).take(PORT_SCAN_LIMIT) {
-                if usable(candidate) {
-                    chosen = Some(candidate);
-                    break;
-                }
-            }
-        }
-
-        match chosen {
-            Some(port) => {
+        // The rules live in `model::plan_local_port` because the ssh-config
+        // importer needs exactly the same ones, and two copies of "which port
+        // should this land on" had already started to diverge.
+        match model::plan_local_port(remote, taken, |c| ssh::port_available(probe_addr, c)) {
+            Some((port, reason)) => {
                 self.local_port.set(port.to_string());
-                self.local_port_note = if port == remote {
-                    Some(format!("已自动设为 {port}（与远端端口相同）"))
-                } else if remote < 1024 {
-                    Some(format!("远端端口 {remote} 需特权，本地建议 {port}"))
-                } else {
-                    Some(format!("{remote} 已被占用，已自动顺延到 {port}"))
-                };
+                self.local_port_note = Some(match reason {
+                    model::LocalPortReason::SameAsRemote => format!("已自动设为 {port}（与远端端口相同）"),
+                    model::LocalPortReason::PrivilegedAlias => {
+                        format!("远端端口 {remote} 需特权，本地建议 {port}")
+                    }
+                    model::LocalPortReason::Bumped => format!("{remote} 已被占用，已自动顺延到 {port}"),
+                });
             }
             None => {
                 self.local_port_note = Some("找不到可用本地端口，请手动填写".to_string());
@@ -307,6 +306,21 @@ impl App {
     /// for confirmation (editing an existing one, which replaces a running
     /// process and therefore drops live connections).
     pub fn submit_form(&mut self) {
+        // The import pane, once it has loaded rows, owns the submit: it lists what
+        // the host already declares, so those rows are the intent and the port
+        // fields are only a scratch pad. Validating the scratch fields would
+        // reject a perfectly good batch (they are typically empty once the pane is
+        // in use) — and worse, unticking every row would fall through to the
+        // single-field path and report "名称不能为空", which describes a field the
+        // user is not even looking at.
+        if let Some(form) = self.form.as_ref()
+            && !form.is_modifying()
+            && !form.import.is_empty()
+        {
+            self.commit_form_create_from_import();
+            return;
+        }
+
         let Some(cfg) = self.validated_form_config() else {
             return;
         };

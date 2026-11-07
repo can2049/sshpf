@@ -24,5 +24,6 @@ pub mod ui;
 
 pub use app::App;
 pub use model::{
-    FailureInfo, FailureKind, ForwardKind, LogLevel, LogLine, LogRing, TunnelConfig, TunnelId, TunnelStatus, TunnelView,
+    BatchAction, FailureInfo, FailureKind, ForwardKind, ImportColumn, ImportRow, ImportTable, LogLevel, LogLine,
+    LogRing, MultiSelect, SshForward, TunnelConfig, TunnelId, TunnelStatus, TunnelView,
 };

@@ -118,6 +118,669 @@ impl TunnelConfig {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Forwards declared in ~/.ssh/config (`LocalForward` / `RemoteForward` /
+// `DynamicForward`), and the "import these into the form" table that lets a
+// user pick which of them a new tunnel batch should start with.
+// ---------------------------------------------------------------------------
+
+/// One forward directive read out of a `Host` block in `~/.ssh/config`.
+///
+/// This is *discovery* data: it is never persisted as-is. The form turns the
+/// rows the user keeps into `TunnelConfig`s, which is where `id`, `enabled`,
+/// `auto_restart` and the rest of the user intent live.
+///
+/// Addresses are kept as written in the config (`""` / `"*"` / `"0.0.0.0"` /
+/// a hostname) because OpenSSH gives them distinct meanings; the form decides
+/// how to normalise them, and the table shows exactly what was configured.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshForward {
+    /// Which directive it came from, so the table can show `L` / `R` / `D`.
+    pub kind: ForwardKind,
+    /// Listen address as written (`""` when the directive omitted it).
+    pub listen_addr: String,
+    /// Listen port (the local port for `-L`/`-D`, the remote one for `-R`).
+    pub listen_port: u16,
+    /// Target host as written (`-L`: reachable from the server; `-R`: local).
+    /// Always empty for `-D`.
+    pub target_host: String,
+    /// Target port (0 for `-D`).
+    pub target_port: u16,
+    /// `Host` alias this directive belongs to.
+    pub host_alias: String,
+    /// 1-based line number in the config file, for "where did this come from".
+    pub line: usize,
+    /// The directive verbatim, e.g. `LocalForward 8080 127.0.0.1:80`. Shown in
+    /// the table so the user can recognise a row without decoding it.
+    pub raw: String,
+}
+
+impl SshForward {
+    /// Stable identity of the *forward itself*, independent of where it was
+    /// declared. Used to de-duplicate rows that several matching `Host` blocks
+    /// contribute, and to remember which rows the user unticked across
+    /// re-filtering.
+    pub fn key(&self) -> String {
+        match self.kind {
+            ForwardKind::Dynamic => format!("D|{}|{}", self.listen_addr, self.listen_port),
+            _ => format!(
+                "{:?}|{}|{}|{}|{}",
+                self.kind, self.listen_addr, self.listen_port, self.target_host, self.target_port
+            ),
+        }
+    }
+
+    /// `LocalForward` / `RemoteForward` / `DynamicForward`.
+    pub fn directive(&self) -> &'static str {
+        match self.kind {
+            ForwardKind::Local => "LocalForward",
+            ForwardKind::Remote => "RemoteForward",
+            ForwardKind::Dynamic => "DynamicForward",
+        }
+    }
+
+    /// `listen` or `listen → target`, for the 目标 column.
+    pub fn target_display(&self) -> String {
+        match self.kind {
+            ForwardKind::Dynamic => "(SOCKS5)".to_string(),
+            _ => format!("{}:{}", self.target_host, self.target_port),
+        }
+    }
+
+    /// `addr:port`, with an empty address rendered as the OpenSSH default.
+    pub fn listen_display(&self) -> String {
+        let addr = if self.listen_addr.is_empty() { "localhost" } else { self.listen_addr.as_str() };
+        format!("{addr}:{}", self.listen_port)
+    }
+
+    /// Whether this row can be imported at all. Unix-domain-socket forwards and
+    /// non-numeric ports cannot be expressed as a `TunnelConfig`, so they are
+    /// listed but never selectable (the table renders them dimmed with a
+    /// reason) instead of silently disappearing.
+    pub fn unsupported_reason(&self) -> Option<&'static str> {
+        if self.listen_port == 0 {
+            return Some("端口无法解析");
+        }
+        if self.kind != ForwardKind::Dynamic && (self.target_host.is_empty() || self.target_port == 0) {
+            return Some("目标地址无法解析");
+        }
+        None
+    }
+
+    /// Suggested tunnel name, e.g. `cloud_pc-L-8080` — unique enough to sort,
+    /// short enough for the NAME column.
+    pub fn suggested_name(&self) -> String {
+        format!("{}-{}-{}", self.host_alias, self.kind.tag(), self.listen_port)
+    }
+}
+
+/// Why [`plan_local_port`] picked the port it did, for the form's hint text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalPortReason {
+    /// Same number as the remote port (the intuitive case).
+    SameAsRemote,
+    /// The remote port is privileged, so this is a friendly unprivileged alias
+    /// (`22 -> 2222`).
+    PrivilegedAlias,
+    /// The natural choice was taken, so the scan walked upwards.
+    Bumped,
+}
+
+/// Candidates the upward scan may probe before giving up.
+pub const PORT_SCAN_LIMIT: usize = 200;
+
+/// Choose a local listen port for a forward landing on `remote`.
+///
+/// This is the *one* implementation of the local-port rules; the form and the
+/// ssh-config importer both call it, because they already drifted once. The
+/// rules, in order:
+///
+/// 1. `remote` itself, when it is unprivileged and free — "the same number on
+///    both ends" is what people expect.
+/// 2. For a privileged `remote`, a friendly alias (`22 -> 2222`). Scanning up
+///    from a privileged port instead would be futile: binding one needs root, so
+///    `available` reports every candidate below 1024 as busy and the whole scan
+///    budget burns inside the privileged range. That bug was caught on the form
+///    path and is pinned by `privileged_remote_gets_an_alias_not_a_privileged_scan`;
+///    the importer must not reintroduce it.
+/// 3. Otherwise walk upwards **from 1024**, skipping anything `taken`.
+///
+/// `available` is a closure so this stays pure and unit-testable without binding
+/// real sockets.
+pub fn plan_local_port(remote: u16, taken: &[u16], available: impl Fn(u16) -> bool) -> Option<(u16, LocalPortReason)> {
+    if remote == 0 {
+        return None;
+    }
+    let usable = |c: u16| c >= 1024 && !taken.contains(&c) && available(c);
+
+    if remote >= 1024 && usable(remote) {
+        return Some((remote, LocalPortReason::SameAsRemote));
+    }
+    if remote < 1024 {
+        // The conventional alias: 22 -> 2222, 80 -> 2280, 443 -> 2643.
+        let alias = 2000u16.saturating_add(remote).saturating_add(200);
+        if usable(alias) {
+            return Some((alias, LocalPortReason::PrivilegedAlias));
+        }
+    }
+    (remote.max(1024)..=u16::MAX)
+        .take(PORT_SCAN_LIMIT)
+        .find(|candidate| usable(*candidate))
+        .map(|port| (port, LocalPortReason::Bumped))
+}
+
+/// Case-insensitive substring match used by the per-column filters.
+///
+/// Substring rather than the fuzzy subsequence matcher used by the main table:
+/// a column filter is a *scope narrowing* tool (`8080`, `localhost`, `-R`), and
+/// fuzzy matching on a port would happily return unrelated rows.
+pub fn col_match(needle: &str, haystack: &str) -> bool {
+    let needle = needle.trim();
+    if needle.is_empty() {
+        return true;
+    }
+    haystack.to_lowercase().contains(&needle.to_lowercase())
+}
+
+/// A column of the import table.
+///
+/// The checkbox column is selection state, not data, so it is deliberately not
+/// a variant here: a filter on it would be a second way to express "select
+/// all", which is what the row toggles are for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportColumn {
+    Kind,
+    Listen,
+    Target,
+    Raw,
+}
+
+impl ImportColumn {
+    pub const COUNT: usize = 4;
+    /// Columns that accept a filter, left to right.
+    pub const ALL: [ImportColumn; ImportColumn::COUNT] =
+        [ImportColumn::Kind, ImportColumn::Listen, ImportColumn::Target, ImportColumn::Raw];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ImportColumn::Kind => "类型",
+            ImportColumn::Listen => "监听",
+            ImportColumn::Target => "目标",
+            ImportColumn::Raw => "原始指令",
+        }
+    }
+
+    pub fn index(self) -> usize {
+        match self {
+            ImportColumn::Kind => 0,
+            ImportColumn::Listen => 1,
+            ImportColumn::Target => 2,
+            ImportColumn::Raw => 3,
+        }
+    }
+
+    /// `value` as the filter sees it, so the table and the matcher cannot
+    /// disagree about what a column contains.
+    pub fn cell(self, f: &SshForward) -> String {
+        match self {
+            ImportColumn::Kind => f.kind.tag().to_string(),
+            ImportColumn::Listen => f.listen_display(),
+            ImportColumn::Target => f.target_display(),
+            ImportColumn::Raw => f.raw.clone(),
+        }
+    }
+
+    pub fn next(self) -> ImportColumn {
+        ImportColumn::ALL[(self.index() + 1) % ImportColumn::COUNT]
+    }
+
+    pub fn prev(self) -> ImportColumn {
+        ImportColumn::ALL[(self.index() + ImportColumn::COUNT - 1) % ImportColumn::COUNT]
+    }
+}
+
+/// One candidate row: a forward found in `~/.ssh/config`, plus whether the user
+/// wants it created.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportRow {
+    pub forward: SshForward,
+    pub checked: bool,
+}
+
+impl ImportRow {
+    /// `false` for rows we can list but cannot import (unix sockets, a `-R`
+    /// with no destination): the table renders them dimmed with the reason.
+    pub fn importable(&self) -> bool {
+        self.forward.unsupported_reason().is_none()
+    }
+}
+
+/// How many filter snapshots the undo stack keeps.
+const FILTER_HISTORY_MAX: usize = 64;
+
+/// The "forwards found for this host" table shown when creating a tunnel.
+///
+/// Deliberately a *pure* state machine: it owns the candidate rows, the tick
+/// marks, the per-column filters and the filter undo stack, and knows nothing
+/// about `App`, SSH or rendering. That is what makes the filtering/selection
+/// rules unit-testable without a terminal.
+///
+/// Default policy (requirement: "默认勾选该 host 在 ~/.ssh/config 中的所有现有
+/// 端口转发"): every importable row starts checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportTable {
+    pub rows: Vec<ImportRow>,
+    /// Index into [`ImportTable::visible`], not into `rows`.
+    pub cursor: usize,
+    /// First visible row (scroll window).
+    pub scroll: u16,
+    /// One filter per [`ImportColumn`], indexed by `ImportColumn::index()`.
+    pub filters: [String; ImportColumn::COUNT],
+    /// The column filter currently being typed into, if any.
+    pub editing: Option<ImportColumn>,
+    /// Filter snapshots for undo (`z`). Newest last.
+    history: Vec<[String; ImportColumn::COUNT]>,
+}
+
+impl ImportTable {
+    /// Build a table from the discovered forwards: everything importable is
+    /// checked by default.
+    pub fn new(forwards: Vec<SshForward>) -> Self {
+        let rows = forwards
+            .into_iter()
+            .map(|forward| {
+                let checked = forward.unsupported_reason().is_none();
+                ImportRow { forward, checked }
+            })
+            .collect();
+        ImportTable {
+            rows,
+            cursor: 0,
+            scroll: 0,
+            filters: std::array::from_fn(|_| String::new()),
+            editing: None,
+            history: Vec::new(),
+        }
+    }
+
+    /// An empty table (`~/.ssh/config` has nothing for this host).
+    pub fn empty() -> Self {
+        ImportTable::new(Vec::new())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Row indices that survive every column filter, in file order.
+    pub fn visible(&self) -> Vec<usize> {
+        let active: Vec<ImportColumn> =
+            ImportColumn::ALL.into_iter().filter(|c| !self.filters[c.index()].trim().is_empty()).collect();
+        self.rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| active.iter().all(|col| col_match(&self.filters[col.index()], &col.cell(&row.forward))))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// The row under the cursor.
+    pub fn cursor_row(&self) -> Option<&ImportRow> {
+        self.visible().get(self.cursor).and_then(|i| self.rows.get(*i))
+    }
+
+    pub fn cursor_forward(&self) -> Option<SshForward> {
+        self.cursor_row().map(|r| r.forward.clone())
+    }
+
+    /// Keep `cursor` inside the filtered view. Called after any filter or row
+    /// change, because a shrinking view must never leave a dangling cursor.
+    pub fn clamp_cursor(&mut self) {
+        let n = self.visible().len();
+        self.cursor = if n == 0 { 0 } else { self.cursor.min(n - 1) };
+    }
+
+    pub fn move_cursor(&mut self, delta: i32) {
+        self.clamp_cursor();
+        let n = self.visible().len();
+        if n == 0 {
+            return;
+        }
+        let next = self.cursor as i64 + delta as i64;
+        self.cursor = next.clamp(0, n as i64 - 1) as usize;
+    }
+
+    pub fn home(&mut self) {
+        self.cursor = 0;
+    }
+
+    pub fn end(&mut self) {
+        self.cursor = self.visible().len().saturating_sub(1);
+    }
+
+    /// Clip `scroll` so the cursor row is inside a `height`-row viewport.
+    pub fn ensure_visible(&mut self, height: usize) {
+        let sel = self.cursor as u16;
+        if height == 0 {
+            self.scroll = sel;
+            return;
+        }
+        let height = height as u16;
+        if sel < self.scroll {
+            self.scroll = sel;
+        } else if sel >= self.scroll + height {
+            self.scroll = sel + 1 - height;
+        }
+    }
+
+    // -- selection ---------------------------------------------------------
+
+    pub fn toggle_cursor(&mut self) {
+        if let Some(&idx) = self.visible().get(self.cursor)
+            && let Some(row) = self.rows.get_mut(idx)
+            && row.importable()
+        {
+            row.checked = !row.checked;
+        }
+    }
+
+    /// Tick every importable row in the *filtered* view.
+    ///
+    /// Filtered, not all: with a filter active the user is looking at a subset,
+    /// and a "全选" that silently checked hidden rows would be a footgun.
+    pub fn check_all_visible(&mut self) {
+        for idx in self.visible() {
+            if let Some(row) = self.rows.get_mut(idx)
+                && row.importable()
+            {
+                row.checked = true;
+            }
+        }
+    }
+
+    pub fn uncheck_all_visible(&mut self) {
+        for idx in self.visible() {
+            if let Some(row) = self.rows.get_mut(idx) {
+                row.checked = false;
+            }
+        }
+    }
+
+    pub fn invert_visible(&mut self) {
+        for idx in self.visible() {
+            if let Some(row) = self.rows.get_mut(idx)
+                && row.importable()
+            {
+                row.checked = !row.checked;
+            }
+        }
+    }
+
+    pub fn checked_count(&self) -> usize {
+        self.rows.iter().filter(|r| r.checked && r.importable()).count()
+    }
+
+    pub fn importable_count(&self) -> usize {
+        self.rows.iter().filter(|r| r.importable()).count()
+    }
+
+    pub fn any_checked(&self) -> bool {
+        self.checked_count() > 0
+    }
+
+    /// The checked forwards, in file order — what the form turns into tunnels.
+    pub fn checked_forwards(&self) -> Vec<SshForward> {
+        self.rows.iter().filter(|r| r.checked && r.importable()).map(|r| r.forward.clone()).collect()
+    }
+
+    // -- filters -----------------------------------------------------------
+
+    pub fn has_filters(&self) -> bool {
+        self.filters.iter().any(|f| !f.trim().is_empty())
+    }
+
+    pub fn filter(&self, col: ImportColumn) -> &str {
+        &self.filters[col.index()]
+    }
+
+    fn snapshot(&mut self) {
+        self.history.push(self.filters.clone());
+        if self.history.len() > FILTER_HISTORY_MAX {
+            self.history.remove(0);
+        }
+    }
+
+    /// Replace one column's filter, recording an undo point.
+    pub fn set_filter(&mut self, col: ImportColumn, text: impl Into<String>) {
+        self.snapshot();
+        self.filters[col.index()] = text.into();
+        self.after_filter_change();
+    }
+
+    pub fn filter_char(&mut self, col: ImportColumn, c: char) {
+        self.snapshot();
+        self.filters[col.index()].push(c);
+        self.after_filter_change();
+    }
+
+    pub fn filter_backspace(&mut self, col: ImportColumn) {
+        if self.filters[col.index()].is_empty() {
+            return;
+        }
+        self.snapshot();
+        self.filters[col.index()].pop();
+        self.after_filter_change();
+    }
+
+    /// Delete one column's filter (undoable).
+    pub fn clear_filter(&mut self, col: ImportColumn) {
+        if self.filters[col.index()].is_empty() {
+            return;
+        }
+        self.snapshot();
+        self.filters[col.index()].clear();
+        self.after_filter_change();
+    }
+
+    /// Delete every filter at once (undoable).
+    pub fn clear_all_filters(&mut self) {
+        if !self.has_filters() {
+            return;
+        }
+        self.snapshot();
+        self.filters = std::array::from_fn(|_| String::new());
+        self.after_filter_change();
+    }
+
+    /// Roll back the most recent filter change. Returns true when something was
+    /// undone, so the caller can say so instead of failing silently.
+    pub fn undo_filter(&mut self) -> bool {
+        match self.history.pop() {
+            Some(prev) => {
+                self.filters = prev;
+                self.after_filter_change();
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn can_undo_filter(&self) -> bool {
+        !self.history.is_empty()
+    }
+
+    fn after_filter_change(&mut self) {
+        // The filtered view changed size: re-anchor the cursor instead of
+        // leaving it pointing at a row that is no longer shown.
+        self.cursor = 0;
+        self.scroll = 0;
+        self.clamp_cursor();
+    }
+
+    /// Begin typing into a column filter.
+    pub fn begin_filter(&mut self, col: ImportColumn) {
+        self.editing = Some(col);
+    }
+
+    pub fn end_filter(&mut self) {
+        self.editing = None;
+    }
+
+    /// The status line: `3/5 条勾选 · 筛选: 类型=R, 监听=8080`.
+    pub fn summary(&self) -> String {
+        let mut s = format!("{}/{} 条勾选", self.checked_count(), self.importable_count());
+        if self.has_filters() {
+            let parts: Vec<String> = ImportColumn::ALL
+                .into_iter()
+                .filter(|c| !self.filters[c.index()].trim().is_empty())
+                .map(|c| format!("{}={}", c.label(), self.filters[c.index()]))
+                .collect();
+            s.push_str(&format!(" · 筛选: {}", parts.join(", ")));
+        }
+        s
+    }
+}
+
+/// One or more rows of the main table marked for a batch operation.
+///
+/// Selection is by `TunnelId`, not by row index: rows move when the filter
+/// changes or a tunnel is deleted, and a marked set that silently retargeted
+/// another tunnel would be dangerous for a batch delete.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MultiSelect {
+    /// Whether the table is in selection mode at all.
+    pub active: bool,
+    /// Marked tunnel ids, ascending for stable prompts.
+    pub marked: std::collections::BTreeSet<TunnelId>,
+    /// Row the mark was last extended from (an index into `visible_indices`),
+    /// for shift+click / shift+j range marking.
+    pub anchor: Option<usize>,
+}
+
+impl MultiSelect {
+    pub fn new() -> Self {
+        MultiSelect::default()
+    }
+
+    /// Enter selection mode with nothing marked.
+    ///
+    /// Deliberately empty rather than pre-marking the cursor row: `space` must
+    /// mean the same thing before and after entering (toggle the row under the
+    /// cursor). If entering already marked it, the first `space` would *unmark*
+    /// the row the user just pointed at, which reads as a bug.
+    pub fn enter(&mut self) {
+        self.active = true;
+        self.marked.clear();
+        self.anchor = None;
+    }
+
+    pub fn exit(&mut self) {
+        self.active = false;
+        self.marked.clear();
+        self.anchor = None;
+    }
+
+    pub fn is_marked(&self, id: TunnelId) -> bool {
+        self.marked.contains(&id)
+    }
+
+    pub fn len(&self) -> usize {
+        self.marked.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.marked.is_empty()
+    }
+
+    pub fn toggle(&mut self, id: TunnelId) {
+        if !self.marked.remove(&id) {
+            self.marked.insert(id);
+        }
+    }
+
+    pub fn set(&mut self, id: TunnelId, on: bool) {
+        if on {
+            self.marked.insert(id);
+        } else {
+            self.marked.remove(&id);
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.marked.clear();
+        self.anchor = None;
+    }
+
+    /// Mark every id in `ids` (used by 全选 on the filtered view).
+    pub fn mark_all(&mut self, ids: &[TunnelId]) {
+        self.marked.extend(ids.iter().copied());
+    }
+
+    /// Mark the inclusive range `from..=to` in `ids`.
+    pub fn mark_range(&mut self, ids: &[TunnelId], from: usize, to: usize) {
+        if ids.is_empty() {
+            return;
+        }
+        let (lo, hi) = if from <= to { (from, to) } else { (to, from) };
+        let lo = lo.min(ids.len() - 1);
+        let hi = hi.min(ids.len() - 1);
+        self.marked.extend(ids[lo..=hi].iter().copied());
+        self.anchor = Some(hi);
+    }
+
+    /// Drop marks for tunnels that no longer exist (after a batch delete).
+    pub fn retain_existing(&mut self, exists: impl Fn(TunnelId) -> bool) {
+        self.marked.retain(|id| exists(*id));
+        if self.marked.is_empty() {
+            self.anchor = None;
+        }
+    }
+
+    /// Marked ids as a `Vec`, for prompts and dispatch.
+    pub fn ids(&self) -> Vec<TunnelId> {
+        self.marked.iter().copied().collect()
+    }
+}
+
+/// An operation a multi-selection can perform at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchAction {
+    Start,
+    Stop,
+    Restart,
+    Delete,
+}
+
+impl BatchAction {
+    pub const ALL: [BatchAction; 4] =
+        [BatchAction::Start, BatchAction::Stop, BatchAction::Restart, BatchAction::Delete];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            BatchAction::Start => "启用",
+            BatchAction::Stop => "停用",
+            BatchAction::Restart => "重启",
+            BatchAction::Delete => "删除",
+        }
+    }
+
+    /// Every batch operation goes through the confirmation gate: even "enable"
+    /// opens N listeners at once, which is exactly what the single-row flow
+    /// already warns about.
+    pub fn prompt(self, n: usize) -> String {
+        match self {
+            BatchAction::Start => format!("确认启用选中的 {n} 条转发？将新开 {n} 个监听端口。"),
+            BatchAction::Stop => format!("确认停用选中的 {n} 条转发？将断开它们的连接。"),
+            BatchAction::Restart => format!("确认重启选中的 {n} 条转发？连接会短暂中断。"),
+            BatchAction::Delete => format!("确认删除选中的 {n} 条转发？此操作不可撤销。"),
+        }
+    }
+}
+
 /// Coarse failure classification, rendered as a short phrase in the table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureKind {
@@ -1035,6 +1698,404 @@ mod tests {
         assert_eq!(StatusMsg::error("e").level, LogLevel::Error);
         assert_eq!(StatusMsg::warn("w").level, LogLevel::Warn);
         assert_eq!(StatusMsg::ok("o").level, LogLevel::Info);
+    }
+
+    // -- shared local-port planning ----------------------------------------
+
+    #[test]
+    fn a_free_unprivileged_remote_port_is_reused_verbatim() {
+        let (port, reason) = plan_local_port(8080, &[], |_| true).unwrap();
+        assert_eq!(port, 8080);
+        assert_eq!(reason, LocalPortReason::SameAsRemote);
+    }
+
+    #[test]
+    fn a_privileged_remote_port_gets_an_unprivileged_alias() {
+        // The trap this pins: scanning up from 80 would stay below 1024, where
+        // every bind needs root. The old importer code did exactly that and
+        // produced another privileged port (280 for a requested 80).
+        for (remote, alias) in [(22u16, 2222u16), (80, 2280), (443, 2643)] {
+            let (port, reason) = plan_local_port(remote, &[], |_| true).unwrap();
+            assert_eq!(port, alias, "remote {remote} should alias to {alias}");
+            assert!(port >= 1024, "alias for {remote} must be unprivileged, got {port}");
+            assert_eq!(reason, LocalPortReason::PrivilegedAlias);
+        }
+    }
+
+    #[test]
+    fn a_privileged_remote_never_yields_a_privileged_result() {
+        // Even when the alias is taken, the fallback scan must stay >= 1024.
+        for remote in 1u16..=1023 {
+            let (port, _) = plan_local_port(remote, &[], |_| true).expect("should always find something");
+            assert!(port >= 1024, "remote {remote} produced privileged local {port}");
+        }
+    }
+
+    #[test]
+    fn a_taken_port_is_bumped_upwards() {
+        // 8080 taken by another tunnel -> the next free one, never a lower port.
+        let (port, reason) = plan_local_port(8080, &[8080], |c| c != 8081).unwrap();
+        assert_eq!(port, 8082, "must skip both the taken and the unavailable port");
+        assert_eq!(reason, LocalPortReason::Bumped);
+        assert!(port > 8080, "bumping must not wrap downwards");
+    }
+
+    #[test]
+    fn taken_ports_below_the_unprivileged_floor_are_irrelevant() {
+        // A privileged port in `taken` cannot affect the >=1024 result.
+        let (port, _) = plan_local_port(8080, &[22, 80], |_| true).unwrap();
+        assert_eq!(port, 8080);
+    }
+
+    #[test]
+    fn port_zero_is_not_plannable() {
+        assert!(plan_local_port(0, &[], |_| true).is_none(), "port 0 means 'unknown', not 'pick one'");
+    }
+
+    #[test]
+    fn planning_gives_up_rather_than_hanging_when_nothing_is_free() {
+        // A closure that rejects everything must terminate, not spin.
+        assert!(plan_local_port(8080, &[], |_| false).is_none());
+    }
+
+    #[test]
+    fn planning_never_lands_inside_the_taken_set() {
+        // Take a contiguous block and check the plan lands outside it.
+        let taken: Vec<u16> = (8080..8085).collect();
+        let (port, _) = plan_local_port(8080, &taken, |_| true).unwrap();
+        assert!(!taken.contains(&port), "{port} is in the taken set");
+        assert_eq!(port, 8085);
+    }
+
+    // -- ssh-config import table -------------------------------------------
+
+    fn fwd(kind: ForwardKind, listen: u16, target: (&str, u16)) -> SshForward {
+        SshForward {
+            kind,
+            listen_addr: "127.0.0.1".into(),
+            listen_port: listen,
+            target_host: target.0.into(),
+            target_port: target.1,
+            host_alias: "dev-box".into(),
+            line: 7,
+            raw: format!("{:?}Forward {listen} {}:{}", kind, target.0, target.1),
+        }
+    }
+
+    fn sample_table() -> ImportTable {
+        ImportTable::new(vec![
+            fwd(ForwardKind::Local, 8080, ("10.0.0.1", 80)),
+            fwd(ForwardKind::Local, 9090, ("10.0.0.2", 90)),
+            fwd(ForwardKind::Remote, 7000, ("127.0.0.1", 22)),
+            fwd(ForwardKind::Dynamic, 1080, ("", 0)),
+        ])
+    }
+
+    #[test]
+    fn every_importable_row_starts_checked() {
+        // Requirement: the host's existing forwards are the default, so creating
+        // a tunnel should already carry them without any clicking.
+        let t = sample_table();
+        assert_eq!(t.checked_count(), 4);
+        assert_eq!(t.importable_count(), 4);
+        assert!(t.rows.iter().all(|r| r.checked));
+        assert_eq!(t.checked_forwards().len(), 4);
+    }
+
+    #[test]
+    fn unimportable_rows_are_never_checked_by_default() {
+        let mut bad = fwd(ForwardKind::Local, 0, ("", 0));
+        bad.listen_port = 0;
+        let t = ImportTable::new(vec![bad, fwd(ForwardKind::Local, 8080, ("10.0.0.1", 80))]);
+        assert_eq!(t.len(), 2);
+        assert_eq!(t.importable_count(), 1, "the broken row is listed but not importable");
+        assert!(!t.rows[0].checked);
+        assert!(t.rows[1].checked);
+        assert_eq!(t.checked_forwards().len(), 1);
+    }
+
+    #[test]
+    fn toggling_ignores_unimportable_rows() {
+        let mut bad = fwd(ForwardKind::Local, 0, ("", 0));
+        bad.listen_port = 0;
+        let mut t = ImportTable::new(vec![bad]);
+        t.toggle_cursor();
+        assert!(!t.rows[0].checked, "a row that cannot be imported must not become checked");
+        t.check_all_visible();
+        assert!(!t.rows[0].checked, "select-all must skip it too");
+    }
+
+    #[test]
+    fn column_filters_are_anded_and_case_insensitive() {
+        let mut t = sample_table();
+        t.set_filter(ImportColumn::Kind, "L");
+        assert_eq!(t.visible(), vec![0, 1], "only Local rows");
+        t.set_filter(ImportColumn::Listen, "9090");
+        assert_eq!(t.visible(), vec![1], "both filters must hold");
+        // Substring, not prefix: "0.0." only appears in the middle of the
+        // rendered listen address.
+        t.set_filter(ImportColumn::Listen, "0.1:9");
+        assert_eq!(t.visible(), vec![1], "a substring match is enough");
+        t.set_filter(ImportColumn::Listen, "127.0.0.1");
+        assert_eq!(t.visible(), vec![0, 1], "every Local row listens on loopback");
+        t.set_filter(ImportColumn::Target, "10.0.0.2");
+        assert_eq!(t.visible(), vec![1]);
+        t.clear_all_filters();
+        assert_eq!(t.visible().len(), 4);
+    }
+
+    #[test]
+    fn filters_match_case_insensitively_and_ignore_padding() {
+        let t = ImportTable::new(vec![SshForward {
+            kind: ForwardKind::Local,
+            listen_addr: String::new(),
+            listen_port: 8080,
+            target_host: "LocalHost".into(),
+            target_port: 80,
+            host_alias: "h".into(),
+            line: 1,
+            raw: "LocalForward 8080 LocalHost:80".into(),
+        }]);
+        assert!(col_match("localhost", &ImportColumn::Target.cell(&t.rows[0].forward)));
+        assert!(col_match("  LOCAL  ", "localhost"), "surrounding spaces must not break a filter");
+        assert!(col_match("", "anything"), "an empty filter matches everything");
+    }
+
+    #[test]
+    fn an_empty_listen_addr_renders_as_the_openssh_default() {
+        let f = SshForward {
+            kind: ForwardKind::Local,
+            listen_addr: String::new(),
+            listen_port: 8080,
+            target_host: "10.0.0.1".into(),
+            target_port: 80,
+            host_alias: "h".into(),
+            line: 1,
+            raw: String::new(),
+        };
+        assert_eq!(f.listen_display(), "localhost:8080", "an omitted bind address is localhost");
+    }
+
+    #[test]
+    fn filter_undo_rolls_back_one_step_at_a_time() {
+        let mut t = sample_table();
+        assert!(!t.can_undo_filter());
+        t.set_filter(ImportColumn::Kind, "L");
+        t.set_filter(ImportColumn::Listen, "8080");
+        assert_eq!(t.visible(), vec![0]);
+        assert!(t.undo_filter());
+        assert_eq!(t.filter(ImportColumn::Listen), "", "the newest change is undone first");
+        assert_eq!(t.visible(), vec![0, 1]);
+        assert!(t.undo_filter());
+        assert!(!t.has_filters());
+        assert!(!t.undo_filter(), "nothing left to undo must report false, not panic");
+    }
+
+    #[test]
+    fn clearing_an_already_empty_filter_is_not_an_undo_step() {
+        // Otherwise `F` on an unfiltered column would push a snapshot and make
+        // `z` look broken (it would appear to do nothing).
+        let mut t = sample_table();
+        t.clear_filter(ImportColumn::Kind);
+        t.clear_all_filters();
+        assert!(!t.can_undo_filter());
+    }
+
+    #[test]
+    fn filter_history_is_bounded() {
+        let mut t = sample_table();
+        for i in 0..(FILTER_HISTORY_MAX + 20) {
+            t.set_filter(ImportColumn::Kind, i.to_string());
+        }
+        let mut undoable = 0;
+        while t.undo_filter() {
+            undoable += 1;
+        }
+        assert_eq!(undoable, FILTER_HISTORY_MAX, "the undo stack must not grow without bound");
+    }
+
+    #[test]
+    fn changing_a_filter_reanchors_a_dangling_cursor() {
+        // A filter that hides everything must not leave the cursor pointing at
+        // row 5 of a one-row view.
+        let mut t = sample_table();
+        t.cursor = 3;
+        t.set_filter(ImportColumn::Listen, "8080");
+        assert_eq!(t.cursor, 0);
+        assert!(t.cursor_row().is_some());
+        t.set_filter(ImportColumn::Listen, "zzz-no-match");
+        assert_eq!(t.visible(), Vec::<usize>::new());
+        assert!(t.cursor_row().is_none(), "no match means no cursor row, not a panic");
+        t.move_cursor(1);
+        assert_eq!(t.cursor, 0, "moving in an empty view is a no-op");
+    }
+
+    #[test]
+    fn select_all_only_touches_the_filtered_view() {
+        let mut t = sample_table();
+        t.uncheck_all_visible();
+        assert_eq!(t.checked_count(), 0);
+        t.set_filter(ImportColumn::Kind, "D");
+        t.check_all_visible();
+        assert_eq!(t.visible(), vec![3]);
+        assert_eq!(t.checked_count(), 1, "only the visible row may be ticked");
+        // Clearing the filter shows the others are still unticked.
+        t.clear_all_filters();
+        assert_eq!(t.checked_count(), 1);
+    }
+
+    #[test]
+    fn invert_flips_only_the_visible_importable_rows() {
+        let mut t = sample_table();
+        t.set_filter(ImportColumn::Kind, "L");
+        t.invert_visible();
+        assert_eq!(t.checked_count(), 2, "the two Local rows flipped on... to off; the others stay on");
+        // Initially 4 checked; flipping 2 visible ones leaves 2 checked.
+        assert!(!t.rows[0].checked && !t.rows[1].checked);
+        assert!(t.rows[2].checked && t.rows[3].checked, "hidden rows must not change");
+    }
+
+    #[test]
+    fn checked_forwards_keep_file_order() {
+        let t = sample_table();
+        let ports: Vec<u16> = t.checked_forwards().iter().map(|f| f.listen_port).collect();
+        assert_eq!(ports, vec![8080, 9090, 7000, 1080]);
+    }
+
+    #[test]
+    fn summary_reports_counts_and_active_filters() {
+        let mut t = sample_table();
+        assert_eq!(t.summary(), "4/4 条勾选");
+        t.uncheck_all_visible();
+        t.set_filter(ImportColumn::Kind, "L");
+        let s = t.summary();
+        assert!(s.contains("0/4"), "{s}");
+        assert!(s.contains("类型=L"), "{s}");
+    }
+
+    #[test]
+    fn cursor_movement_clamps_instead_of_wrapping() {
+        let mut t = sample_table();
+        t.move_cursor(99);
+        assert_eq!(t.cursor, 3, "clamps at the last row");
+        t.move_cursor(-99);
+        assert_eq!(t.cursor, 0);
+        t.end();
+        assert_eq!(t.cursor, 3);
+        t.home();
+        assert_eq!(t.cursor, 0);
+    }
+
+    #[test]
+    fn cursor_stays_inside_a_scrolled_window() {
+        let mut t = sample_table();
+        t.ensure_visible(2);
+        t.move_cursor(3);
+        t.ensure_visible(2);
+        // cursor 3 in a 2-row window must put the window at rows 2..=3.
+        assert_eq!(t.scroll, 2);
+        t.home();
+        t.ensure_visible(2);
+        assert_eq!(t.scroll, 0, "scrolling back up must follow the cursor");
+    }
+
+    #[test]
+    fn import_columns_cycle_and_expose_their_cells() {
+        let mut col = ImportColumn::Kind;
+        for _ in 0..ImportColumn::COUNT {
+            assert!(!col.label().is_empty());
+            col = col.next();
+        }
+        assert_eq!(col, ImportColumn::Kind, "cycling wraps");
+        assert_eq!(ImportColumn::Kind.prev(), ImportColumn::Raw);
+
+        let f = fwd(ForwardKind::Dynamic, 1080, ("", 0));
+        assert_eq!(ImportColumn::Kind.cell(&f), "D");
+        assert_eq!(ImportColumn::Target.cell(&f), "(SOCKS5)", "a SOCKS row has no target");
+    }
+
+    // -- multi-select ------------------------------------------------------
+
+    #[test]
+    fn multi_select_enter_marks_the_cursor_and_exit_clears() {
+        let mut ms = MultiSelect::new();
+        assert!(!ms.active);
+        ms.enter();
+        assert!(ms.active);
+        assert!(ms.is_empty(), "entering must not pre-mark anything");
+        ms.mark_all(&[7]);
+        assert_eq!(ms.ids(), vec![7]);
+        ms.exit();
+        assert!(!ms.active);
+        assert!(ms.is_empty());
+        assert_eq!(ms.anchor, None);
+    }
+
+    #[test]
+    fn multi_select_toggle_and_set() {
+        let mut ms = MultiSelect::new();
+        ms.enter();
+        ms.toggle(1);
+        ms.toggle(2);
+        assert_eq!(ms.len(), 2);
+        ms.toggle(1);
+        assert_eq!(ms.ids(), vec![2], "a second toggle removes");
+        ms.set(2, false);
+        assert!(ms.is_empty());
+        ms.set(3, true);
+        assert_eq!(ms.ids(), vec![3]);
+    }
+
+    #[test]
+    fn multi_select_range_is_inclusive_and_order_insensitive() {
+        let ids: Vec<TunnelId> = (1..=6).collect();
+        let mut ms = MultiSelect::new();
+        ms.mark_range(&ids, 1, 3);
+        assert_eq!(ms.ids(), vec![2, 3, 4]);
+        // Dragging backwards marks the same set.
+        ms.enter();
+        ms.mark_range(&ids, 4, 2);
+        assert_eq!(ms.ids(), vec![3, 4, 5]);
+        // Out-of-range indices are clamped, not a panic.
+        ms.enter();
+        ms.mark_range(&ids, 0, 99);
+        assert_eq!(ms.len(), 6);
+        ms.enter();
+        ms.mark_range(&[], 0, 2);
+        assert!(ms.is_empty(), "an empty view marks nothing");
+    }
+
+    #[test]
+    fn retain_existing_drops_marks_for_deleted_tunnels() {
+        let mut ms = MultiSelect::new();
+        ms.enter();
+        ms.mark_all(&[1, 2, 3]);
+        ms.retain_existing(|id| id != 2);
+        assert_eq!(ms.ids(), vec![1, 3]);
+        ms.retain_existing(|_| false);
+        assert!(ms.is_empty());
+        assert_eq!(ms.anchor, None, "an empty selection must not keep an anchor");
+    }
+
+    #[test]
+    fn marked_ids_are_sorted_for_stable_prompts() {
+        let mut ms = MultiSelect::new();
+        ms.enter();
+        for id in [9, 3, 5] {
+            ms.mark_all(&[id]);
+        }
+        assert_eq!(ms.ids(), vec![3, 5, 9]);
+    }
+
+    #[test]
+    fn every_batch_action_has_a_label_and_a_counted_prompt() {
+        for action in BatchAction::ALL {
+            assert!(!action.label().is_empty());
+            let prompt = action.prompt(3);
+            assert!(prompt.contains('3'), "{action:?} prompt must state the count: {prompt}");
+            assert!(!prompt.contains('\n'), "prompts must stay single-line");
+        }
+        assert_eq!(BatchAction::ALL.len(), 4);
     }
 
     #[test]

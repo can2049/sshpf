@@ -12,16 +12,19 @@ use std::time::{Duration, Instant};
 
 use crate::config::{self, ConfigFile, Paths};
 use crate::model::{
-    FailureInfo, FormMode, ForwardKind, HostPicker, StatusMsg, TunnelConfig, TunnelId, TunnelStatus, TunnelView,
-    fuzzy_match, now_unix,
+    BatchAction, FailureInfo, FormMode, ForwardKind, HostPicker, MultiSelect, StatusMsg, TunnelConfig, TunnelId,
+    TunnelStatus, TunnelView, fuzzy_match, now_unix,
 };
 use crate::ssh::{self, SshHost};
 use crate::tunnel::{Supervisor, TunnelEvent};
 
 pub mod confirm;
 pub mod form;
+pub mod import;
+pub mod mouse;
 pub mod picker;
 pub mod runtime;
+pub mod select;
 
 pub use form::{EditMode, FormState};
 
@@ -71,6 +74,8 @@ pub enum ConfirmAction {
     ApplyEdit(TunnelId),
     /// Discard unsaved edits (loses typed input).
     DiscardForm,
+    /// Apply one operation to every marked tunnel in selection mode.
+    Batch { action: BatchAction, count: usize },
     /// Quit the program (kills all children).
     Quit,
 }
@@ -119,6 +124,16 @@ pub struct App {
     /// Tunnels whose driver reported readiness. Retained for compatibility with
     /// the stop/restart bookkeeping (`forget_runtime_state`).
     saw_listening: std::collections::HashSet<TunnelId>,
+    /// Multi-row selection on the main table (`v` enters selection mode).
+    pub select_mode: MultiSelect,
+    /// Semantic map of what was drawn last frame, for mouse hit-testing.
+    ///
+    /// The renderer owns it: `ui::draw` clears it and re-records every frame.
+    /// Keeping it on `App` (rather than in the renderer) is what lets the mouse
+    /// handler resolve a click without re-deriving the layout.
+    pub hits: crate::ui::hit::HitMap,
+    /// Why reading forwards out of `~/.ssh/config` failed for the open form.
+    pub import_error: Option<String>,
 }
 
 impl App {
@@ -154,6 +169,9 @@ impl App {
             pending_exit: HashMap::new(),
             pending_reason: HashMap::new(),
             saw_listening: std::collections::HashSet::new(),
+            select_mode: MultiSelect::new(),
+            hits: crate::ui::hit::HitMap::new(),
+            import_error: None,
         }
     }
 
@@ -171,6 +189,17 @@ impl App {
             })
             .map(|(i, _)| i)
             .collect()
+    }
+
+    /// Ids of the rows currently visible (filter applied), in display order.
+    pub fn visible_ids(&self) -> Vec<TunnelId> {
+        self.visible_indices().iter().filter_map(|i| self.tunnels.get(*i)).map(|t| t.cfg.id).collect()
+    }
+
+    /// Marked ids that still exist, in display order so prompts and bulk logs
+    /// read in the same order as the table.
+    pub fn marked_ids_in_view_order(&self) -> Vec<TunnelId> {
+        self.visible_ids().into_iter().filter(|id| self.select_mode.is_marked(*id)).collect()
     }
 
     pub fn selected_tunnel(&self) -> Option<&TunnelView> {
@@ -316,6 +345,16 @@ impl App {
         let Some(id) = self.selected_id() else {
             return;
         };
+        self.delete_tunnel(id);
+        self.set_status(StatusMsg::info("已删除"));
+    }
+
+    /// Remove one tunnel definition and its runtime state.
+    ///
+    /// Split out from [`App::delete_selected`] because the batch path deletes by
+    /// id without moving the cursor between removals (a shuffled cursor would
+    /// make `selected` mean a different tunnel on every iteration).
+    pub fn delete_tunnel(&mut self, id: TunnelId) {
         self.supervisor.stop(id);
         self.forget_runtime_state(id);
         self.cfg.tunnels.retain(|t| t.id != id);
@@ -323,7 +362,6 @@ impl App {
         let n = self.visible_indices().len();
         self.selected = self.selected.min(n.saturating_sub(1));
         self.persist_quietly();
-        self.set_status(StatusMsg::info("已删除"));
     }
 
     /// `x`: stopping everything is a bulk destructive action.

@@ -1,0 +1,450 @@
+# 从 `~/.ssh/config` 导入转发
+
+`sshpf` 从不写 `~/.ssh/config`，但会**读**它。除了读连接参数（`HostName` / `Port` /
+`User` / `ProxyJump` / `IdentityFile`），它还读三组转发指令：
+
+```text
+LocalForward   [bind_address:]port  host:hostport
+RemoteForward  [bind_address:]port  host:hostport
+DynamicForward [bind_address:]port
+```
+
+新建转发的表单里选好主机后，这些指令会以表格列出，**默认全部勾选**，取消掉不要的再保存。
+保存时一条勾选行生成一条隧道——`TunnelConfig` 只描述一条转发，所以 N 行就是 N 条。
+
+本文说明扫描规则、去重、不可导入的行，以及一次完整的"从配置到隧道"的推演。
+
+## 因子：为什么不用 `ssh2-config` 的现成字段
+
+`~/.ssh/config` 的**连接参数**由 [`ssh2-config`](https://crates.io/crates/ssh2-config) 0.9.0 解析
+（见 [design.md](design.md) §2）。但**转发指令**不行，因为该版本对三者支持不对等：
+
+| 指令 | `ssh2-config` 0.9.0 的处理 | 直接用它读会怎样 |
+|---|---|---|
+| `RemoteForward` | 有 `HostParams::remote_forward: Vec<RemoteForward>`，逐行追加 | 可用 |
+| `LocalForward` | `Field::LocalForward` 落在"not implemented"分支，`ALLOW_UNSUPPORTED_FIELDS` 下进 `unsupported_fields` | 丢顺序、丢条数 |
+| `DynamicForward` | 同上 | 丢顺序、丢条数 |
+
+`unsupported_fields` 的类型是 `HashMap<String, Vec<String>>`——**以指令名为 key**，
+每条指令的实参是一个名字下的 `Vec<String>`。实测（同一个 `Host` 写 2 条 `LocalForward`
++ 1 条 `DynamicForward`）：
+
+```text
+Host cloud_pc
+  LocalForward 18789 127.0.0.1:18789
+  LocalForward 8090 127.0.0.1:8080
+  DynamicForward 1080
+  RemoteForward 7000 localhost:22
+  RemoteForward 7001 localhost:23
+
+ssh2-config 0.9.0, ParseRule::ALLOW_UNSUPPORTED_FIELDS:
+  remote_forward     = [7000→localhost:22, 7001→localhost:23]   ← 两条都在，有序
+  unsupported_fields = {"localforward": ["8090", "127.0.0.1:8080"],
+                        "dynamicforward": ["1080"]}              ← 只剩最后一条，18789 被覆盖
+```
+
+`localforward` 只剩 `8090`：`HashMap::insert` 让**后一条覆盖前一条**。也就是说
+`Host cloud_pc` 上的 `18789` 从解析结果里彻底消失了，而**没有任何报错**。静态丢数据比崩溃更危险。
+
+所以 `src/ssh/forwards.rs` 自己按行扫这三组指令，`ssh2-config` 继续只负责连接参数。
+扫描是**面向行、引号感知**的，不是完整 config 解析器：要处理的指令都是单行，
+且它们的作用域规则比 `Host`/`Match`/`Include` 简单。
+
+## 作用域规则
+
+OpenSSH 的转发指令**从所有匹配的 `Host` 块累积**，不是"命中第一个就停"。`sshpf` 照此实现：
+
+| 规则 | 行为 | 依据（为什么必须这样） |
+|---|---|---|
+| 多个 `Host` 块都匹配 | **全部累积**，按文件顺序 | OpenSSH 累积；只取第一个会让 `Host *` 的公共转发整个消失 |
+| `Host *` | 对任何别名都匹配 | 同上，这是最常见的"公共转发"写法 |
+| 通配符 `*` `?` | 支持，**大小写不敏感** | 与 OpenSSH 一致；`*.Example.COM` 要能匹配 `api.example.com` |
+| 否定子句 `!prod-db` | 命中即**排除整个块**，否定优先于肯定 | 与 OpenSSH 一致；`Host prod-* !prod-db` 不该给 `prod-db` 开转发 |
+| 第一个 `Host` 行**之前**的指令 | 视为全局，等价 `Host *` | OpenSSH 语义：文件头部的指令对所有主机生效 |
+| `Match` 块 | **永不导入** | 见下 |
+| `Include` | 跟进，有深度上限与环检测 | 用户确实会把转发放进 `conf.d/` 单独文件 |
+
+### `Match` 一律不导入
+
+```text
+Match host other exec "test -f /tmp/allow"
+  LocalForward 7005 127.0.0.1:7005
+```
+
+`Match` 的转发是**有连接上下文前置条件**的。`sshpf` 不建模这些条件，把一个受 `Match`
+门控的转发当成无条件生效，等于在用户明确设了闸的地方静默开了一个监听端口。所以 `Match`
+块里的转发一行都不导入，也不列出——它不是"这个主机声明了什么"，而是"满足某条件时声明了什么"。
+
+实现上 `Scope` 在遇到 `match` 时被置成 `InBlock { applies: false, excluded: true }`，
+后续指令一律跳过，直到下一个 `Host` 行重新开块。`strip_match_blocks`（`src/ssh/config.rs`）
+在扫描前还会先剔除 `Match` 行及其后缩进行——这道预处理同样保护了 `ssh2-config` 的连接参数解析
+（见 [design.md](design.md) §2 的上游 bug）。
+
+两个已知边界，都是"少导入"而不是"误导入"，因此可接受：
+
+- `Match` 块**未缩进**的后续指令不会被 `strip_match_blocks` 摘掉（它只在缩进行内延伸），
+  但因为 `scan_config` 自己的 `match` 分支已经把 scope 关掉了，这些行仍然不会被导入。
+- `Include` 进来的文件**也**会过 `strip_match_blocks`，所以 `Include` 文件里的 `Match`
+  同样被剔除（这一点与 `ssh2-config` 的已知限制不同，那边只预处理顶层文件）。
+
+### `Include`：深度上限与环检测
+
+```text
+const MAX_INCLUDE_DEPTH: usize = 8;
+```
+
+`forwards_for_host` 用一个显式栈遍历文件，`seen_files` 记录已读路径，`depth` 计层数。
+两者都有必要：`seen_files` 挡住 `a.conf` ↔ `b.conf` 互相 `Include` 的死循环，
+`depth` 挡住"每层都是新文件"的无限链。
+
+**上限是"总共读几个文件"，不是"嵌套几层"**——`depth` 在 `while` 循环里每弹出一个文件就
+`+= 1`，与嵌套关系无关。实测：
+
+| 配置 | 结果 |
+|---|---|
+| 12 个**并列** `Include f0..f11` | 只读 9 个文件（`config` + 8 个 include），其余静默丢弃 |
+| 20 层**链式** `Include` | 同样只读 9 个文件 |
+
+即 `config` 本身占掉一次，剩下 `MAX_INCLUDE_DEPTH` 次给 include，合计 9 个文件。
+这是"总文件数"预算而非嵌套深度限制，所以扁平拆成十几个 `conf.d` 文件的配置会读到一半就停。
+对真实的 `~/.ssh/config` 足够（几乎没人把转发散在 9 个以上文件里）；真遇到时把转发收进主文件即可，
+不会静默出错——只是那些文件里的行不会出现在表里。
+
+`Include` 的顺序也值得说明：遇到 `Include` 时把展开出的路径**压栈**，当前文件读完后才逐个读，
+所以 include 出来的行总是排在该文件所有行**之后**，而不是出现在 `Include` 那一行的位置：
+
+```text
+Host web
+  LocalForward 20000 127.0.0.1:1
+Include extra.conf
+  LocalForward 20002 127.0.0.1:1
+
+extra.conf:
+Host web
+  LocalForward 20001 127.0.0.1:1
+
+结果顺序: 20000, 20002, 20001   ← 20001 最后
+```
+
+对"生成一组独立隧道"这个用途无影响（顺序只影响表格里行的先后），但不要把它当成
+OpenSSH 的文本内联语义。
+
+`Include` 路径的解析：`~/` 展开到家目录，绝对路径原样，相对路径**相对于当前文件的目录**；
+含 `*`/`?` 的做目录内 glob 并按名字排序。
+
+### 一个无害的作用域泄漏（已记录，不修）
+
+`Include` 若是写在某个 `Host` 块**内部**，被包含文件里**没有 `Host` 行**的裸指令
+会被当成全局指令，从而对所有主机生效：
+
+```text
+Host web
+  Include inc.conf          # inc.conf 内容: LocalForward 42000 127.0.0.1:1
+
+查询 web  -> [web 自己的转发, 42000]
+查询 db   -> [42000]        ← 泄漏
+```
+
+原因是每个文件独立从 `Scope::Global` 开始扫，`Include` 目标文件不知道自己在谁的块里。
+OpenSSH 会继承外层块的作用域。这是**多导入**而非漏导入：用户写了这条转发，只是没料到它对
+所有主机生效。真实的 `~/.ssh/config` 里几乎不会把 `Include` 放进 `Host` 块（惯例是顶层
+`Include config.d/*`），因此按"先记录、不引入跨文件作用域传递的复杂度"处理。
+
+## 去重：`Host *` 重复声明不会变成两条隧道
+
+```text
+Host web
+  LocalForward 8080 127.0.0.1:80
+Host *
+  LocalForward 8080 127.0.0.1:80
+```
+
+两行 `key()` 相同，去重后只剩 1 行。去重发生在**输出阶段**（`dedup`），保留**第一次出现**的那条，
+所以行号指向更具体的块。这防止的失败模式很具体：两条隧道抢同一个监听端口，第二条必然
+`bind: Address already in use`。
+
+`key()` 的定义：
+
+```text
+-D  :  D|listen_addr|listen_port
+-L/-R:  {kind:?}|listen_addr|listen_port|target_host|target_port
+```
+
+**不包含** `host_alias` 和行号——同一条转发被两个块声明，物理上就是同一个转发。
+
+注意 key 是**字面**比较，不做地址归一化。`8080`（省略监听地址）和 `127.0.0.1:8080`
+算两个不同的 key：
+
+| 配置 | 行数 | 创建结果 |
+|---|---|---|
+| `LocalForward 8080 …` + `LocalForward 8080 …` | 1 | 1 条 |
+| `LocalForward 8080 …` + `LocalForward 127.0.0.1:8080 …` | 2 | 2 条，第二条本地端口被自动顺延 |
+
+省略监听地址在 OpenSSH 里的含义依赖 `GatewayPorts`，`sshpf` 不猜，按字面区分。
+第二条之所以不会撞端口，是因为批量创建时有端口顺延（见下）。
+
+## 列出但不可导入的行
+
+Unix domain socket 形式的转发、以及 `-R` 没有目标的形式，**不能**被默默丢掉——用户会以为
+工具漏读了配置。它们照常出现在表里，但勾选框显示 `[–]`、整行变暗、并且**用不可导入的原因
+替换掉**最后一个数据列：
+
+```text
+  [–] L     localhost:0        ⚠ 端口无法解析
+  [–] R     localhost:7006     ⚠ 目标地址无法解析
+```
+
+判定在 `SshForward::unsupported_reason()`：
+
+| 条件 | 原因文案 |
+|---|---|
+| `listen_port == 0` | `端口无法解析` |
+| 非 `-D` 且 `target_host` 为空或 `target_port == 0` | `目标地址无法解析` |
+
+端口留 0 是刻意的：解析失败时把端口记成 0，而不是猜一个数字或跳过整行。
+`listen_display()` 对空地址显示 `localhost`（OpenSSH 的默认），所以上面第一行仍能看出
+"这条监听解析不出来"，而不是显示成 `:0`。
+
+这些行**永远无法被勾上**：`toggle_cursor` / `check_all_visible` / `invert_visible` 都先查
+`row.importable()`；`ImportTable::new` 初始化时也不勾它们。`checked_count()` 的分母是
+`importable_count()`，所以状态行显示 `2/2 条勾选` 而不是 `2/3`——不可导入的行不算进"可选"。
+
+## 逐列筛选 + 撤销
+
+四列各有一个独立筛选：**类型 / 监听 / 目标 / 原始指令**。单元格内容与筛选看到的值由同一个
+函数产生（`ImportColumn::cell`），所以表格和匹配器不可能对"这一列是什么"有分歧。
+
+| 特性 | 实现 | 为什么 |
+|---|---|---|
+| 大小写不敏感**子串** | `col_match` = `to_lowercase().contains(...)` | 见下 |
+| 多个筛选 | **AND** 关系，全部满足才可见 | 逐列收窄，符合直觉 |
+| 空筛选 | 视为不生效 | 否则空串等于全匹配但会参与 AND |
+| 撤销栈 | `Vec<[String; 4]>`，上限 64 条，LIFO | 一次按键一个撤销点 |
+| 改筛选后 | `cursor = 0; scroll = 0; clamp_cursor()` | 视图变了不重锚，光标会指向不存在的行 |
+
+### 为什么用子串而不是模糊匹配
+
+主表（`/` 过滤）用的是**模糊子序列**匹配（`fuzzy_match`：needle 的字符按顺序出现即命中，
+中间可有任意字符）。逐列筛选**刻意不用**它：
+
+- 端口列用模糊匹配，`1080` 会命中 `127.0.0.1:1080`、`127.0.0.1:10800`、
+  甚至 `1:0:8:0` 之类包含这些字符序列的任意组合。筛选端口是为了**精确定位一行**，
+  返回一堆无关行等于没筛。
+- 列筛选是"缩小范围"工具（`8080`、`localhost`、`-R`），用户期望子串语义。
+
+同理 `类型` 列只有单字符 `L`/`R`/`D`，子串匹配等于精确匹配，不会误伤。
+
+### 换列用 `f`（循环）或 `←`/`→`
+
+`f` 在四列间循环（`类型 → 监听 → 目标 → 原始指令 → 类型`），`←`/`→` 单步。`f` **优先于**
+筛选输入被处理，所以连按两次 `f` 是"换列"，不是"打开输入然后把 f 写进去"。
+
+代价说清楚：**字面字符 `f` 无法输入到筛选里**。四列的内容分别是端口、主机地址和指令名
+（`LocalForward` 之类），没有哪一列需要匹配字母 `f`，而让 `f` 被输入吃掉会让底部的
+「f/←→ 选列」提示变成谎话——第二次按下时行为突变，是最难查的那类交互 bug。
+`←`/`→` 与退格覆盖了剩下的需求。
+
+### 撤销是快照式、一次一个键
+
+`filter_char` / `filter_backspace` / `set_filter` / `clear_filter` / `clear_all_filters`
+**每次都在改之前压一份完整快照**。所以：
+
+- 输入 `8080` 会压 4 份快照，按 4 次 `z` 逐字符回退；
+- `ctrl+r` 一次清空四列，只压**一**份，一次 `z` 全部恢复；
+- 删掉某一列的 chip，也只压一份。
+
+栈满 64 后丢最旧的一份（`history.remove(0)`）。`undo_filter()` 返回 `bool`，
+调用方据此提示 `已撤销筛选` 或 `没有可撤销的筛选`——空栈时静默无反应会让人以为按键没生效。
+
+### 全选 / 反选 / 全不选只看筛选后的视图
+
+**这是本节最重要的一条。** 三个操作都只作用于 `ImportTable::visible()`，即**筛选后可见**
+的行索引，而不是 `rows` 全量：
+
+```text
+3 行: L(18003) / R(18004) / L(18005)
+先全部取消勾选，再加筛选 类型=R
+按 全选
+实际结果: checked = [false, true, false]    ← 只有可见的 R 行被勾上
+```
+
+如果"全选"勾上了被筛选隐藏的行，用户看到的 3 行里只有 1 行打勾，但保存时会创建 3 条隧道。
+对**批量创建**（起 N 个监听端口）来说，这是明确的脚枪。同理 `反选` 与 `全不选`。
+
+鼠标点 `全选/反选/全不选` 按钮走的是同一批函数，所以规则一致。
+
+## 保存：一行一条隧道
+
+`ctrl+s`（或 `F10`）在导入表**有行**的情况下走批量路径，**整个批次先全部校验，全过才写盘**：
+
+```text
+for each ticked forward:
+    TunnelConfig 由 config_from_forward 生成
+    校验字段（validate_tunnel）
+    校验监听地址冲突：已保存的隧道 + 本批次里前面的隧道
+    校验通过 → 收进 out
+若 errors 非空 → 把错误写进表单，一条都不创建
+否则 → 全部 append、persist 一次、逐条启动
+```
+
+"全部校验完才写"要防的是**部分写入**：创建了 3 条、第 4 条报错，用户会得到一个自己没要求过的状态。
+
+判定用「导入表非空」而不是「有勾选行」，这是刻意的：若按后者，用户把行全部取消勾选后按
+`ctrl+s` 会掉进单条表单的校验分支，报出「名称不能为空」「本地端口必须是 1-65535 的数字」——
+描述的是三个他从未看过、也不打算填的字段。现在全取消勾选只会报「没有勾选任何转发」。
+**校验必须对着用户正在看的那份表单。**
+
+### `TunnelConfig` 字段怎么由指令填
+
+| 指令 | `local_addr` / `local_port` | `remote_host` / `remote_port` |
+|---|---|---|
+| `-L` | 指令的**监听**端 | 指令的**目标**端 |
+| `-R` | 指令的**目标**端 | 指令的**监听**端 |
+| `-D` | 指令的**监听**端 | 空 / 0（SOCKS5 没有远端） |
+
+`-R` 是两端**对调**的：`RemoteForward 7000 localhost:22` 里 `7000` 是服务端监听、
+`localhost:22` 是本地目标；而 `TunnelConfig` 的 `local_*` 永远是"本机这一侧"，
+`remote_*` 永远是"服务器那一侧"。填反了会静默转发错误的端口。
+
+监听地址为空时填 `defaults.bind`（默认 `127.0.0.1`）。
+
+### 本地端口顺延
+
+`-L`/`-D` 需要在本机 bind，所以它们的端口会先过一遍 `plan_local_port`（与表单的建议逻辑
+共用同一份规则）：
+
+| 情况 | 结果 |
+|---|---|
+| 端口 ≥1024 且可用 | 原样使用 |
+| 端口 <1024（需 root） | 用惯用别名 `2000 + port + 200`（`22 → 2222`），不从特权区间向上扫 |
+| 以上都不行 | 从 `max(port, 1024)` 向上扫，最多 200 个候选 |
+| 200 个都不行 | **保留原端口**，让校验报出真正的问题，而不是静默改成 0 |
+
+`-R` 不在本机监听，端口原样保留。特权端口不在自己所在的区间里向上扫这一点很关键：
+`port_available` 会把所有 <1024 的端口报成不可用（绑定需要 root），从那里起步会烧完
+整个扫描预算仍然找不到端口。
+
+`taken` 列表在批次内**逐条增长**，所以同一批次里两行要求同一个本地端口时，第二行会被顺延
+而不是两条隧道抢一个端口。已保存但**未运行**的隧道也计入——它现在没在监听，但它一旦启动就会冲突。
+
+### 名称
+
+建议名是 `<host>-<L|R|D>-<监听端口>`，例如 `cloud_pc-L-8090`。然后两级去重：
+
+1. `unique_name(...)` 对已保存的隧道去重 → `cloud_pc-L-8090-2`
+2. `unique_within(...)` 对本批次内已有名字再去重
+
+### 保存后的状态
+
+- 每条隧道 `enabled = true`，`persist` 一次（不是 N 次），然后逐条启动；
+- `note` 记 `来自 ~/.ssh/config 第 N 行`，便于回溯到配置出处；
+- 表单关闭，光标落到**第一条**新建隧道上。
+
+## 完整例子
+
+`~/.ssh/config`：
+
+```text
+ 1  Host bastion
+ 2    HostName 203.0.113.9
+ 3    User ops
+ 4
+ 5  Host cloud_pc
+ 6    HostName 10.20.0.11
+ 7    User wangcan
+ 8    ProxyJump bastion
+ 9    LocalForward 127.0.0.1:18789 127.0.0.1:18789
+10    LocalForward 8090 127.0.0.1:8080
+11    # LocalForward 127.0.0.1:3081 127.0.0.1:3081
+12
+13  Host *
+14    ServerAliveInterval 30
+15    DynamicForward 1080
+```
+
+表单里 SSH 主机填 `cloud_pc`，按 `space` 展开导入面板：
+
+```text
+╭ 从 ~/.ssh/config 导入转发 · cloud_pc ──────────────────────────────╮
+│     类型   监听                  目标               原始指令         │
+│▸[x] L     127.0.0.1:18789      127.0.0.1:18789   LocalForward 127.…│
+│ [x] L     127.0.0.1:8090       127.0.0.1:8080    LocalForward 127.…│
+│ [x] D     localhost:1080       (SOCKS5)          DynamicForward 10…│
+│                                                                    │
+│全选   反选   全不选      清除全部筛选   撤销筛选                    │
+│3/3 条勾选   space 勾选 · f/←→ 选列 · F 清该列 · ctrl+r 清全部 · z …│
+╰────────────────────────────────────────────────────────────────────╯
+```
+
+三行分别来自哪里：
+
+| 行 | 来源 | 说明 |
+|---|---|---|
+| `L 127.0.0.1:18789` | 第 9 行，`Host cloud_pc` | 具体块命中 |
+| `L localhost:8090` | 第 10 行，`Host cloud_pc` | 省略监听地址 → 显示 `localhost` |
+| `D localhost:1080` | 第 15 行，`Host *` | 通配块**累积**进来 |
+
+没有出现的：
+
+- 第 11 行 `# LocalForward 127.0.0.1:3081 …`——注释行整行跳过，**不列出**；
+- 第 1–3 行 `Host bastion` 的块——只声明连接参数，没有转发指令；
+- `Host cloud_pc` 的 `HostName`/`User`/`ProxyJump`——不是转发指令，不进行。
+
+`Host *` 的 `ServerAliveInterval` 同理不是转发指令，跳过。`ProxyJump bastion` 不影响导入：
+它决定"怎么连"，导入只关心"转发什么"。
+
+按 `ctrl+s` 保存，创建 3 条隧道：
+
+| 名称 | 类型 | 本地 | 远端 | enabled | note |
+|---|---|---|---|---|---|
+| `cloud_pc-L-18789` | local | `127.0.0.1:18789` | `127.0.0.1:18789` | true | 来自 ~/.ssh/config 第 9 行 |
+| `cloud_pc-L-8090` | local | `127.0.0.1:8090` | `127.0.0.1:8080` | true | 来自 ~/.ssh/config 第 10 行 |
+| `cloud_pc-D-1080` | dynamic | `127.0.0.1:1080` | — | true | 来自 ~/.ssh/config 第 15 行 |
+
+如果已存在一条叫 `cloud_pc-L-8090` 的隧道，第二条会变成 `cloud_pc-L-8090-2`。
+如果 `8090` 已被本机占用，本地端口会顺延成 `8091`，名称仍按**导入的**监听端口命名
+（`cloud_pc-L-8090`）——名字描述的是配置里写了什么，不是运行时落在哪。
+
+### 变体：不可导入的行
+
+```text
+Host cloud_pc
+  LocalForward 127.0.0.1:18789 127.0.0.1:18789
+  LocalForward /run/sshpf/app.sock /run/app.sock
+  RemoteForward 7006
+  RemoteForward 127.0.0.1:7000 127.0.0.1:22
+```
+
+| 行 | 显示 | 可导入 | 建成后 |
+|---|---|---|---|
+| 2 | `L 127.0.0.1:18789 → 127.0.0.1:18789` | ✓ | 本地 `:18789` → 远端 `:18789` |
+| 3 | `L localhost:0` + `⚠ 端口无法解析` | ✗ | socket 路径不是 `host:port` |
+| 4 | `R localhost:7006` + `⚠ 目标地址无法解析` | ✗ | `-R` 没有目标，无处可转发 |
+| 5 | `R 127.0.0.1:7000 → 127.0.0.1:22` | ✓ | 远端监听 `:7000`，本地目标是 `:22` |
+
+第 5 行是唯一需要转置方向的：`RemoteForward 127.0.0.1:7000 127.0.0.1:22` 里 `7000` 是
+**服务端**监听、`22` 是**本机**目标；`TunnelConfig` 的 `local_*` 恒指本机侧，所以建出来是
+`local=127.0.0.1:22`、`remote=127.0.0.1:7000`，`forward_spec()` 为 `127.0.0.1:7000:127.0.0.1:22`。
+
+### 变体：`Host *` 重复了具体块
+
+```text
+Host cloud_pc
+  LocalForward 8090 127.0.0.1:8080
+Host *
+  LocalForward 8090 127.0.0.1:8080
+```
+
+去重后**只有 1 行**（第 2 行，保留首次出现）。不会出现两条隧道抢 `8090`。
+
+## "默认全选"只是意图，不是监听
+
+这一点必须说清楚，否则"默认勾选全部"听起来像工具会擅自开一堆端口：
+
+- 勾选状态**只是一个意图标记**，存在 `ImportTable` 里，不写盘、不建线程、不 bind；
+- 隧道只在用户按 `ctrl+s` **确认保存之后**才创建，创建时才开始连接；
+- 关掉表单（`esc`，有未保存内容会二次确认）不会创建任何东西；
+- 编辑已有隧道时**根本没有**导入面板（`refresh_import_table` 对 `FormMode::Edit` 直接返回）——
+  把一次编辑悄悄变成批量新建会是数据丢失级的问题。
+
+所以"默认全选"回答的是"这些是配置里已经声明的转发，是否都要纳入"，而不是"现在就开"。
