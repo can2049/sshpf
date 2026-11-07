@@ -38,7 +38,15 @@ sshpf — SSH 端口转发 TUI 管理器
   j/k ↑↓   移动        space  启用/停用    r  重启
   n        新建        e      编辑        d  删除（需确认）
   enter/l  详情+日志    /      过滤        a  全部启用   x  全部停止
+  v        多选模式（标记多条后批量启停/重启/删除）
   ?        帮助        q      退出（有运行中转发时确认）
+
+新建转发时选中主机，按 space 或 i 展开「从 ~/.ssh/config 导入转发」面板：
+该主机已声明的 LocalForward/RemoteForward/DynamicForward 会全部列出并默认勾选，
+取消掉不要的再保存。面板内可逐列筛选、撤销筛选。
+
+鼠标：点击行选中、点击勾选框、点击列头筛选该列、点击筛选 chip 的 × 删除、
+滚轮滚动列表、多选模式下点击动作条按钮、shift 点击扩选范围。
 
 配置文件为 TOML，权限 0600；转发定义由本工具管理，
 SSH 连接参数（ProxyJump/IdentityFile/ssh-agent 等）交给 ~/.ssh/config。
