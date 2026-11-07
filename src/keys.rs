@@ -104,124 +104,118 @@ fn handle_filter_key(app: &mut App, key: KeyEvent) {
 }
 
 fn handle_form_key(app: &mut App, key: KeyEvent) {
-    // The SSH HOST dropdown, when expanded, owns most keys: it is the primary
-    // way to pick a host, so ↑↓/enter/esc must drive the list, not the form.
+    // An expanded SSH HOST dropdown owns most keys: it is the primary way to
+    // pick a host, so ↑↓/enter/esc must drive the list rather than the form.
     if app.host_picker_open() && handle_dropdown_key(app, key) {
         return;
     }
 
-    let editing = app.form.as_ref().is_some_and(|f| f.is_editing_field());
-    let field = app.form.as_ref().map(|f| f.field);
-
-    // ---- stage 2: editing the highlighted field -------------------------
-    if editing {
-        match key.code {
-            // Leave editing; the highlight stays where it is.
-            KeyCode::Enter | KeyCode::Esc => {
-                if let Some(f) = app.form.as_mut() {
-                    f.end_edit();
-                    f.revalidate();
-                }
-                return;
-            }
-            // Tab commits and advances, like leaving the field.
-            KeyCode::Tab | KeyCode::BackTab => {
-                let forward = key.code == KeyCode::Tab;
-                if let Some(f) = app.form.as_mut() {
-                    f.end_edit();
-                    f.field = if forward { f.field.next() } else { f.field.prev() };
-                    f.revalidate();
-                }
-                return;
-            }
-            _ => {}
-        }
-        if let Some(field) = field {
-            // Typing in the remote port re-derives the local port suggestion.
-            let was_remote_port = field == FormField::RemotePort;
-            let was_local_port = field == FormField::LocalPort;
-            if was_local_port
-                && matches!(key.code, KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete)
-                && let Some(f) = app.form.as_mut()
-            {
-                f.mark_local_port_manual();
-            }
-            edit_field(app, field, &key);
-            if was_remote_port {
-                app.refresh_local_port_suggestion();
-            }
-        }
-        return;
+    // The form has two stages with different key semantics; dispatch on stage.
+    if app.form.as_ref().is_some_and(|f| f.is_editing_field()) {
+        handle_field_editing(app, key);
+    } else {
+        handle_field_navigating(app, key);
     }
+}
 
-    // ---- stage 1: navigating -------------------------------------------
-    // Arrows only move the highlight; `enter` is what starts editing.
+/// Stage 2: a text field is actively being edited.
+///
+/// Keystrokes go into the buffer; `enter`/`esc` end editing and `tab` ends it
+/// and advances. Typing in the remote port also re-derives the local-port
+/// suggestion, and typing in the local port marks it as hand-set so the
+/// suggestion stops overwriting it.
+fn handle_field_editing(app: &mut App, key: KeyEvent) {
     match key.code {
-        KeyCode::Esc => {
-            // Asking here (not just closing) is what protects typed input:
-            // this is the branch users reach with one esc from the form.
-            app.request_close_form();
+        // Leave editing; the highlight stays where it is.
+        KeyCode::Enter | KeyCode::Esc => {
+            if let Some(f) = app.form.as_mut() {
+                f.end_edit();
+                f.revalidate();
+            }
             return;
         }
+        // Tab commits and advances, like leaving the field.
         KeyCode::Tab | KeyCode::BackTab => {
-            let forward = key.code == KeyCode::Tab;
+            move_field(app, key.code == KeyCode::Tab);
             if let Some(f) = app.form.as_mut() {
-                f.field = if forward { f.field.next() } else { f.field.prev() };
-                f.revalidate();
+                f.end_edit();
             }
-            app.close_host_picker();
-            return;
-        }
-        KeyCode::Down | KeyCode::Up => {
-            let forward = key.code == KeyCode::Down;
-            if let Some(f) = app.form.as_mut() {
-                f.field = if forward { f.field.next() } else { f.field.prev() };
-                f.revalidate();
-            }
-            app.close_host_picker();
-            return;
-        }
-        KeyCode::Enter => {
-            // On the toggle/select fields `enter` just acts; on text fields it
-            // enters editing.
-            match field {
-                Some(FormField::Kind) => {
-                    if let Some(f) = app.form.as_mut() {
-                        f.cycle_kind(true);
-                    }
-                }
-                Some(FormField::AutoRestart) => {
-                    if let Some(f) = app.form.as_mut() {
-                        f.auto_restart = !f.auto_restart;
-                    }
-                }
-                Some(FormField::SshHost) => app.open_host_picker(),
-                Some(_) => {
-                    if let Some(f) = app.form.as_mut() {
-                        f.begin_edit();
-                    }
-                }
-                None => {}
-            }
-            return;
-        }
-        // Ctrl+S saves from anywhere; plain `enter` is field editing now.
-        KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.submit_form();
-            return;
-        }
-        KeyCode::F(10) => {
-            app.submit_form();
             return;
         }
         _ => {}
     }
 
-    let Some(field) = field else {
+    let Some(field) = app.form.as_ref().map(|f| f.field) else {
+        return;
+    };
+    if field == FormField::LocalPort
+        && matches!(key.code, KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete)
+        && let Some(f) = app.form.as_mut()
+    {
+        f.mark_local_port_manual();
+    }
+    edit_field(app, field, &key);
+    if field == FormField::RemotePort {
+        app.refresh_local_port_suggestion();
+    }
+}
+
+/// Stage 1: arrows only move the highlight; `enter` commits to editing.
+fn handle_field_navigating(app: &mut App, key: KeyEvent) {
+    let Some(field) = app.form.as_ref().map(|f| f.field) else {
         return;
     };
 
-    // Left/right adjust the enum-like fields while merely navigating.
+    match key.code {
+        KeyCode::Esc => {
+            // Asking here (rather than just closing) is what protects typed
+            // input: this is the branch users reach with one esc.
+            app.request_close_form();
+        }
+        KeyCode::Tab | KeyCode::BackTab => {
+            move_field(app, key.code == KeyCode::Tab);
+            app.close_host_picker();
+        }
+        KeyCode::Down => {
+            move_field(app, true);
+            app.close_host_picker();
+        }
+        KeyCode::Up => {
+            move_field(app, false);
+            app.close_host_picker();
+        }
+        KeyCode::Enter => activate_field(app, field),
+        // Ctrl+S saves from anywhere; plain `enter` is field editing now.
+        KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => app.submit_form(),
+        KeyCode::F(10) => app.submit_form(),
+        _ => adjust_field(app, field, key),
+    }
+}
+
+/// `enter` on the highlighted field: act for toggles, edit for text fields.
+fn activate_field(app: &mut App, field: FormField) {
+    match field {
+        FormField::Kind => {
+            if let Some(f) = app.form.as_mut() {
+                f.cycle_kind(true);
+            }
+        }
+        FormField::AutoRestart => {
+            if let Some(f) = app.form.as_mut() {
+                f.auto_restart = !f.auto_restart;
+            }
+        }
+        FormField::SshHost => app.open_host_picker(),
+        _ => {
+            if let Some(f) = app.form.as_mut() {
+                f.begin_edit();
+            }
+        }
+    }
+}
+
+/// Keys that adjust the enum-like fields while merely navigating.
+fn adjust_field(app: &mut App, field: FormField, key: KeyEvent) {
     match field {
         FormField::Kind => match key.code {
             KeyCode::Left | KeyCode::Char('h') => {
@@ -229,12 +223,7 @@ fn handle_form_key(app: &mut App, key: KeyEvent) {
                     f.cycle_kind(false);
                 }
             }
-            KeyCode::Right | KeyCode::Char('l') => {
-                if let Some(f) = app.form.as_mut() {
-                    f.cycle_kind(true);
-                }
-            }
-            KeyCode::Char(' ') => {
+            KeyCode::Right | KeyCode::Char('l') | KeyCode::Char(' ') => {
                 if let Some(f) = app.form.as_mut() {
                     f.cycle_kind(true);
                 }
@@ -257,6 +246,14 @@ fn handle_form_key(app: &mut App, key: KeyEvent) {
             _ => {}
         },
         _ => {}
+    }
+}
+
+/// Move the highlight one field forward or backward, re-validating.
+fn move_field(app: &mut App, forward: bool) {
+    if let Some(f) = app.form.as_mut() {
+        f.field = if forward { f.field.next() } else { f.field.prev() };
+        f.revalidate();
     }
 }
 

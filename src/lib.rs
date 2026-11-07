@@ -17,6 +17,7 @@ pub mod config;
 pub mod keys;
 pub mod model;
 pub mod ssh;
+pub mod text;
 pub mod tunnel;
 pub mod ui;
 

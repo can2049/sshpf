@@ -127,74 +127,11 @@ pub fn palette_with(no_color: bool) -> Palette {
 // Small pure helpers (unit tested)
 // ---------------------------------------------------------------------------
 
-/// Display width of `s` in terminal cells: CJK / full-width characters count 2.
-///
-/// We cannot pull in `unicode-width` (no new dependencies allowed), and
-/// `str::len()` is bytes — using it for alignment breaks every Chinese label.
-pub fn display_width(s: &str) -> usize {
-    s.chars().map(char_width).sum()
-}
+pub mod layout;
 
-/// Width of a single character in cells (1 or 2).
-fn char_width(c: char) -> usize {
-    let cp = c as u32;
-    let wide = matches!(
-        cp,
-        0x1100..=0x115F      // Hangul Jamo
-        | 0x2E80..=0x303E    // CJK radicals, Kangxi, CJK symbols & punctuation
-        | 0x3041..=0x33FF    // Hiragana .. CJK compatibility
-        | 0x3400..=0x4DBF    // CJK ext A
-        | 0x4E00..=0x9FFF    // CJK unified ideographs
-        | 0xA000..=0xA4CF    // Yi
-        | 0xAC00..=0xD7A3    // Hangul syllables
-        | 0xF900..=0xFAFF    // CJK compatibility ideographs
-        | 0xFE30..=0xFE6F    // CJK compatibility forms
-        | 0xFF00..=0xFF60    // full-width forms
-        | 0xFFE0..=0xFFE6
-        | 0x1F300..=0x1F64F  // emoji / pictographs
-        | 0x1F900..=0x1F9FF
-        | 0x20000..=0x3FFFD  // CJK ext B+
-    );
-    if wide { 2 } else { 1 }
-}
-
-/// Pad `s` with spaces to `width` display columns (never truncates).
-fn pad_to_width(s: &str, width: usize) -> String {
-    let w = display_width(s);
-    if w >= width {
-        return s.to_string();
-    }
-    let mut out = String::with_capacity(s.len() + (width - w));
-    out.push_str(s);
-    out.push_str(&" ".repeat(width - w));
-    out
-}
-
-/// Truncate `s` to at most `width` display columns, appending `…` when cut.
-///
-/// The head is preserved (it usually holds the classification word), matching
-/// the "折叠尾部、保留开头" rule from the prior-art research.
-fn truncate_to_width(s: &str, width: usize) -> String {
-    if width == 0 {
-        return String::new();
-    }
-    if display_width(s) <= width {
-        return s.to_string();
-    }
-    let budget = width.saturating_sub(1); // room for the ellipsis
-    let mut out = String::new();
-    let mut used = 0;
-    for ch in s.chars() {
-        let w = char_width(ch);
-        if used + w > budget {
-            break;
-        }
-        out.push(ch);
-        used += w;
-    }
-    out.push('…');
-    out
-}
+use crate::text::{display_width, pad_to_width, truncate_to_width};
+use layout::{COL_SPACING, DETAIL_LOG_TAIL, FORM_LABEL_W, FORM_VALUE_X};
+pub use layout::{Col, column_layout};
 
 /// Human duration used by the 时长 column.
 ///
@@ -217,158 +154,6 @@ fn fmt_unix(ts: i64) -> String {
         Some(dt) => dt.format("%Y-%m-%d %H:%M:%S").to_string(),
         None => "—".to_string(),
     }
-}
-
-// ---------------------------------------------------------------------------
-// Table columns
-// ---------------------------------------------------------------------------
-
-/// One logical column of the tunnel table.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Col {
-    Name,
-    Kind,
-    /// `127.0.0.1:8080`
-    Local,
-    /// `127.0.0.1:3000` / `(SOCKS5)`
-    Remote,
-    /// `8080→3000` — the merged fallback when the terminal is very narrow.
-    LocalRemote,
-    SshHost,
-    Status,
-    LastError,
-    Uptime,
-}
-
-/// Space reserved for the `▶ ` selection symbol (always allocated so the table
-/// never shifts when the selection moves).
-const SELECTION_WIDTH: u16 = 2;
-/// `Table::column_spacing`.
-const COL_SPACING: u16 = 1;
-/// Widest the LAST ERROR column may become (prior-art: `短句 ≤ 34 列`).
-const MAX_LAST_ERROR: u16 = 34;
-/// Narrowest LAST ERROR column we accept before dropping columns instead.
-const MIN_LAST_ERROR: u16 = 4;
-/// Label column of the form (`SSH 主机` = 8 cells) plus one separating space.
-const FORM_LABEL_W: usize = 8;
-/// Field value column of the form starts at this offset inside the popup.
-const FORM_VALUE_X: usize = FORM_LABEL_W + 1;
-/// How many log lines the detail overlay keeps on screen.
-const DETAIL_LOG_TAIL: usize = 15;
-
-/// Minimum width for a column when squeezing.
-fn min_width(col: Col) -> u16 {
-    match col {
-        Col::Name => 6,
-        Col::Kind => 1,
-        Col::Local | Col::Remote => 10,
-        Col::LocalRemote => 10,
-        Col::SshHost => 6,
-        Col::Status => 8,
-        Col::LastError => MIN_LAST_ERROR,
-        Col::Uptime => 10,
-    }
-}
-
-/// Preferred width for a column (before shrinking).
-fn ideal_width(col: Col) -> u16 {
-    match col {
-        Col::Name => 14,
-        Col::Kind => 1,
-        Col::Local | Col::Remote => 17,
-        Col::LocalRemote => 20,
-        Col::SshHost => 14,
-        Col::Status => 11,
-        // Overwritten by the "take the remaining space" pass.
-        Col::LastError => MAX_LAST_ERROR,
-        Col::Uptime => 10,
-    }
-}
-
-/// Which columns survive at a given terminal width.
-///
-/// Sacrifice order mandated by the spec: ① 时长 → ② SSH 主机 → ③ merge 本地/远端.
-fn select_columns(width: u16) -> Vec<Col> {
-    if width >= 110 {
-        vec![Col::Name, Col::Kind, Col::Local, Col::Remote, Col::SshHost, Col::Status, Col::LastError, Col::Uptime]
-    } else if width >= 88 {
-        vec![Col::Name, Col::Kind, Col::Local, Col::Remote, Col::SshHost, Col::Status, Col::LastError]
-    } else if width >= 64 {
-        vec![Col::Name, Col::Kind, Col::Local, Col::Remote, Col::Status, Col::LastError]
-    } else {
-        vec![Col::Name, Col::Kind, Col::LocalRemote, Col::Status, Col::LastError]
-    }
-}
-
-/// Compute the table layout for `area_width`.
-///
-/// The LAST ERROR column is the elastic one: it absorbs (or yields) the slack
-/// first, which reproduces the "错误列缩到 18 列" rule from the wireframe.
-/// Whatever happens, `sum(widths) <= area_width` and the list is never empty.
-pub fn column_layout(area_width: u16) -> Vec<(Col, u16)> {
-    let mut cols = select_columns(area_width);
-    let mut widths: Vec<u16> = cols.iter().map(|c| ideal_width(*c)).collect();
-    let n = cols.len();
-
-    // Budget for the column widths themselves (selection gutter + spacing).
-    let overhead = SELECTION_WIDTH + COL_SPACING * (n.saturating_sub(1) as u16);
-    let avail = area_width.saturating_sub(overhead);
-
-    // 1. LAST ERROR takes whatever is left, clamped to a sane range.
-    if let Some(err_idx) = cols.iter().position(|c| *c == Col::LastError) {
-        let others: u16 = widths.iter().enumerate().filter(|(i, _)| *i != err_idx).map(|(_, w)| *w).sum();
-        widths[err_idx] = avail.saturating_sub(others).clamp(MIN_LAST_ERROR, MAX_LAST_ERROR);
-    }
-
-    // 2. Shrink the widest elastic column one cell at a time until it fits.
-    let mut total: u16 = widths.iter().sum();
-    while total > avail {
-        let mut best: Option<usize> = None;
-        for (i, col) in cols.iter().enumerate() {
-            if widths[i] <= min_width(*col) {
-                continue;
-            }
-            if best.is_none_or(|b| widths[b] <= widths[i]) {
-                best = Some(i);
-            }
-        }
-        match best {
-            Some(i) => {
-                widths[i] -= 1;
-                total -= 1;
-            }
-            None => break,
-        }
-    }
-
-    // 3. Absolute guarantee for absurd terminals: drop trailing columns, then
-    //    cap the survivor. Never panic, never overflow the area.
-    while widths.iter().sum::<u16>() > area_width {
-        if cols.len() > 1 {
-            cols.pop();
-            widths.pop();
-        } else {
-            widths[0] = widths[0].min(area_width);
-            if widths[0] == 0 {
-                break;
-            }
-        }
-    }
-
-    cols.into_iter().zip(widths).collect()
-}
-
-/// Footprint including the selection gutter and inter-column spacing.
-#[cfg(test)]
-fn layout_footprint(layout: &[(Col, u16)]) -> u16 {
-    let n = layout.len() as u16;
-    column_sum(layout) + SELECTION_WIDTH + COL_SPACING * n.saturating_sub(1)
-}
-
-/// Sum of the column widths (without the gutter/spacing overhead).
-#[cfg(test)]
-fn column_sum(layout: &[(Col, u16)]) -> u16 {
-    layout.iter().map(|(_, w)| *w).sum()
 }
 
 // ---------------------------------------------------------------------------
@@ -877,7 +662,6 @@ fn form_field_buf(form: &crate::app::FormState, field: FormField) -> Option<&cra
 fn draw_form(frame: &mut Frame, app: &App, area: Rect) {
     let Some(form) = app.form.as_ref() else { return };
     let p = palette();
-    let kind = form.kind();
     let title =
         if form.is_modifying() { format!("编辑转发 · {}", form.name.value()) } else { "新建转发".to_string() };
     // Tall enough to hold the fields *and* the expanded host dropdown.
@@ -893,20 +677,44 @@ fn draw_form(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let fields = FormField::ORDER;
     let value_w = inner.width.saturating_sub(FORM_VALUE_X as u16) as usize;
-    let current_idx = fields.iter().position(|f| *f == form.field).unwrap_or(0);
+    let current_idx = FormField::ORDER.iter().position(|f| *f == form.field).unwrap_or(0);
 
-    let mut lines: Vec<Line<'static>> = Vec::with_capacity(fields.len());
-    for (i, field) in fields.iter().enumerate() {
-        if i as u16 >= inner.height {
-            break;
-        }
+    let lines = form_field_lines(app, form, p, value_w, current_idx);
+    let extra = form_notes(form, p, inner.width as usize);
+
+    let used = lines.len() as u16;
+    if inner.height > used {
+        let rest = Rect { x: inner.x, y: inner.y + used, width: inner.width, height: inner.height - used };
+        frame.render_widget(Paragraph::new(extra), rest);
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+
+    // Expand the dropdown *inside* the form, anchored under the SSH HOST row.
+    if let Some(picker) = app.picker.as_ref().filter(|pk| pk.open) {
+        draw_host_dropdown(frame, app, picker, inner, current_idx as u16);
+    }
+
+    place_form_cursor(frame, form, inner, popup, current_idx);
+}
+
+/// One `Line` per form field, styled for the three highlight states.
+///
+/// Three visual states make the two-stage model obvious:
+///   • highlighted + editing → solid selection bar (text entry active)
+///   • highlighted only      → bold accent, no bar (arrows just move)
+///   • neither               → plain
+fn form_field_lines(
+    app: &App,
+    form: &crate::app::FormState,
+    p: Palette,
+    value_w: usize,
+    current_idx: usize,
+) -> Vec<Line<'static>> {
+    let kind = form.kind();
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(FormField::ORDER.len());
+    for (i, field) in FormField::ORDER.iter().enumerate() {
         let focused = i == current_idx;
-        // Three visual states, so the two-stage model is obvious:
-        //   • highlighted + editing -> solid selection bar (text entry active)
-        //   • highlighted only      -> bold accent, no bar (arrows just move)
-        //   • neither               -> plain
         let editing_here = focused && form.is_editing_field();
         let label_style = if editing_here {
             p.focused().add_modifier(Modifier::BOLD)
@@ -922,39 +730,12 @@ fn draw_form(frame: &mut Frame, app: &App, area: Rect) {
         } else {
             p.fg(p.text)
         };
+        let label = Span::styled(pad_to_width(field.label(), FORM_LABEL_W), label_style);
 
-        // The SSH HOST field is a dropdown: value on the left, a ▾/▴ marker on
-        // the right, and a reminder of how many hosts `~/.ssh/config` offered.
         if *field == FormField::SshHost {
-            let typed = form.ssh_host.value();
-            let (marker, drop_style) = match &app.picker {
-                Some(pk) if pk.open => ("▴", if editing_here { p.focused() } else { p.fg(p.accent) }),
-                _ => ("▾", if editing_here { p.focused() } else { p.fg(p.accent) }),
-            };
-            // Do not append the hint once a host is chosen: it would push the
-            // actual alias out of view, which is the one thing the user needs
-            // to confirm here.
-            let hint = if !typed.trim().is_empty() {
-                String::new()
-            } else if !app.hosts.is_empty() {
-                format!(" ({}台可选)", app.hosts.len())
-            } else if app.hosts_error.is_some() {
-                " (读取失败)".to_string()
-            } else {
-                " (无主机)".to_string()
-            };
-            let marker_w = display_width(marker);
-            let avail = value_w.saturating_sub(marker_w + 1);
-            let shown = truncate_to_width(&format!("{typed}{hint}"), avail);
-            lines.push(Line::from(vec![
-                Span::styled(pad_to_width(field.label(), FORM_LABEL_W), label_style),
-                Span::raw(" "),
-                Span::styled(pad_to_width(&shown, avail), value_style),
-                Span::styled(marker, drop_style.add_modifier(Modifier::BOLD)),
-            ]));
+            lines.push(host_field_line(app, form, p, value_w, editing_here, label));
             continue;
         }
-
         let value = match field {
             FormField::Kind => Span::styled(
                 pad_to_width(&format!("< {} >", kind.label()), value_w),
@@ -973,33 +754,61 @@ fn draw_form(frame: &mut Frame, app: &App, area: Rect) {
                 Span::styled(pad_to_width(&text, value_w), value_style)
             }
         };
-        lines.push(Line::from(vec![
-            Span::styled(pad_to_width(field.label(), FORM_LABEL_W), label_style),
-            Span::raw(" "),
-            value,
-        ]));
+        lines.push(Line::from(vec![label, Span::raw(" "), value]));
     }
+    lines
+}
 
-    // Errors and the live port hint sit right below the fields.
-    let mut extra: Vec<Line<'static>> = Vec::new();
-    if !form.errors.is_empty() {
-        for err in form.errors.iter().take(3) {
-            extra.push(Line::from(Span::styled(
-                truncate_to_width(&format!("✗ {err}"), inner.width as usize),
-                p.fg(p.failed),
-            )));
-        }
+/// The SSH HOST row: value on the left, a ▾/▴ affordance on the right.
+///
+/// The `(N台可选)` hint is deliberately suppressed once a host is chosen — it
+/// would push the actual alias out of view, which is what the user is checking.
+fn host_field_line(
+    app: &App,
+    form: &crate::app::FormState,
+    p: Palette,
+    value_w: usize,
+    editing_here: bool,
+    label: Span<'static>,
+) -> Line<'static> {
+    let typed = form.ssh_host.value();
+    let open = app.picker.as_ref().is_some_and(|pk| pk.open);
+    let marker = if open { "▴" } else { "▾" };
+    let drop_style = if editing_here { p.focused() } else { p.fg(p.accent) };
+    let hint = if !typed.trim().is_empty() {
+        String::new()
+    } else if !app.hosts.is_empty() {
+        format!(" ({}台可选)", app.hosts.len())
+    } else if app.hosts_error.is_some() {
+        " (读取失败)".to_string()
+    } else {
+        " (无主机)".to_string()
+    };
+    let marker_w = display_width(marker);
+    let avail = value_w.saturating_sub(marker_w + 1);
+    let shown = truncate_to_width(&format!("{typed}{hint}"), avail);
+    let value_style = if editing_here { p.focused() } else { p.fg(p.text) };
+    Line::from(vec![
+        label,
+        Span::raw(" "),
+        Span::styled(pad_to_width(&shown, avail), value_style),
+        Span::styled(marker, drop_style.add_modifier(Modifier::BOLD)),
+    ])
+}
+
+/// Validation errors, the auto-suggested port note, and the key hint.
+fn form_notes(form: &crate::app::FormState, p: Palette, width: usize) -> Vec<Line<'static>> {
+    let mut extra = Vec::new();
+    for err in form.errors.iter().take(3) {
+        extra.push(Line::from(Span::styled(truncate_to_width(&format!("✗ {err}"), width), p.fg(p.failed))));
     }
     if let Some(note) = &form.local_port_note {
         // The auto-derived local port is a *suggestion*; say so plainly.
-        extra.push(Line::from(Span::styled(
-            truncate_to_width(&format!("· {note}（可编辑）"), inner.width as usize),
-            p.fg(p.pending),
-        )));
+        extra.push(Line::from(Span::styled(truncate_to_width(&format!("· {note}（可编辑）"), width), p.fg(p.pending))));
     }
     if let Some(hint) = &form.port_hint {
         let style = if hint.contains("占用") { p.fg(p.pending) } else { p.fg(p.up) };
-        extra.push(Line::from(Span::styled(truncate_to_width(&format!("· {hint}"), inner.width as usize), style)));
+        extra.push(Line::from(Span::styled(truncate_to_width(&format!("· {hint}"), width), style)));
     }
     extra.push(Line::from(""));
     let hint_text = if form.is_editing_field() {
@@ -1007,22 +816,12 @@ fn draw_form(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         "↑↓ 选择字段  ·  enter 编辑  ·  ctrl+s 保存  ·  esc 取消"
     };
-    extra.push(Line::from(Span::styled(truncate_to_width(hint_text, inner.width as usize), p.fg(p.dim))));
+    extra.push(Line::from(Span::styled(truncate_to_width(hint_text, width), p.fg(p.dim))));
+    extra
+}
 
-    let used = lines.len() as u16;
-    if inner.height > used {
-        let rest = Rect { x: inner.x, y: inner.y + used, width: inner.width, height: inner.height - used };
-        frame.render_widget(Paragraph::new(extra), rest);
-    }
-    frame.render_widget(Paragraph::new(lines), inner);
-
-    // Expand the dropdown *inside* the form, anchored under the SSH HOST row.
-    if let Some(picker) = app.picker.as_ref().filter(|pk| pk.open) {
-        draw_host_dropdown(frame, app, picker, inner, current_idx as u16);
-    }
-
-    // Cursor only while a text field is actively being edited: in the
-    // navigating stage there is no text insertion point.
+/// Show a text cursor only while a field is actively being edited.
+fn place_form_cursor(frame: &mut Frame, form: &crate::app::FormState, inner: Rect, popup: Rect, current_idx: usize) {
     if !form.is_editing_field() {
         return;
     }
@@ -1407,53 +1206,6 @@ mod tests {
     }
 
     // -- column layout ------------------------------------------------------
-
-    #[test]
-    fn column_layout_fits_and_degrades() {
-        let wide = column_layout(120);
-        assert_eq!(wide.len(), 8, "120 columns must show all eight columns");
-        assert!(layout_footprint(&wide) <= 120);
-        assert!(wide.iter().any(|(c, _)| *c == Col::Uptime));
-        assert!(wide.iter().any(|(c, _)| *c == Col::SshHost));
-
-        let mid = column_layout(100);
-        assert_eq!(mid.len(), 7, "100 columns drops 时长 first");
-        assert!(layout_footprint(&mid) <= 100);
-        assert!(!mid.iter().any(|(c, _)| *c == Col::Uptime));
-        assert!(mid.iter().any(|(c, _)| *c == Col::SshHost));
-
-        let narrow = column_layout(80);
-        assert_eq!(narrow.len(), 6, "80 columns also drops SSH 主机");
-        assert!(layout_footprint(&narrow) <= 80);
-        assert!(!narrow.iter().any(|(c, _)| *c == Col::SshHost));
-        assert!(narrow.iter().any(|(c, _)| *c == Col::Local));
-        assert!(narrow.iter().any(|(c, _)| *c == Col::Remote));
-
-        let tiny = column_layout(60);
-        assert_eq!(tiny.len(), 5);
-        assert!(tiny.iter().any(|(c, _)| *c == Col::LocalRemote));
-        assert!(layout_footprint(&tiny) <= 60);
-
-        // Never overflows, never panics, for every width from absurd to huge.
-        for w in 1u16..=240 {
-            let layout = column_layout(w);
-            assert!(!layout.is_empty(), "width {w} returned no columns");
-            assert!(column_sum(&layout) <= w, "width {w} overflows: {layout:?}");
-        }
-    }
-
-    #[test]
-    fn column_layout_takes_the_slack_in_last_error() {
-        let err_w = |w: u16| {
-            column_layout(w)
-                .into_iter()
-                .find(|(c, _)| *c == Col::LastError)
-                .map(|(_, w)| w)
-                .expect("LAST ERROR column must exist")
-        };
-        assert!(err_w(120) >= err_w(100));
-        assert!(err_w(120) <= MAX_LAST_ERROR);
-    }
 
     // -- rendering ----------------------------------------------------------
 
