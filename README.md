@@ -384,7 +384,7 @@ sshpf --check               # 确认配置没写坏
 ## 开发
 
 ```bash
-cargo test                    # 386 单元 + 8 端到端（其中 7 个默认 #[ignore]，需真实 sshd）
+cargo test                    # 386 单元 + 9 端到端（其中 8 个默认 #[ignore]，需真实 sshd）
 cargo test --test e2e -- --ignored --test-threads=1   # 真实 sshd 端到端
 cargo clippy --all-targets    # 零警告
 cargo fmt --check             # 格式检查
