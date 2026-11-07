@@ -36,7 +36,7 @@
 
 ```text
 $ ssh -G cloud_pc | grep -E '^(hostname|user|port|proxyjump|identityfile|localforward) '
-user wangcan / hostname 10.244.119.128 / port 22
+user alice / hostname 203.0.113.10 / port 22
 localforward 18789 [127.0.0.1]:18789 / localforward 44897 [127.0.0.1]:44897
 identityfile ~/.ssh/id_rsa / proxyjump cloud_pc_jump
 ```
@@ -56,7 +56,7 @@ Include / 通配 / 含空格路径均正确（`identityfile ~/my keys/key with s
    bind [127.0.0.1]:80: Permission denied
    channel_setup_fwd_listener_tcpip: cannot listen to port: 80
    Could not request local forwarding.
-③ 认证失败（exit=255）：wangcan@127.0.0.1: Permission denied (publickey).
+③ 认证失败（exit=255）：alice@127.0.0.1: Permission denied (publickey).
    （BatchMode=yes 对纯密码服务器也立即失败，不挂起）
 ④ 拒绝/解析失败（exit=255）
    ssh: connect to host 127.0.0.1 port 1: Connection refused
@@ -88,7 +88,7 @@ $ ssh -N -v -L 127.0.0.1:18500:127.0.0.1:22 ...
 43: debug1: Entering interactive session.       ← 就绪（-R 则等 45: remote forward success for）
 ```
 - `-o LogLevel=VERBOSE` **不够**（只有 `Authenticated to`），必须 `-v` 或 `-o LogLevel=DEBUG1`。三个必备细节：**(1) 失败行优先**（bind 失败行在 `Entering` 之前但进程可能仍活）；**(2) stderr EOF 后必须 `wait()` 取退出码**（认证失败无 marker，探针第一版漏 wait 误报 "stderr closed"）；**(3) `-L` 成功 ≠ 目标可达**（见⑦）。
-- `BatchMode=yes`+stdin=null 下密码服务器立即失败；`SSH_ASKPASS_REQUIRE` **8.2 不支持**（askpass 被调用但无效）。pty 实测可读 `wangcan@127.0.0.1's password:` 并写入，但 v1 建议默认 BatchMode、失败时提示手动登录。
+- `BatchMode=yes`+stdin=null 下密码服务器立即失败；`SSH_ASKPASS_REQUIRE` **8.2 不支持**（askpass 被调用但无效）。pty 实测可读 `alice@127.0.0.1's password:` 并写入，但 v1 建议默认 BatchMode、失败时提示手动登录。
 
 ### 2.4 进程树与清理（含 ProxyJump）
 

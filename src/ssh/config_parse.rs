@@ -656,8 +656,8 @@ mod tests {
 
     #[test]
     fn parse_user_at_host_port() {
-        let spec = HostSpec::parse("wangcan@127.0.0.1:2222");
-        assert_eq!(spec.user.as_deref(), Some("wangcan"));
+        let spec = HostSpec::parse("alice@127.0.0.1:2222");
+        assert_eq!(spec.user.as_deref(), Some("alice"));
         assert_eq!(spec.host, "127.0.0.1");
         assert_eq!(spec.port, Some(2222));
         assert!(!spec.is_alias);

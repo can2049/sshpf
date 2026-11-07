@@ -649,7 +649,7 @@ mod tests {
         assert!(f.short.contains("80"), "{}", f.short);
 
         // ③ auth failure
-        let f = classify_failure("wangcan@127.0.0.1: Permission denied (publickey).").unwrap();
+        let f = classify_failure("alice@127.0.0.1: Permission denied (publickey).").unwrap();
         assert_eq!(f.kind, FailureKind::AuthFailed);
 
         // ④ dns / refused
@@ -690,7 +690,7 @@ mod tests {
         assert_eq!(f.kind, FailureKind::TargetUnreachable);
 
         // ⑧ timeout
-        let f = classify_failure("Timeout, server 10.244.119.128 not responding.").unwrap();
+        let f = classify_failure("Timeout, server 203.0.113.10 not responding.").unwrap();
         assert_eq!(f.kind, FailureKind::Timeout);
         assert_eq!(
             classify_failure("ssh: connect to host 10.0.0.1 port 22: Connection timed out").unwrap().kind,

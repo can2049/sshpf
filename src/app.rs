@@ -953,7 +953,7 @@ mod tests {
         let mut app = app_with(dir.path(), vec![sample_tunnel(1, "x", 18021)]);
         app.cfg.defaults.auto_restart = false;
         app.set_state(1, TunnelStatus::Starting { since: Instant::now() });
-        app.on_line(1, "wangcan@host: Permission denied (publickey).".into());
+        app.on_line(1, "alice@host: Permission denied (publickey).".into());
         let before = app.tunnels[0].status.clone();
         app.on_exit(1, Some(255));
         assert_eq!(app.tunnels[0].status, before, "exit must not overwrite a specific failure");
@@ -992,7 +992,7 @@ mod tests {
         app.set_state(1, TunnelStatus::Starting { since: Instant::now() });
         app.arm_retry(1);
         // Authentication cannot fix itself.
-        app.on_line(1, "wangcan@host: Permission denied (publickey).".into());
+        app.on_line(1, "alice@host: Permission denied (publickey).".into());
         app.on_exit(1, Some(255));
         assert!(
             matches!(app.tunnels[0].status, TunnelStatus::Failed { .. }),
