@@ -518,3 +518,63 @@ fn unresolvable_host_fails_without_hanging() {
         std::env::remove_var("SSHPF_KNOWN_HOSTS");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Importing forwards declared in ~/.ssh/config
+// ---------------------------------------------------------------------------
+
+/// End-to-end proof of the headline feature: a forward declared only in
+/// `~/.ssh/config` is discovered, turned into a tunnel, and really carries bytes.
+///
+/// The interesting part is that nothing here hand-builds a `TunnelConfig` — the
+/// config file is the only source, which is exactly the path a user takes
+/// (`n` -> pick host -> the pane lists it -> `ctrl+s`).
+#[test]
+#[ignore = "needs a working sshd"]
+fn imported_ssh_config_forward_carries_traffic() {
+    let _guard = env_lock();
+    let Some(sshd) = start_sshd() else { return };
+    sshd.activate();
+
+    // Declare a LocalForward in the client config, targeting the sshd's own
+    // port: its SSH banner proves bytes crossed the tunnel.
+    let local_port = free_port();
+    let mut cfg = std::fs::read_to_string(sshd.ssh_config()).unwrap_or_default();
+    cfg.push_str(&format!(
+        "\nHost testhost\n  HostName 127.0.0.1\n  Port {}\n  LocalForward {local_port} 127.0.0.1:{}\n",
+        sshd.port, sshd.port
+    ));
+    std::fs::write(sshd.ssh_config(), cfg).unwrap();
+
+    // Discovery is the entry point: whatever it reports is what the pane shows.
+    let rows = sshpf::ssh::forwards::forwards_for_host("testhost").expect("scan should succeed");
+    assert_eq!(rows.len(), 1, "the declared forward must be discovered: {rows:#?}");
+    assert_eq!(rows[0].listen_port, local_port);
+    assert!(rows[0].unsupported_reason().is_none(), "it must be importable");
+    let forward = rows[0].clone();
+
+    // Build the tunnel the way the form does, then run it for real.
+    let dir = tempfile::tempdir().unwrap();
+    let paths = Paths { config: dir.path().join("config.toml"), state: dir.path().join("state.toml") };
+    config::save(&paths.config, &config::ConfigFile::default()).unwrap();
+    let mut app = App::new(paths);
+    let mut t = app.config_from_forward(1, &forward, &[]);
+    t.auto_restart = false;
+    assert_eq!(t.local_port, local_port, "a free port must be imported verbatim");
+    app.cfg.tunnels.push(t.clone());
+    app.tunnels.push(sshpf::model::TunnelView::new(t.clone()));
+
+    app.start_tunnel(1);
+    assert!(
+        wait_for(&mut app, 30, |a| matches!(status_of(a, 1), TunnelStatus::Up { .. })),
+        "imported tunnel never came up: {:?}",
+        status_of(&app, 1)
+    );
+
+    let mut conn = TcpStream::connect(("127.0.0.1", local_port)).expect("connect through the imported forward");
+    conn.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut buf = [0u8; 64];
+    let n = conn.read(&mut buf).expect("read the target banner through the imported forward");
+    let banner = String::from_utf8_lossy(&buf[..n]).to_string();
+    assert!(banner.starts_with("SSH-2.0-"), "expected the sshd banner through the import, got {banner:?}");
+}
