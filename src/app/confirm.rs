@@ -40,6 +40,10 @@ impl App {
                     format!("确认启用全部转发？将新开 {n} 个监听端口。")
                 }
                 ConfirmAction::DiscardForm => "确认放弃未保存的修改？已输入的内容会丢失。".to_string(),
+                // The batch path builds its prompt from the action and the
+                // effective count, so this arm is only reachable if a caller
+                // forgot to do that.
+                ConfirmAction::Batch { action, count } => action.prompt(*count),
                 ConfirmAction::Quit => {
                     let running = self.supervisor.running_count();
                     if running == 0 {
@@ -100,6 +104,7 @@ impl App {
                 self.set_status(StatusMsg::info("已放弃修改"));
             }
             ConfirmAction::Quit => self.should_quit = true,
+            ConfirmAction::Batch { action, .. } => self.apply_batch(action),
         }
     }
 }

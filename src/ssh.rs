@@ -9,6 +9,7 @@
 //!
 //! ```text
 //! config       ~/.ssh/config → hosts + effective endpoints (ssh2-config)
+//! forwards     ~/.ssh/config → LocalForward/RemoteForward/DynamicForward rows
 //! known_hosts  server key verification (self-written; russh's has holes)
 //! socks5       SOCKS5 server for -D
 //! client       connect/auth/ProxyJump + the -L/-R/-D drivers (russh)
@@ -41,6 +42,7 @@ use crate::model::ForwardKind;
 
 pub mod client;
 pub mod config;
+pub mod forwards;
 pub mod known_hosts;
 pub mod socks5;
 

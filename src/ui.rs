@@ -35,7 +35,8 @@ use ratatui::widgets::{
 use crate::app::{App, Overlay};
 use crate::config;
 use crate::model::{
-    FormField, ForwardKind, HostPicker, LogLevel, LogLine, TunnelConfig, TunnelId, TunnelStatus, TunnelView, now_hms,
+    BatchAction, FormField, ForwardKind, HostPicker, LogLevel, LogLine, TunnelConfig, TunnelId, TunnelStatus,
+    TunnelView, now_hms,
 };
 
 // ---------------------------------------------------------------------------
@@ -127,9 +128,12 @@ pub fn palette_with(no_color: bool) -> Palette {
 // Small pure helpers (unit tested)
 // ---------------------------------------------------------------------------
 
+pub mod hit;
+pub mod import;
 pub mod layout;
 
 use crate::text::{display_width, pad_to_width, truncate_to_width};
+use hit::{HitMap, HitTarget};
 use layout::{COL_SPACING, DETAIL_LOG_TAIL, FORM_LABEL_W, FORM_VALUE_X};
 pub use layout::{Col, column_layout};
 
@@ -170,32 +174,49 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // --- mutable phase: clamp scroll offsets ------------------------------
     clamp_scrolls(app, area);
 
-    // --- immutable phase: render ------------------------------------------
-    let app: &App = app;
+    // --- hit map: rebuilt from scratch, every frame -----------------------
+    // A stale map would send a click to last frame's geometry, so it is cleared
+    // first. It is *taken out* of `App` rather than borrowed: the renderers
+    // below only get `&App` (that is what keeps this module read-only), yet they
+    // must still record where they drew things. Written back at the end.
+    app.hits.clear();
+    let mut hits = std::mem::take(&mut app.hits);
 
+    // --- immutable phase: render ------------------------------------------
+    let app_ref: &App = app;
+
+    // The action bar only exists while selecting, and it takes its row from the
+    // table instead of leaving a blank strip in normal mode.
+    let select_h = u16::from(app_ref.select_mode.active);
     let rows = Layout::vertical([
-        Constraint::Length(1), // title
-        Constraint::Length(1), // counters
-        Constraint::Min(1),    // table
-        Constraint::Length(1), // message bar
-        Constraint::Length(2), // key hints
+        Constraint::Length(1),        // title
+        Constraint::Length(1),        // counters
+        Constraint::Min(1),           // table
+        Constraint::Length(1),        // message bar
+        Constraint::Length(select_h), // selection-mode action bar
+        Constraint::Length(2),        // key hints
     ])
     .split(area);
 
-    draw_title(frame, app, rows[0]);
-    draw_counters(frame, app, rows[1]);
-    draw_table(frame, app, rows[2]);
-    draw_message(frame, app, rows[3]);
-    draw_keys(frame, rows[4]);
-
-    match &app.overlay {
-        Overlay::None => {}
-        Overlay::Help => draw_help(frame, app, area),
-        Overlay::Form => draw_form(frame, app, area),
-        Overlay::Confirm { prompt, .. } => draw_confirm(frame, prompt, area),
-        Overlay::Detail(id) => draw_detail(frame, app, *id, area),
-        Overlay::Filter => draw_filter(frame, app, area),
+    draw_title(frame, app_ref, rows[0]);
+    draw_counters(frame, app_ref, rows[1]);
+    draw_table(frame, app_ref, rows[2], &mut hits);
+    draw_message(frame, app_ref, rows[3]);
+    if select_h > 0 {
+        draw_selection_bar(frame, app_ref, rows[4], &mut hits);
     }
+    draw_keys(frame, app_ref, rows[5]);
+
+    match &app_ref.overlay {
+        Overlay::None => {}
+        Overlay::Help => draw_help(frame, app_ref, area, &mut hits),
+        Overlay::Form => draw_form(frame, app_ref, area, &mut hits),
+        Overlay::Confirm { prompt, .. } => draw_confirm(frame, prompt, area, &mut hits),
+        Overlay::Detail(id) => draw_detail(frame, app_ref, *id, area, &mut hits),
+        Overlay::Filter => draw_filter(frame, app_ref, area, &mut hits),
+    }
+
+    app.hits = hits;
 }
 
 /// Clamp the ratatui scroll offsets to the current content length so that a
@@ -322,14 +343,25 @@ fn draw_message(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 /// Two lines of key hints, exactly matching the keys `main` dispatches.
-fn draw_keys(frame: &mut Frame, area: Rect) {
+///
+/// Both lines change in selection mode, because the mode *re-binds* keys rather
+/// than adding to them: `space` marks instead of starting, and `r`/`d`/`n`/`e`
+/// are not bound at all there. Leaving the normal hints on screen would
+/// advertise keys that do something else or nothing — the exact way a user
+/// discovers "the app is broken" while it is working as designed.
+fn draw_keys(frame: &mut Frame, app: &App, area: Rect) {
     if area.height == 0 || area.width == 0 {
         return;
     }
     let p = palette();
-    let lines = vec![
-        key_line(
-            &[
+    let (first, second): (Vec<Hint>, Vec<Hint>) = if app.select_mode.active {
+        (
+            vec![("j/k ↑↓", "移动"), ("space", "勾选"), ("J/K", "扩选"), ("g/G", "首尾")],
+            vec![("a", "全选"), ("s/x/R/D", "批量操作"), ("esc", "退出"), ("?", "帮助")],
+        )
+    } else {
+        (
+            vec![
                 ("j/k ↑↓", "移动"),
                 ("space", "启停"),
                 ("r", "重启"),
@@ -339,25 +371,25 @@ fn draw_keys(frame: &mut Frame, area: Rect) {
                 ("enter", "详情"),
                 ("l", "日志"),
             ],
-            p,
-        ),
-        key_line(
-            &[
+            vec![
                 ("/", "过滤"),
                 ("a", "全启"),
                 ("x", "全停"),
                 ("g/G", "首尾"),
+                ("v", "多选"),
                 ("?", "帮助"),
-                ("esc", "关闭弹窗"),
                 ("q", "退出"),
             ],
-            p,
-        ),
-    ];
+        )
+    };
+    let lines = vec![key_line(&first, p), key_line(&second, p)];
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn key_line(items: &[(&str, &str)], p: Palette) -> Line<'static> {
+/// One `(key, description)` pair of the two hint lines.
+type Hint = (&'static str, &'static str);
+
+fn key_line(items: &[Hint], p: Palette) -> Line<'static> {
     let mut spans = vec![Span::raw(" ")];
     for (i, (key, desc)) in items.iter().enumerate() {
         if i > 0 {
@@ -408,44 +440,61 @@ fn uptime_text(status: &TunnelStatus) -> String {
     }
 }
 
+/// Width of the selection-mode mark gutter (`✓` / `·`). One cell: the glyph is
+/// single-width, and the table's own `▶ ` highlight symbol sits next to it.
+const MARK_W: u16 = 1;
+
 fn cell(text: impl Into<String>, style: Style) -> Cell<'static> {
     Cell::new(Text::from(Line::from(text.into()))).style(style)
 }
 
-fn draw_table(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_table(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     if area.height == 0 || area.width == 0 {
         return;
     }
     let p = palette();
-    let layout = column_layout(area.width);
+    let select = app.select_mode.active;
+    // The whole list is a scroll target; rows are pushed afterwards so a row
+    // under the pointer shadows the background.
+    hits.push(area, HitTarget::TunnelList);
+
+    // In selection mode the table grows a narrow mark column. Its width (plus the
+    // extra inter-column gap it introduces) is subtracted from the budget *before*
+    // the column layout runs, so the other columns shrink by exactly that much
+    // instead of the table overflowing the frame.
+    let mark_w = if select { MARK_W } else { 0 };
+    let layout = column_layout(area.width.saturating_sub(mark_w + u16::from(select) * COL_SPACING));
 
     let header_style = p.fg(p.dim).add_modifier(Modifier::BOLD);
-    let headers: Vec<Cell<'static>> = layout
-        .iter()
-        .map(|(col, w)| {
-            // Short labels keep the header readable once a column is squeezed.
-            let label = match col {
-                Col::Name => "名称",
-                Col::Kind => "T",
-                Col::Local => "本地",
-                Col::Remote => "远端",
-                Col::LocalRemote => "本地→远端",
-                Col::SshHost => "SSH 主机",
-                Col::Status => "状态",
-                Col::LastError if *w >= 8 => "最后错误",
-                Col::LastError => "错误",
-                Col::Uptime => "时长",
-            };
-            cell(label, header_style)
-        })
-        .collect();
+    let mut headers: Vec<Cell<'static>> = Vec::with_capacity(layout.len() + 1);
+    if select {
+        // Single-width on purpose: MARK_W is one cell, and a two-cell header
+        // glyph would be truncated to nothing by the column constraint.
+        headers.push(cell("✓", header_style));
+    }
+    headers.extend(layout.iter().map(|(col, w)| {
+        // Short labels keep the header readable once a column is squeezed.
+        let label = match col {
+            Col::Name => "名称",
+            Col::Kind => "T",
+            Col::Local => "本地",
+            Col::Remote => "远端",
+            Col::LocalRemote => "本地→远端",
+            Col::SshHost => "SSH 主机",
+            Col::Status => "状态",
+            Col::LastError if *w >= 8 => "最后错误",
+            Col::LastError => "错误",
+            Col::Uptime => "时长",
+        };
+        cell(label, header_style)
+    }));
     let header = Row::new(headers);
 
     let visible = app.visible_indices();
     let mut rows: Vec<Row<'static>> = Vec::with_capacity(visible.len().max(1));
     for idx in &visible {
         if let Some(view) = app.tunnels.get(*idx) {
-            rows.push(table_row(view, &layout, p));
+            rows.push(table_row(view, &layout, p, select.then_some(app.select_mode.is_marked(view.cfg.id))));
         }
     }
 
@@ -455,10 +504,15 @@ fn draw_table(frame: &mut Frame, app: &App, area: Rect) {
         } else {
             "没有匹配的条目，按 esc 清除过滤"
         };
-        rows.push(Row::new(vec![cell(text, p.fg(p.dim)).column_span(layout.len().max(1) as u16)]));
+        let span = layout.len().max(1) as u16 + mark_w;
+        rows.push(Row::new(vec![cell(text, p.fg(p.dim)).column_span(span)]));
     }
 
-    let widths: Vec<Constraint> = layout.iter().map(|(_, w)| Constraint::Length(*w)).collect();
+    let mut widths: Vec<Constraint> = Vec::with_capacity(layout.len() + 1);
+    if select {
+        widths.push(Constraint::Length(mark_w));
+    }
+    widths.extend(layout.iter().map(|(_, w)| Constraint::Length(*w)));
     let table = Table::new(rows, widths)
         .header(header)
         .column_spacing(COL_SPACING)
@@ -472,11 +526,33 @@ fn draw_table(frame: &mut Frame, app: &App, area: Rect) {
         state.select(Some(app.selected.min(visible.len() - 1)));
     }
     frame.render_stateful_widget(table, area, &mut state);
+
+    // Row geometry: one row for the top border, one for the header, then one per
+    // visible row. `draw_table` always passes a fresh `TableState` with no
+    // offset, so the mapping is exact — and rows scrolled past the bottom are
+    // skipped so a click below the last row cannot resolve to a hidden one.
+    for (i, idx) in visible.iter().enumerate() {
+        let Some(view) = app.tunnels.get(*idx) else { continue };
+        let y = area.y + 2 + i as u16;
+        if y >= area.bottom() {
+            break;
+        }
+        hits.push(Rect { x: area.x, y, width: area.width, height: 1 }, HitTarget::TunnelRow(view.cfg.id));
+    }
 }
 
-fn table_row(view: &TunnelView, layout: &[(Col, u16)], p: Palette) -> Row<'static> {
+/// One table row. `marked` is `Some(flag)` only in selection mode, where it adds
+/// the leading mark gutter — the `▶` cursor marker is drawn by the table itself,
+/// so `▶ ✓ name` means "cursor here, and this one is selected too".
+fn table_row(view: &TunnelView, layout: &[(Col, u16)], p: Palette, marked: Option<bool>) -> Row<'static> {
     let cfg = &view.cfg;
-    let mut cells: Vec<Cell<'static>> = Vec::with_capacity(layout.len());
+    let mut cells: Vec<Cell<'static>> = Vec::with_capacity(layout.len() + 1);
+    if let Some(marked) = marked {
+        // Symbol + colour, never colour alone: `·` is the unmarked state, and it
+        // is visible in a NO_COLOR run.
+        let (mark, style) = if marked { ("✓", p.fg(p.up).add_modifier(Modifier::BOLD)) } else { ("·", p.fg(p.dim)) };
+        cells.push(cell(mark, style));
+    }
     for (col, width) in layout {
         let w = *width as usize;
         let c = match col {
@@ -513,7 +589,85 @@ fn table_row(view: &TunnelView, layout: &[(Col, u16)], p: Palette) -> Row<'stati
         cells.push(c);
     }
     let row = Row::new(cells);
-    if matches!(view.status, TunnelStatus::Stopped) { row.style(p.fg(p.dim)) } else { row }
+    if marked == Some(true) {
+        // A marked row keeps its normal text style on top of the bar: the mark
+        // gutter already says "selected", so the row need not shout.
+        row.style(p.fg(p.text))
+    } else if matches!(view.status, TunnelStatus::Stopped) {
+        row.style(p.fg(p.dim))
+    } else {
+        row
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Selection mode: action bar
+// ---------------------------------------------------------------------------
+
+/// The bottom bar of selection mode: how many are marked, and what can be done.
+///
+/// Every action is a clickable label recorded in the hit map, so the mouse
+/// reaches exactly the same handlers as the keys. The count leads the line
+/// because "what is my selection right now" is the question the mode exists to
+/// answer; it is stated even when zero rather than being omitted.
+fn draw_selection_bar(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let p = palette();
+    let n = app.select_mode.len();
+    frame.render_widget(Clear, area);
+    frame.render_widget(Paragraph::new("").style(p.bg(p.selection_bg)), area);
+
+    let mut x = area.x;
+    let right = area.right();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+
+    // The count is emphasised because it is the mode's whole state.
+    let count = format!(" 已选 {n} 条 ");
+    let count_w = display_width(&count) as u16;
+    let count_style = if n == 0 { p.fg(p.pending) } else { p.fg(p.up) }.add_modifier(Modifier::BOLD);
+    spans.push(Span::styled(count, count_style));
+    x = x.saturating_add(count_w);
+
+    // Layout, not content: "已选 0 条" plus the actions still fits narrow
+    // terminals because each label is dropped whole once it stops fitting.
+    let buttons: [(BatchAction, &str); 4] = [
+        (BatchAction::Start, "s 启用"),
+        (BatchAction::Stop, "x 停用"),
+        (BatchAction::Restart, "R 重启"),
+        (BatchAction::Delete, "D 删除"),
+    ];
+    for (action, label) in buttons {
+        let sep = "  ·  ";
+        let sep_w = display_width(sep) as u16;
+        let label_w = display_width(label) as u16;
+        if x + sep_w + label_w > right {
+            break;
+        }
+        spans.push(Span::styled(sep, p.fg(p.dim)));
+        spans.push(Span::styled(label, p.fg(p.accent)));
+        x += sep_w;
+        let rect = Rect { x, y: area.y, width: label_w, height: 1 };
+        hits.push(rect, HitTarget::BatchAction(action));
+        x += label_w;
+    }
+
+    for (label, target) in [("a 全选", HitTarget::BatchSelectAll), ("v/esc 退出", HitTarget::BatchExit)] {
+        let sep = "  ·  ";
+        let sep_w = display_width(sep) as u16;
+        let label_w = display_width(label) as u16;
+        if x + sep_w + label_w > right {
+            break;
+        }
+        spans.push(Span::styled(sep, p.fg(p.dim)));
+        spans.push(Span::styled(label, p.fg(p.accent)));
+        x += sep_w;
+        hits.push(Rect { x, y: area.y, width: label_w, height: 1 }, target);
+        x += label_w;
+    }
+
+    frame.render_widget(Paragraph::new(Line::from(spans)).style(p.bg(p.selection_bg)), area);
 }
 
 // ---------------------------------------------------------------------------
@@ -584,8 +738,26 @@ const HELP_ITEMS: &[(&str, &str)] = &[
     ("tab / ↑↓", "切换字段"),
     ("← / →", "切换转发类型 L / R / D"),
     ("enter/↓", "在 SSH 主机字段展开 ~/.ssh/config 下拉"),
+    ("space / i", "展开 / 收起「从 ~/.ssh/config 导入转发」面板"),
     ("enter", "校验并保存（保存后立即连接）"),
     ("esc", "取消编辑（有未保存内容会确认）"),
+    ("", ""),
+    ("导入面板内：", ""),
+    ("j/k ↑↓", "移动行（g/G 首尾）"),
+    ("space", "勾选 / 取消当前行"),
+    ("a / U / I", "全选 / 全不选 / 反选（只作用于筛选后的可见行）"),
+    ("f / ←→", "切到下一 / 上一列的筛选"),
+    ("F", "清除当前列的筛选"),
+    ("ctrl+r", "清除全部筛选"),
+    ("z", "撤销上一次筛选改动"),
+    ("esc", "先退出筛选输入；再按一次收起面板"),
+    ("", ""),
+    ("多选模式（v）：", ""),
+    ("v / esc", "进入 / 退出多选模式"),
+    ("space", "勾选 / 取消光标行"),
+    ("J / K", "扩选：按行范围累加标记"),
+    ("a", "全选（再按一次取消全选，看「已选 N 条」确认）"),
+    ("s / x / R / D", "批量 启用 / 停用 / 重启 / 删除（需确认）"),
     ("", ""),
     ("状态含义：", ""),
     ("● 已连通", "转发已就绪，可开始使用"),
@@ -609,9 +781,12 @@ fn help_inner_height(area: Rect) -> u16 {
     centered_pct(area, 78, 84).height.saturating_sub(2)
 }
 
-fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_help(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     let p = palette();
     let popup = centered_pct(area, 78, 84);
+    // Modals are drawn after the table, so they must record themselves: without
+    // this, a click on the dialog would still hit the table row behind it.
+    hits.push(popup, HitTarget::Popup);
     let block = popup_block("帮助 · j/k 滚动 · ? 或 esc 关闭", p);
     let inner = block.inner(popup);
     clear_and_block(frame, popup, block);
@@ -659,7 +834,7 @@ fn form_field_buf(form: &crate::app::FormState, field: FormField) -> Option<&cra
     }
 }
 
-fn draw_form(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_form(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     let Some(form) = app.form.as_ref() else { return };
     let p = palette();
     let title =
@@ -668,7 +843,26 @@ fn draw_form(frame: &mut Frame, app: &App, area: Rect) {
     // Rows: title border (2) + one line per field + errors/port hint (2)
     //       + blank (1) + key hint (1) + dropdown frame (2) + dropdown rows.
     let fields_h = FormField::ORDER.len() as u16;
-    let wanted_h = fields_h + 4 + 2 + crate::app::HOST_DROPDOWN_ROWS as u16 + 2;
+    let base_h = fields_h + 4 + 2 + crate::app::HOST_DROPDOWN_ROWS as u16 + 2;
+    // The import pane is *added* to the form's height rather than borrowed from
+    // it: a pane that squeezed the fields would hide the very values the user is
+    // checking against the rows they tick.
+    //
+    // Visibility goes through `App::import_pane_open` so the renderer and the key
+    // handler cannot disagree. Two extra cases are the renderer's to own, because
+    // `import_pane_open` is deliberately just "is there a table worth showing":
+    //
+    // * discovery *failed* → the table is empty, but the reason is exactly what
+    //   the user needs, so the pane opens to show it;
+    // * `import_open` set on an empty table → the state is reachable (a filter or
+    //   a host switch can empty it), and silently collapsing would look like the
+    //   key did nothing. `import::draw_empty` has a branch for each.
+    // (`import_error` on its own deliberately does *not* force the pane open:
+    // `App::toggle_import_pane` reports the failure on the status line and leaves
+    // the pane closed, and two places claiming to show the same reason would be
+    // worse than one.)
+    let pane_open = app.import_pane_open() || app.form.as_ref().is_some_and(|f| f.import_open);
+    let wanted_h = base_h + if pane_open { import::PREF_HEIGHT } else { 0 };
     let popup = centered(area, 74.min(area.width), wanted_h.min(area.height));
     let block = popup_block(&title, p);
     let inner = block.inner(popup);
@@ -683,19 +877,44 @@ fn draw_form(frame: &mut Frame, app: &App, area: Rect) {
     let lines = form_field_lines(app, form, p, value_w, current_idx);
     let extra = form_notes(form, p, inner.width as usize);
 
+    // Reserve the pane out of the bottom, but only after the fields and their
+    // notes have their rows: on a short terminal the pane is what shrinks (and
+    // eventually disappears) so the form stays usable.
+    let (body, pane_area) = match pane_open {
+        true => {
+            let needed = lines.len() as u16 + extra.len() as u16;
+            let room = inner.height.saturating_sub(needed).min(import::PREF_HEIGHT);
+            if room >= import::MIN_HEIGHT {
+                let body = Rect { height: inner.height - room, ..inner };
+                let pane = Rect { x: inner.x, y: inner.y + body.height, width: inner.width, height: room };
+                (body, Some(pane))
+            } else {
+                (inner, None)
+            }
+        }
+        false => (inner, None),
+    };
+
     let used = lines.len() as u16;
-    if inner.height > used {
-        let rest = Rect { x: inner.x, y: inner.y + used, width: inner.width, height: inner.height - used };
+    if body.height > used {
+        let rest = Rect { x: body.x, y: body.y + used, width: body.width, height: body.height - used };
         frame.render_widget(Paragraph::new(extra), rest);
     }
-    frame.render_widget(Paragraph::new(lines), inner);
+    frame.render_widget(Paragraph::new(lines), body);
 
     // Expand the dropdown *inside* the form, anchored under the SSH HOST row.
+    // It is confined to the body so it can never cover the import pane.
     if let Some(picker) = app.picker.as_ref().filter(|pk| pk.open) {
-        draw_host_dropdown(frame, app, picker, inner, current_idx as u16);
+        draw_host_dropdown(frame, app, picker, body, current_idx as u16);
     }
 
-    place_form_cursor(frame, form, inner, popup, current_idx);
+    place_form_cursor(frame, form, body, popup, current_idx);
+
+    // Drawn last, and outside `body`: it owns its own cursor (a column filter
+    // being typed into), which must win over the form field cursor.
+    if let Some(pane) = pane_area {
+        import::draw_pane(frame, app, pane, hits);
+    }
 }
 
 /// One `Line` per form field, styled for the three highlight states.
@@ -939,7 +1158,7 @@ fn draw_host_dropdown(frame: &mut Frame, app: &App, picker: &HostPicker, inner: 
 // Overlay: Confirm
 // ---------------------------------------------------------------------------
 
-fn draw_confirm(frame: &mut Frame, prompt: &str, area: Rect) {
+fn draw_confirm(frame: &mut Frame, prompt: &str, area: Rect, hits: &mut HitMap) {
     let p = palette();
     let min = 40u16.min(area.width);
     let max = 90u16.min(area.width);
@@ -948,6 +1167,9 @@ fn draw_confirm(frame: &mut Frame, prompt: &str, area: Rect) {
     // blank line and the key row, plus the two border rows.
     let prompt_rows = display_width(prompt).div_ceil(wanted.saturating_sub(4) as usize) as u16;
     let popup = centered(area, wanted, (prompt_rows.max(1) + 4).min(area.height));
+    // The riskiest click-through to allow: the dialog asks before a destructive
+    // action, so a click meant for the dialog must never reach a table row.
+    hits.push(popup, HitTarget::Popup);
     let block = popup_block("确认", p);
     let inner = block.inner(popup);
     clear_and_block(frame, popup, block);
@@ -1079,10 +1301,11 @@ fn detail_lines(view: &TunnelView, id: TunnelId, p: Palette) -> Vec<Line<'static
     lines
 }
 
-fn draw_detail(frame: &mut Frame, app: &App, id: TunnelId, area: Rect) {
+fn draw_detail(frame: &mut Frame, app: &App, id: TunnelId, area: Rect, hits: &mut HitMap) {
     let p = palette();
     let Some(view) = app.tunnel(id) else { return };
     let popup = centered_pct(area, 88, 86);
+    hits.push(popup, HitTarget::Popup);
     let title = format!("详情 · {} · j/k 滚动 · esc 返回", view.cfg.name);
     let block = popup_block(&title, p);
     let inner = block.inner(popup);
@@ -1101,7 +1324,7 @@ fn draw_detail(frame: &mut Frame, app: &App, id: TunnelId, area: Rect) {
 // Overlay: Filter
 // ---------------------------------------------------------------------------
 
-fn draw_filter(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_filter(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     let p = palette();
     // Occupies the very last screen row: a one-line, non-modal input.
     let row = Rect { x: area.x, y: area.bottom().saturating_sub(1), width: area.width, height: 1 };
@@ -1109,17 +1332,42 @@ fn draw_filter(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
     frame.render_widget(Clear, row);
+
+    let prefix = " 过滤: ";
+    let prefix_w = display_width(prefix) as u16;
+    let clear = "  × 清除 ";
+    let clear_w = display_width(clear) as u16;
+    // Keep the clear affordance on screen even when the typed text is long: it
+    // sits on the right, the input echoes in whatever is left of it.
+    let hint = "   enter 应用   esc 清除";
+    let hint_w = display_width(hint) as u16;
+    let value_w = row.width.saturating_sub(prefix_w + clear_w + hint_w);
+
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(" 过滤: ", p.fg(p.accent).add_modifier(Modifier::BOLD)),
-            Span::styled(truncate_to_width(&app.filter, row.width.saturating_sub(24) as usize), p.fg(p.text)),
-            Span::styled("    enter 应用   esc 清除", p.fg(p.dim)),
+            Span::styled(prefix, p.fg(p.accent).add_modifier(Modifier::BOLD)),
+            Span::styled(truncate_to_width(&app.filter, value_w as usize), p.fg(p.text)),
+            Span::styled(clear, p.fg(p.accent)),
+            Span::styled(hint, p.fg(p.dim)),
         ]))
         .style(p.bg(p.selection_bg)),
         row,
     );
-    let x = row.x + display_width(" 过滤: ") as u16 + display_width(&app.filter) as u16;
-    if x < row.right() {
+
+    // The input line itself: a click parks the cursor there (the overlay is
+    // already modal-ish, so it only needs to keep the click from falling
+    // through to the table underneath).
+    let bar_w = prefix_w + value_w;
+    hits.push(Rect { x: row.x, y: row.y, width: bar_w, height: 1 }, HitTarget::FilterBar);
+    if row.width >= clear_w + hint_w {
+        hits.push(
+            Rect { x: row.x + row.width - hint_w - clear_w, y: row.y, width: clear_w, height: 1 },
+            HitTarget::FilterClear,
+        );
+    }
+
+    let x = row.x + prefix_w + display_width(&app.filter) as u16;
+    if x < row.x + bar_w {
         frame.set_cursor_position((x, row.y));
     }
 }
@@ -1133,7 +1381,7 @@ mod tests {
     use super::*;
     use crate::app::{App, ConfirmAction};
     use crate::config::{ConfigFile, Paths};
-    use crate::model::{FailureInfo, FailureKind, InputBuf, TunnelStatus};
+    use crate::model::{FailureInfo, FailureKind, ImportColumn, ImportTable, InputBuf, SshForward, TunnelStatus};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use std::time::{Duration, Instant};
@@ -1682,6 +1930,47 @@ mod tests {
     }
 
     #[test]
+    fn key_hints_swap_instead_of_lying_in_selection_mode() {
+        // Selection mode RE-BINDS space and unbinds r/d/n/e. Showing the normal
+        // hints while it is active would advertise keys that do something else
+        // or nothing at all.
+        let mut app = app_with_tunnels(vec![sample(1, "api-dev", 8080), sample(2, "db", 8081)]);
+        let normal = render_to_text(&mut app, 140, 24);
+        assert!(normal.contains("启停"), "normal hints must describe space:\n{normal}");
+        assert!(normal.contains("重启"), "normal hints must mention r:\n{normal}");
+
+        app.selected = 0;
+        app.toggle_select_mode();
+        let selecting = render_to_text(&mut app, 140, 24);
+        assert!(!selecting.contains("启停"), "space does not start/stop in selection mode:\n{selecting}");
+        assert!(selecting.contains("勾选"), "selection hints must describe space:\n{selecting}");
+        assert!(selecting.contains("批量操作"), "selection hints must point at the batch keys:\n{selecting}");
+        assert!(selecting.contains("已选"), "the marked count must be on screen:\n{selecting}");
+    }
+
+    #[test]
+    fn selection_mode_gutter_marks_only_marked_rows() {
+        let mut app = app_with_tunnels(vec![sample(1, "first", 8080), sample(2, "second", 8081)]);
+        app.selected = 0;
+        app.toggle_select_mode();
+        // Nothing marked yet: the bar says 0 and no row carries a mark.
+        let text = render_to_text(&mut app, 140, 26);
+        assert!(text.contains("已选 0 条"), "initial state must be stated:\n{text}");
+        app.toggle_mark_selected();
+        let text = render_to_text(&mut app, 140, 26);
+        assert!(text.contains("已选 1 条"), "marking must be visible:\n{text}");
+        assert!(text.contains('✓'), "the marked row needs its own gutter symbol:\n{text}");
+    }
+
+    #[test]
+    fn the_import_pane_is_reachable_only_through_the_form() {
+        // The pane must never leak into the normal table view.
+        let mut app = app_with_tunnels(vec![sample(1, "api-dev", 8080)]);
+        let text = render_to_text(&mut app, 140, 26);
+        assert!(!text.contains("导入"), "the pane is a form sub-pane, not table chrome:\n{text}");
+    }
+
+    #[test]
     fn status_always_carries_symbol_and_word() {
         let mut app = app_with_tunnels(vec![sample(1, "api-dev", 8080)]);
         app.tunnels[0].status = TunnelStatus::Up { since: Instant::now() };
@@ -1698,5 +1987,285 @@ mod tests {
         assert!(form_field_buf(form, FormField::Kind).is_none());
         assert!(form_field_buf(form, FormField::AutoRestart).is_none());
         assert_eq!(form_field_buf(form, FormField::LocalAddr).map(InputBuf::value), Some("127.0.0.1"));
+    }
+
+    // -- import pane --------------------------------------------------------
+
+    fn fwd(kind: ForwardKind, listen: u16, target: &str, target_port: u16, raw: &str) -> SshForward {
+        SshForward {
+            kind,
+            listen_addr: String::new(),
+            listen_port: listen,
+            target_host: target.to_string(),
+            target_port,
+            host_alias: "dev-box".to_string(),
+            line: 12,
+            raw: raw.to_string(),
+        }
+    }
+
+    /// An app with a create form whose SSH HOST is set and whose import table
+    /// holds `rows`, pane open.
+    fn app_with_import(rows: Vec<SshForward>) -> App {
+        let mut app = app_with_tunnels(vec![]);
+        app.open_form_create();
+        app.hosts = vec![crate::ssh::SshHost {
+            alias: "dev-box".into(),
+            hostname: "10.0.0.9".into(),
+            user: None,
+            port: 22,
+            proxy_jump: None,
+            identity_file: None,
+        }];
+        if let Some(f) = app.form.as_mut() {
+            f.ssh_host.set("dev-box");
+            f.set_import_table("dev-box", ImportTable::new(rows));
+            f.import_open = true;
+        }
+        app
+    }
+
+    fn sample_forwards() -> Vec<SshForward> {
+        vec![
+            fwd(ForwardKind::Local, 8080, "127.0.0.1", 80, "LocalForward 8080 127.0.0.1:80"),
+            fwd(ForwardKind::Remote, 9000, "127.0.0.1", 9001, "RemoteForward 9000 127.0.0.1:9001"),
+            // Un-importable: listen port could not be parsed.
+            fwd(ForwardKind::Local, 0, "127.0.0.1", 5432, "LocalForward abc 127.0.0.1:5432"),
+        ]
+    }
+
+    #[test]
+    fn import_pane_renders_rows_checkboxes_and_summary() {
+        let mut app = app_with_import(sample_forwards());
+        let text = render_to_text(&mut app, 120, 45);
+        assert!(text.contains("从 ~/.ssh/config 导入转发"), "pane title missing:\n{text}");
+        assert!(text.contains("localhost:8080"), "listen cell missing:\n{text}");
+        assert!(text.contains("(SOCKS5)") || text.contains("127.0.0.1:9001"), "target cell missing:\n{text}");
+        // The 原始指令 column is the elastic one, so a long directive is shown
+        // truncated with an ellipsis rather than being allowed to overflow.
+        assert!(text.contains("LocalForward 8080"), "raw directive missing:\n{text}");
+        // Two importable rows are pre-ticked, the un-importable one is not.
+        assert!(text.contains("[x]"), "checked box missing:\n{text}");
+        assert!(text.contains("[–]"), "un-importable box should be the striped form:\n{text}");
+        assert!(text.contains("2/2 条勾选"), "summary must count importable rows only:\n{text}");
+        assert!(text.contains("space 勾选"), "pane footer hints missing:\n{text}");
+    }
+
+    #[test]
+    fn unimportable_import_row_shows_its_reason_and_cannot_be_ticked() {
+        let mut app =
+            app_with_import(vec![fwd(ForwardKind::Local, 0, "127.0.0.1", 5432, "LocalForward abc 127.0.0.1:5432")]);
+        let text = render_to_text(&mut app, 120, 45);
+        let row =
+            text.lines().find(|l| l.contains("端口无法解析")).unwrap_or_else(|| panic!("reason missing:\n{text}"));
+        assert!(!row.contains("[x]"), "a broken row must not look ticked: {row:?}");
+        assert!(row.contains("[–]"), "it should look untickable, not merely unticked: {row:?}");
+        assert!(text.contains("0/0 条勾选"), "summary should show nothing importable:\n{text}");
+        // Ticking it is a no-op, at the model level too.
+        let form = app.form.as_mut().unwrap();
+        form.import.toggle_cursor();
+        assert_eq!(form.import.checked_count(), 0, "un-importable rows must not become checked");
+    }
+
+    #[test]
+    fn import_pane_shows_filtered_header_chips_and_buttons() {
+        let mut app = app_with_import(sample_forwards());
+        if let Some(f) = app.form.as_mut() {
+            f.import.set_filter(ImportColumn::Kind, "R");
+        }
+        let text = render_to_text(&mut app, 120, 45);
+        // The filtered column header is marked distinctly (`▾`) ...
+        assert!(text.contains("类型▾"), "filtered header marker missing:\n{text}");
+        // ... and the chip line names the active filter with a delete affordance.
+        assert!(text.contains("筛选: 类型=R ×"), "filter chip missing:\n{text}");
+        assert!(text.contains("清除全部筛选"), "clear-all affordance missing:\n{text}");
+        assert!(text.contains("撤销筛选"), "undo affordance missing:\n{text}");
+        assert!(text.contains("全选"), "select-all button missing:\n{text}");
+        // Only the R row survives the filter.
+        assert!(text.contains("RemoteForward 900"), "filtered row missing:\n{text}");
+        assert!(!text.contains("LocalForward 8080"), "filter did not narrow:\n{text}");
+    }
+
+    #[test]
+    fn import_pane_shows_the_editing_column_with_a_cursor() {
+        let mut app = app_with_import(sample_forwards());
+        if let Some(f) = app.form.as_mut() {
+            f.import.begin_filter(ImportColumn::Listen);
+            f.import.filter_char(ImportColumn::Listen, '8');
+        }
+        let text = render_to_text(&mut app, 120, 45);
+        assert!(text.contains("监听:8"), "the column being typed into must echo the input:\n{text}");
+    }
+
+    #[test]
+    fn import_pane_renders_at_small_sizes_without_panicking() {
+        // The pane must degrade, never panic: it is opened by a key press, and a
+        // panic would leave the terminal in raw mode.
+        for rows in [0usize, 1, 3, 40] {
+            let mut app = app_with_import(
+                (0..rows)
+                    .map(|i| fwd(ForwardKind::Local, 8000 + i as u16, "127.0.0.1", 80, "LocalForward x"))
+                    .collect(),
+            );
+            if rows == 0 {
+                app.form.as_mut().unwrap().import_open = true;
+            }
+            for (w, h) in [(1u16, 1u16), (8, 6), (20, 8), (40, 12), (74, 24), (120, 45)] {
+                let backend = TestBackend::new(w, h);
+                let mut term = Terminal::new(backend).unwrap();
+                term.draw(|f| draw(f, &mut app)).unwrap_or_else(|e| panic!("import pane at {w}x{h}: {e}"));
+            }
+        }
+    }
+
+    #[test]
+    fn import_pane_empty_state_says_there_are_no_forwards() {
+        // `import_open` on an empty table with no error: reachable when a host
+        // switch empties the list. It must not collapse silently — the pane says
+        // why it is empty, and the manual form fields all stay on screen.
+        let mut app = app_with_import(vec![]);
+        app.form.as_mut().unwrap().import_open = true;
+        app.import_error = None;
+        let text = render_to_text(&mut app, 120, 45);
+        assert!(text.contains("没有端口转发配置"), "empty state missing:\n{text}");
+        assert!(text.contains("从 ~/.ssh/config 导入转发"), "pane title missing:\n{text}");
+        for field in FormField::ORDER {
+            assert!(text.contains(field.label()), "form field {field:?} pushed out by the pane:\n{text}");
+        }
+    }
+
+    #[test]
+    fn import_pane_empty_state_surfaces_a_discovery_error() {
+        let mut app = app_with_import(vec![]);
+        app.form.as_mut().unwrap().import_open = true;
+        app.import_error = Some("读取 ~/.ssh/config 转发配置失败: permission denied".to_string());
+        let text = render_to_text(&mut app, 120, 45);
+        assert!(text.contains("permission denied"), "the reason must be readable:\n{text}");
+        assert!(!text.contains("没有端口转发配置"), "a failure is not the same as 'no forwards':\n{text}");
+    }
+
+    #[test]
+    fn hits_are_not_pushed_for_rows_outside_the_list_area() {
+        // 30 tunnels into a 14-row terminal: most rows are below the table area,
+        // and a click down there must not resolve to a row that is not drawn.
+        let tunnels: Vec<TunnelConfig> = (1..=30).map(|i| sample(i, &format!("t-{i:02}"), 8000 + i as u16)).collect();
+        let mut app = app_with_tunnels(tunnels);
+        let _ = render_to_text(&mut app, 100, 14);
+
+        let list = app.hits.rect_of(&HitTarget::TunnelList).expect("table area must be recorded");
+        let pushed: Vec<u16> =
+            (1..=30u64).filter_map(|i| app.hits.rect_of(&HitTarget::TunnelRow(i)).map(|r| r.y)).collect();
+        assert!(!pushed.is_empty(), "some rows must be clickable");
+        assert!(pushed.iter().all(|y| *y < list.bottom()), "a row hit escaped the table area: {pushed:?}");
+        assert!(pushed.len() < 30, "off-screen rows must not be clickable: {pushed:?}");
+    }
+
+    #[test]
+    fn import_pane_hits_resolve_to_the_checkbox_and_row() {
+        let mut app = app_with_import(sample_forwards());
+        let _ = render_to_text(&mut app, 120, 45);
+
+        // The first row's checkbox cell: the hit map must resolve to the *raw
+        // row index*, not the visible position.
+        let cb = app.hits.rect_of(&HitTarget::ImportCheckbox(0)).expect("first checkbox must be clickable");
+        assert_eq!(app.hits.at(cb.x, cb.y), Some(&HitTarget::ImportCheckbox(0)));
+
+        // Somewhere else on the same row: selects rather than toggles.
+        let row = app.hits.rect_of(&HitTarget::ImportRow(0)).expect("first row must be clickable");
+        let far_x = row.right().saturating_sub(2).max(row.x);
+        assert_eq!(app.hits.at(far_x, row.y), Some(&HitTarget::ImportRow(0)), "wide part of the row selects");
+
+        // Column headers and the action buttons are recorded too.
+        assert!(app.hits.rect_of(&HitTarget::ImportColumnHeader(ImportColumn::Listen)).is_some());
+        assert!(app.hits.rect_of(&HitTarget::ImportCheckAll).is_some());
+        assert!(app.hits.rect_of(&HitTarget::ImportInvert).is_some());
+        assert!(app.hits.rect_of(&HitTarget::ImportUncheckAll).is_some());
+        assert!(app.hits.rect_of(&HitTarget::ImportList).is_some());
+    }
+
+    #[test]
+    fn import_pane_hits_are_rebuilt_every_frame() {
+        let mut app = app_with_import(sample_forwards());
+        let _ = render_to_text(&mut app, 120, 45);
+        let first = app.hits.len();
+        assert!(first > 0);
+        // Closing the pane must not leave its rects behind, or a click would hit
+        // a widget that is no longer drawn.
+        app.form.as_mut().unwrap().import_open = false;
+        let _ = render_to_text(&mut app, 120, 45);
+        assert!(app.hits.rect_of(&HitTarget::ImportCheckbox(0)).is_none(), "stale import hits survived");
+    }
+
+    // -- selection mode -----------------------------------------------------
+
+    #[test]
+    fn selection_mode_shows_the_mark_gutter_and_action_bar() {
+        let mut app = app_with_tunnels(vec![sample(1, "api-dev", 8080), sample(2, "db-prod", 5432)]);
+        app.selected = 0;
+        app.toggle_select_mode();
+        // Entering the mode starts with nothing marked; mark explicitly so the
+        // gutter has something to show.
+        app.toggle_mark_selected();
+        let text = render_to_text(&mut app, 120, 30);
+        assert!(text.contains("✓"), "a marked row needs the ✓ gutter:\n{text}");
+        assert!(text.contains("已选 1 条"), "marked count missing:\n{text}");
+        assert!(text.contains("s 启用"), "start action missing:\n{text}");
+        assert!(text.contains("x 停用"), "stop action missing:\n{text}");
+        assert!(text.contains("R 重启"), "restart action missing:\n{text}");
+        assert!(text.contains("D 删除"), "delete action missing:\n{text}");
+        assert!(text.contains("esc 退出"), "exit hint missing:\n{text}");
+        // The cursor marker and the mark gutter coexist.
+        assert!(text.contains("▶"), "cursor marker missing:\n{text}");
+    }
+
+    #[test]
+    fn empty_selection_is_stated_plainly() {
+        let mut app = app_with_tunnels(vec![sample(1, "api-dev", 8080)]);
+        app.toggle_select_mode();
+        app.mark_none();
+        let text = render_to_text(&mut app, 120, 30);
+        assert!(text.contains("已选 0 条"), "an empty selection must be stated:\n{text}");
+        // The gutter itself still renders (with `·`), so the column layout does
+        // not jump when the first mark appears; only the ✓ marks are absent.
+        let rows: Vec<&str> = text.lines().filter(|l| l.contains("api-dev")).collect();
+        assert!(!rows.is_empty(), "tunnel row missing:\n{text}");
+        assert!(rows.iter().all(|r| !r.contains('✓')), "nothing is marked, so no ✓ should appear: {rows:?}");
+    }
+
+    #[test]
+    fn selection_mode_hits_resolve_to_rows_and_actions() {
+        let mut app = app_with_tunnels(vec![sample(1, "api-dev", 8080), sample(2, "db-prod", 5432)]);
+        app.toggle_select_mode();
+        let _ = render_to_text(&mut app, 120, 30);
+
+        let row1 = app.hits.rect_of(&HitTarget::TunnelRow(1)).expect("row must be clickable");
+        assert_eq!(app.hits.at(row1.x + 1, row1.y), Some(&HitTarget::TunnelRow(1)));
+        assert!(app.hits.rect_of(&HitTarget::TunnelList).is_some());
+
+        let start = app.hits.rect_of(&HitTarget::BatchAction(BatchAction::Start)).expect("start button missing");
+        assert_eq!(app.hits.at(start.x, start.y), Some(&HitTarget::BatchAction(BatchAction::Start)));
+        assert!(app.hits.rect_of(&HitTarget::BatchAction(BatchAction::Delete)).is_some());
+        assert!(app.hits.rect_of(&HitTarget::BatchSelectAll).is_some());
+        assert!(app.hits.rect_of(&HitTarget::BatchExit).is_some());
+    }
+
+    #[test]
+    fn normal_mode_has_no_mark_gutter_or_action_bar() {
+        let mut app = app_with_tunnels(vec![sample(1, "api-dev", 8080)]);
+        let text = render_to_text(&mut app, 120, 30);
+        assert!(!text.contains("已选 "), "the action bar must only exist in selection mode:\n{text}");
+        assert!(!text.contains("R 重启"), "batch hints must not leak into normal mode:\n{text}");
+        assert!(app.hits.rect_of(&HitTarget::BatchAction(BatchAction::Start)).is_none());
+    }
+
+    #[test]
+    fn filter_overlay_records_its_input_and_clear_affordances() {
+        let mut app = app_with_tunnels(vec![sample(1, "api-dev", 8080)]);
+        app.overlay = Overlay::Filter;
+        app.filter = "api".into();
+        let text = render_to_text(&mut app, 120, 30);
+        assert!(text.contains("× 清除"), "clear affordance missing:\n{text}");
+        assert!(app.hits.rect_of(&HitTarget::FilterBar).is_some(), "filter input must be clickable");
+        assert!(app.hits.rect_of(&HitTarget::FilterClear).is_some(), "filter clear must be clickable");
     }
 }
