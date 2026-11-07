@@ -293,10 +293,50 @@ fn load_auth(endpoint: &Endpoint) -> Result<Auth> {
         }
     }
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().context("创建 runtime 失败")?;
-    match rt.block_on(AgentClient::connect_env()) {
-        Ok(agent) => Ok(Auth::Agent(agent.dynamic())),
+    match rt.block_on(connect_agent()) {
+        Ok(agent) => Ok(Auth::Agent(agent)),
         Err(_) => bail!("没有可用的认证方式：未找到可读取的私钥，也连接不上 ssh-agent"),
     }
+}
+
+/// Boxed agent client, so the Unix socket and the Windows transports share one
+/// type.
+type AnyAgent = AgentClient<Box<dyn russh::keys::agent::client::AgentStream + Send + Unpin>>;
+
+/// Connect to whatever ssh-agent the platform offers.
+///
+/// * Unix: `$SSH_AUTH_SOCK`.
+/// * Windows: the OpenSSH agent's named pipe, then Pageant. There is no
+///   `SSH_AUTH_SOCK` on Windows, which is why this cannot be a single
+///   `connect_env()` call — that function only exists in russh's `cfg(unix)` impl
+///   and failed the Windows build until this was split out.
+#[cfg(unix)]
+async fn connect_agent() -> Result<AnyAgent> {
+    let agent = AgentClient::connect_env().await.map_err(|e| anyhow!("连接 ssh-agent 失败: {e}"))?;
+    Ok(agent.dynamic())
+}
+
+#[cfg(windows)]
+async fn connect_agent() -> Result<AnyAgent> {
+    // The OpenSSH-for-Windows agent listens on this well-known pipe.
+    const OPENSSH_AGENT_PIPE: &str = r"\\.\pipe\openssh-ssh-agent";
+    match AgentClient::connect_named_pipe(OPENSSH_AGENT_PIPE).await {
+        Ok(agent) => return Ok(agent.dynamic()),
+        Err(pipe_err) => {
+            // Fall back to PuTTY's Pageant, which is still common.
+            match AgentClient::connect_pageant().await {
+                Ok(agent) => Ok(agent.dynamic()),
+                Err(pageant_err) => {
+                    Err(anyhow!("连接 ssh-agent 失败: OpenSSH pipe: {pipe_err}; Pageant: {pageant_err}"))
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+async fn connect_agent() -> Result<AnyAgent> {
+    bail!("此平台没有可用的 ssh-agent 支持")
 }
 
 /// Expand a leading `~` / `%d` in an `IdentityFile` value.
