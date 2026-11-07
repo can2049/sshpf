@@ -177,13 +177,16 @@ mod tests {
         let group = group_of(&child);
         assert!(!group.is_null(), "job object creation failed");
 
-        assert!(pid_is_alive(pid));
+        assert!(pid_is_alive(pid), "child should be running before we terminate it");
+
         kill_group(group);
+        // Reap first: a terminated-but-unreaped process is not "alive", but
+        // waiting keeps the test from racing the supervisor's own bookkeeping.
+        let _ = child.wait();
         let deadline = Instant::now() + Duration::from_secs(5);
         while pid_is_alive(pid) && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(50));
         }
-        let _ = child.wait();
         release_group(group);
         assert!(!pid_is_alive(pid), "terminating the job must kill the child");
     }

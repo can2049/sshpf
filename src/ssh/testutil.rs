@@ -138,3 +138,67 @@ pub(crate) fn fake_ssh_with_output(dir: &Path, tag: &str, stdout_lines: &[&str])
     }
     Some(exe)
 }
+
+/// Compile a fake tunnel child that streams `stderr_lines` then sleeps.
+///
+/// Replaces the `/bin/sh` scripts the tunnel tests used to write: those cannot
+/// run on Windows, and the point of those tests (supervising a real child) has
+/// nothing to do with the host shell. `exit_code` is returned after the sleep
+/// so the caller can assert code propagation.
+pub(crate) fn fake_tunnel_child(
+    dir: &Path,
+    tag: &str,
+    stderr_lines: &[&str],
+    sleep_secs: u64,
+    exit_code: i32,
+) -> Option<PathBuf> {
+    let mut program = String::from("use std::io::Write;\nfn main() {\n");
+    program.push_str("    let mut err = std::io::stderr();\n");
+    for line in stderr_lines {
+        let escaped = line.replace('\\', "\\\\").replace('"', "\\\"");
+        program.push_str(&format!("    writeln!(err, \"{escaped}\").unwrap();\n"));
+        program.push_str("    err.flush().unwrap();\n");
+    }
+    program.push_str(&format!(
+        "    std::thread::sleep(std::time::Duration::from_secs({sleep_secs}));\n    \
+         std::process::exit({exit_code});\n}}\n"
+    ));
+    fake_ssh_with_output(dir, tag, &[]) // ensures rustc works; then overwrite
+        .and_then(|_| {
+            let src = dir.join(format!("{tag}.rs"));
+            std::fs::write(&src, program).ok()?;
+            let exe = dir.join(if cfg!(windows) { format!("{tag}.exe") } else { tag.to_string() });
+            let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+            let out = std::process::Command::new(rustc).arg(&src).arg("-o").arg(&exe).output().ok()?;
+            if !out.status.success() {
+                eprintln!("fixture build failed for {tag}: {}", String::from_utf8_lossy(&out.stderr));
+                return None;
+            }
+            Some(exe)
+        })
+}
+
+/// Compile a child that floods stdout then sleeps, to prove stdout is drained.
+pub(crate) fn fake_chatty_child(dir: &Path, tag: &str, lines: u32, sleep_secs: u64, exit_code: i32) -> Option<PathBuf> {
+    let program = format!(
+        "fn main() {{\n    \
+         for _ in 0..{lines} {{ println!(\"noise on stdout\"); }}\n    \
+         std::thread::sleep(std::time::Duration::from_secs({sleep_secs}));\n    \
+         std::process::exit({exit_code});\n}}\n"
+    );
+    compile_helper(dir, tag, &program)
+}
+
+/// Write `program` to `<dir>/<tag>.rs` and compile it, returning the exe path.
+fn compile_helper(dir: &Path, tag: &str, program: &str) -> Option<PathBuf> {
+    let src = dir.join(format!("{tag}.rs"));
+    std::fs::write(&src, program).ok()?;
+    let exe = dir.join(if cfg!(windows) { format!("{tag}.exe") } else { tag.to_string() });
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    let out = std::process::Command::new(rustc).arg(&src).arg("-o").arg(&exe).output().ok()?;
+    if !out.status.success() {
+        eprintln!("fixture build failed for {tag}: {}", String::from_utf8_lossy(&out.stderr));
+        return None;
+    }
+    Some(exe)
+}

@@ -23,7 +23,7 @@ use windows_sys::Win32::System::JobObjects::{
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation, SetInformationJobObject,
     TerminateJobObject,
 };
-use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_ALL_ACCESS};
+use windows_sys::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_ALL_ACCESS};
 
 /// A Job Object handle that owns one tunnel's process tree.
 ///
@@ -112,21 +112,26 @@ pub fn release_group(group: GroupId) {
     }
 }
 
-/// Whether a pid is still alive.
+/// Whether a pid is still running.
 ///
-/// Windows has no `kill(pid, 0)`, so this asks for a handle and treats a
-/// non-null handle as "alive". `STILL_ACTIVE` would need `GetExitCodeProcess`;
-/// opening is enough for the stale-scratch-dir sweep.
+/// Windows has no `kill(pid, 0)`. Opening a handle is not enough: a terminated
+/// process that has not been reaped yet still has an openable handle, so
+/// "handle acquired" would report a dead process as alive. The reliable test is
+/// `GetExitCodeProcess` returning `STILL_ACTIVE` (259).
 pub fn pid_is_alive(pid: u32) -> bool {
-    const SYNCHRONIZE: u32 = 0x0010_0000;
-    let handle = unsafe { OpenProcess(SYNCHRONIZE, 0, pid) };
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const STILL_ACTIVE: u32 = 259;
+
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
     if handle.is_null() {
         return false;
     }
+    let mut code: u32 = 0;
+    let ok = unsafe { GetExitCodeProcess(handle, &mut code) };
     unsafe {
         let _ = CloseHandle(handle);
     }
-    true
+    ok != 0 && code == STILL_ACTIVE
 }
 
 /// Signals that make the TUI quit cleanly.
