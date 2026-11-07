@@ -468,8 +468,7 @@ fn cleanup_stale_scratch_dirs() {
         }
         // `kill(pid, 0)` succeeds for any process we may signal, which is the
         // right liveness test for "is this scratch dir still in use".
-        let alive = unsafe { libc::kill(pid as i32, 0) == 0 }
-            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+        let alive = crate::sys::pid_is_alive(pid);
         if !alive {
             let _ = std::fs::remove_dir_all(entry.path());
         }

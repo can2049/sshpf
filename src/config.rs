@@ -9,7 +9,6 @@
 
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -260,18 +259,13 @@ pub fn save(path: &Path, cfg: &ConfigFile) -> Result<()> {
     let text = toml::to_string_pretty(cfg).context("序列化配置失败")?;
     let tmp = dir.join(format!(".{}.tmp", path.file_name().and_then(|s| s.to_str()).unwrap_or("config")));
     {
-        let mut f = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)
-            .with_context(|| format!("写入配置失败: {}", tmp.display()))?;
+        let mut f =
+            crate::sys::create_private_file(&tmp).with_context(|| format!("写入配置失败: {}", tmp.display()))?;
         f.write_all(text.as_bytes())?;
         f.sync_all()?;
     }
     // Tighten in case the temp file pre-existed with wider permissions.
-    let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
+    let _ = crate::sys::restrict_file(&tmp);
     fs::rename(&tmp, path).with_context(|| format!("替换配置失败: {}", path.display()))?;
     Ok(())
 }
@@ -281,22 +275,18 @@ pub fn ensure_dir(dir: &Path) -> Result<()> {
     if !dir.exists() {
         fs::create_dir_all(dir).with_context(|| format!("创建目录失败: {}", dir.display()))?;
     }
-    let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+    let _ = crate::sys::restrict_dir(dir);
     Ok(())
 }
 
 /// Warn when the config file is readable by others.
 pub fn perms_too_open(path: &Path) -> bool {
-    match fs::metadata(path) {
-        Ok(m) => m.permissions().mode() & 0o077 != 0,
-        Err(_) => false,
-    }
+    crate::sys::perms_too_open(path)
 }
 
 /// Force `0600` on an existing config file.
 pub fn tighten_perms(path: &Path) -> Result<()> {
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("修复权限失败: {}", path.display()))
+    crate::sys::restrict_file(path).with_context(|| format!("修复权限失败: {}", path.display()))
 }
 
 /// Runtime bookkeeping kept out of the user-editable config.
@@ -322,7 +312,7 @@ pub fn save_state(path: &Path, state: &StateFile) -> Result<()> {
     let text = toml::to_string_pretty(state).context("序列化状态失败")?;
     let tmp = dir.join(".state.toml.tmp");
     {
-        let mut f = fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
+        let mut f = crate::sys::create_private_file(&tmp)?;
         f.write_all(text.as_bytes())?;
     }
     fs::rename(&tmp, path)?;
@@ -381,11 +371,13 @@ mod tests {
         assert!(load(&path).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn save_is_0600() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         save(&path, &ConfigFile::default()).unwrap();
+        use std::os::unix::fs::PermissionsExt;
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
         assert!(!perms_too_open(&path));
@@ -477,6 +469,7 @@ mod tests {
         assert_eq!(back.tunnels[0], t);
     }
 
+    #[cfg(unix)]
     #[test]
     fn save_creates_missing_parent_directories() {
         let dir = tempfile::tempdir().unwrap();
@@ -484,6 +477,7 @@ mod tests {
         save(&path, &ConfigFile::default()).unwrap();
         assert!(path.exists());
         // Directory is tightened to 0700, file to 0600.
+        use std::os::unix::fs::PermissionsExt;
         let dir_mode = fs::metadata(path.parent().unwrap()).unwrap().permissions().mode() & 0o777;
         assert_eq!(dir_mode, 0o700);
     }
@@ -505,6 +499,7 @@ mod tests {
         assert_eq!(load(&path).unwrap().tunnels.len(), 1, "last write wins");
     }
 
+    #[cfg(unix)]
     #[test]
     fn open_permissions_are_detected_and_fixed() {
         let dir = tempfile::tempdir().unwrap();
@@ -512,6 +507,7 @@ mod tests {
         save(&path, &ConfigFile::default()).unwrap();
         assert!(!perms_too_open(&path));
 
+        use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         assert!(perms_too_open(&path), "world-readable config must be flagged");
         tighten_perms(&path).unwrap();

@@ -652,7 +652,7 @@ mod tests {
     use super::*;
     use crate::ssh::{CONFIG_ENV, SSH_BIN_ENV, ssh_available};
 
-    use crate::ssh::testutil::{FAKE_SSH, write_script};
+    use crate::ssh::testutil::fake_ssh_binary;
 
     #[test]
     fn parse_user_at_host_port() {
@@ -688,7 +688,7 @@ mod tests {
     fn list_hosts_parses_include_glob_and_skips_patterns() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let bin = write_script(root, "fake-ssh.sh", FAKE_SSH);
+        let Some(bin) = fake_ssh_binary() else { return };
 
         std::fs::create_dir_all(root.join("conf.d")).unwrap();
         std::fs::write(root.join("conf.d/a.conf"), "Host alpha jeprof\n  HostName 10.1.1.1\n  User nvidia\n").unwrap();
@@ -706,7 +706,7 @@ mod tests {
         )
         .unwrap();
 
-        let hosts = list_hosts_with(&bin, std::slice::from_ref(&config), Some(&config)).unwrap();
+        let hosts = list_hosts_with(bin, std::slice::from_ref(&config), Some(&config)).unwrap();
         let aliases: Vec<&str> = hosts.iter().map(|h| h.alias.as_str()).collect();
         // `*`, `!negated` and `foo` (inside Match) are not concrete aliases.
         assert_eq!(aliases, vec!["alpha", "beta", "broken", "jeprof", "other"], "{aliases:?}");
@@ -729,22 +729,21 @@ mod tests {
     #[test]
     fn list_hosts_missing_config_is_empty() {
         let dir = tempfile::tempdir().unwrap();
-        let bin = write_script(dir.path(), "fake-ssh.sh", FAKE_SSH);
+        let Some(bin) = fake_ssh_binary() else { return };
         let missing = dir.path().join("nope");
-        assert!(list_hosts_with(&bin, std::slice::from_ref(&missing), Some(&missing)).unwrap().is_empty());
-        assert!(list_hosts_with(&bin, &[], None).unwrap().is_empty());
+        assert!(list_hosts_with(bin, std::slice::from_ref(&missing), Some(&missing)).unwrap().is_empty());
+        assert!(list_hosts_with(bin, &[], None).unwrap().is_empty());
     }
 
     #[test]
     fn resolve_host_uses_probe_and_overrides_user_port() {
-        let dir = tempfile::tempdir().unwrap();
-        let bin = write_script(dir.path(), "fake-ssh.sh", FAKE_SSH);
-        let host = resolve_host_with(&bin, "alpha", None).unwrap();
+        let Some(bin) = fake_ssh_binary() else { return };
+        let host = resolve_host_with(bin, "alpha", None).unwrap();
         assert_eq!(host.hostname, "10.0.0.1");
         assert_eq!(host.port, 2222);
 
         // Failure surfaces as an error for a single explicit lookup.
-        assert!(resolve_host_with(&bin, "no-such-host", None).is_err());
+        assert!(resolve_host_with(bin, "no-such-host", None).is_err());
     }
 
     #[test]
@@ -762,21 +761,21 @@ mod tests {
     #[test]
     fn include_inside_host_block_contributes_to_that_host() {
         let dir = tempfile::tempdir().unwrap();
-        let bin = write_script(dir.path(), "fake-ssh.sh", FAKE_SSH);
+        let Some(bin) = fake_ssh_binary() else { return };
         std::fs::write(dir.path().join("extra.conf"), "User alice\nPort 2222\n").unwrap();
         let config = dir.path().join("config");
         std::fs::write(&config, "Host alpha\n  HostName 10.0.0.1\n  Include extra.conf\n").unwrap();
         // `alpha` is handled by the fake ssh, but the raw parser must also have
         // picked the included values up, which we check via a host the fake
         // ssh does not know (so the fallback values are used).
-        let hosts = list_hosts_with(&bin, std::slice::from_ref(&config), Some(&config)).unwrap();
+        let hosts = list_hosts_with(bin, std::slice::from_ref(&config), Some(&config)).unwrap();
         assert_eq!(hosts.len(), 1);
         assert_eq!(hosts[0].hostname, "10.0.0.1");
 
         // `unknown` fails the probe → downgraded to parsed values.
         let config2 = dir.path().join("config2");
         std::fs::write(&config2, "Host unknown-host\n  HostName 10.0.0.9\n  Include extra.conf\n").unwrap();
-        let hosts = list_hosts_with(&bin, std::slice::from_ref(&config2), Some(&config2)).unwrap();
+        let hosts = list_hosts_with(bin, std::slice::from_ref(&config2), Some(&config2)).unwrap();
         assert_eq!(hosts[0].user.as_deref(), Some("alice"), "{:?}", hosts[0]);
         assert_eq!(hosts[0].port, 2222, "{:?}", hosts[0]);
     }
@@ -784,10 +783,10 @@ mod tests {
     #[test]
     fn include_cycle_is_safe() {
         let dir = tempfile::tempdir().unwrap();
-        let bin = write_script(dir.path(), "fake-ssh.sh", FAKE_SSH);
+        let Some(bin) = fake_ssh_binary() else { return };
         let config = dir.path().join("config");
         std::fs::write(&config, "Include config\nHost alpha\n  HostName 10.0.0.1\n").unwrap();
-        let hosts = list_hosts_with(&bin, std::slice::from_ref(&config), Some(&config)).unwrap();
+        let hosts = list_hosts_with(bin, std::slice::from_ref(&config), Some(&config)).unwrap();
         assert_eq!(hosts.len(), 1);
     }
 
@@ -805,7 +804,7 @@ mod tests {
     #[test]
     fn env_overrides_select_config_and_binary() {
         let dir = tempfile::tempdir().unwrap();
-        let bin = write_script(dir.path(), "fake-ssh.sh", FAKE_SSH);
+        let Some(bin) = fake_ssh_binary() else { return };
         let config = dir.path().join("config");
         std::fs::write(&config, "Host alpha\n  HostName 10.0.0.1\n").unwrap();
 
@@ -813,7 +812,7 @@ mod tests {
         assert!(ssh_binary().exists());
 
         // SSHPF_SSH_BIN wins over PATH lookup.
-        unsafe { std::env::set_var(SSH_BIN_ENV, &bin) };
+        unsafe { std::env::set_var(SSH_BIN_ENV, bin) };
         assert_eq!(ssh_binary(), bin);
         assert!(ssh_available());
 

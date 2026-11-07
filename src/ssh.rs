@@ -75,7 +75,6 @@
 
 use std::ffi::OsStr;
 use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -320,17 +319,11 @@ fn write_synth_config_with(
 
     std::fs::create_dir_all(dir).with_context(|| format!("无法创建目录 {}", dir.display()))?;
     let path = dir.join(format!("sshpf-{}.conf", cfg.id));
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&path)
-        .with_context(|| format!("无法写入 {}", path.display()))?;
+    let mut file = crate::sys::create_private_file(&path).with_context(|| format!("无法写入 {}", path.display()))?;
     file.write_all(text.as_bytes())?;
     file.flush()?;
-    // `mode(0o600)` only applies on creation; force it if the file existed.
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    // Creation mode only applies to new files; tighten an existing one too.
+    crate::sys::restrict_file(&path)?;
     Ok(path)
 }
 
@@ -469,22 +462,37 @@ pub(crate) fn pick_binary(override_path: Option<&OsStr>) -> PathBuf {
             return p;
         }
     }
+    let name = crate::sys::ssh_binary_name();
     if let Some(path_var) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path_var) {
-            let candidate = dir.join("ssh");
+            let candidate = dir.join(name);
             if is_executable(&candidate) {
                 return candidate;
             }
+            // On Windows the client may also be present without the `.exe`
+            // suffix; try the bare name as a fallback.
+            #[cfg(windows)]
+            {
+                let bare = dir.join("ssh");
+                if is_executable(&bare) {
+                    return bare;
+                }
+            }
         }
     }
-    PathBuf::from("/usr/bin/ssh")
+    // Last resort: the conventional install path per OS.
+    #[cfg(unix)]
+    {
+        PathBuf::from("/usr/bin/ssh")
+    }
+    #[cfg(windows)]
+    {
+        PathBuf::from(r"C:\Windows\System32\OpenSSH\ssh.exe")
+    }
 }
 
 fn is_executable(path: &Path) -> bool {
-    match std::fs::metadata(path) {
-        Ok(meta) => meta.is_file() && (meta.permissions().mode() & 0o111 != 0),
-        Err(_) => false,
-    }
+    crate::sys::is_executable(path)
 }
 
 /// Whether `ssh` can actually be run.
@@ -602,7 +610,7 @@ mod tests {
     use super::*;
     use crate::model::FailureKind;
     use crate::ssh::failure::fit_short;
-    use crate::ssh::testutil::{FAKE_SSH, write_script};
+    use crate::ssh::testutil::{fake_ssh_binary, fake_ssh_with_output, write_script};
     use std::path::Path;
 
     fn tunnel(kind: ForwardKind) -> TunnelConfig {
@@ -836,12 +844,12 @@ mod tests {
     #[test]
     fn synth_config_excludes_forwards_and_bakes_jump_chain() {
         let dir = tempfile::tempdir().unwrap();
-        let bin = write_script(dir.path(), "fake-ssh.sh", FAKE_SSH);
+        let Some(bin) = fake_ssh_binary() else { return };
         let out_dir = dir.path().join("nested").join("synth");
         assert!(!out_dir.exists(), "caller dir may not exist yet");
 
         let cfg = tunnel(ForwardKind::Local);
-        let path = write_synth_config_with(&bin, &cfg, &out_dir, None).unwrap();
+        let path = write_synth_config_with(bin, &cfg, &out_dir, None).unwrap();
         assert_eq!(path.file_name().unwrap(), "sshpf-7.conf");
         assert_eq!(path.parent().unwrap(), out_dir.as_path());
 
@@ -864,20 +872,25 @@ mod tests {
         // multi-value line must stay unquoted, single path values are kept
         assert!(text.contains("userknownhostsfile ~/.ssh/known_hosts"), "{text}");
 
-        // 0600
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
+        // Owner-only permissions (Unix only: Windows relies on profile ACLs).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
     }
 
     #[test]
     fn synth_config_quotes_paths_with_spaces() {
         let dir = tempfile::tempdir().unwrap();
-        let script = write_script(
+        let Some(script) = fake_ssh_with_output(
             dir.path(),
-            "space-ssh.sh",
-            "#!/bin/sh\ncase \"$*\" in\n  *) echo 'hostname 1.2.3.4'; echo 'user u';\
-             echo 'port 22'; echo 'identityfile ~/my keys/key with space';;\nesac\n",
-        );
+            "space-ssh",
+            &["hostname 1.2.3.4", "user u", "port 22", "identityfile ~/my keys/key with space"],
+        ) else {
+            return;
+        };
         let cfg = tunnel(ForwardKind::Local);
         let path = write_synth_config_with(&script, &cfg, dir.path(), None).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
@@ -890,11 +903,13 @@ mod tests {
         // line) must not leak `Host`/`Match`/`Include` into the baked block:
         // that would open a new host context and drop every following key.
         let dir = tempfile::tempdir().unwrap();
-        let script = write_script(
+        let Some(script) = fake_ssh_with_output(
             dir.path(),
-            "weird-ssh.sh",
-            "#!/bin/sh\necho 'host -G -T tgt'\necho 'match all'\necho 'include /tmp/x.conf'\n             echo 'hostname 1.2.3.4'\necho 'user u'\necho 'port 22'\n",
-        );
+            "weird-ssh",
+            &["host -G -T tgt", "match all", "include /tmp/x.conf", "hostname 1.2.3.4", "user u", "port 22"],
+        ) else {
+            return;
+        };
         let cfg = tunnel(ForwardKind::Local);
         let path = write_synth_config_with(&script, &cfg, dir.path(), None).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
@@ -910,11 +925,13 @@ mod tests {
     #[test]
     fn synth_config_rejects_proxycommand_hosts() {
         let dir = tempfile::tempdir().unwrap();
-        let script = write_script(
+        let Some(script) = fake_ssh_with_output(
             dir.path(),
-            "pc-ssh.sh",
-            "#!/bin/sh\necho 'hostname 5.5.5.5'\necho 'user u'\necho 'port 22'\necho 'proxycommand ssh -W %h:%p jump'\n",
-        );
+            "pc-ssh",
+            &["hostname 5.5.5.5", "user u", "port 22", "proxycommand ssh -W %h:%p jump"],
+        ) else {
+            return;
+        };
         let cfg = tunnel(ForwardKind::Local);
         let err = write_synth_config_with(&script, &cfg, dir.path(), None).unwrap_err();
         assert!(err.to_string().contains("ProxyCommand"), "{err}");
@@ -923,10 +940,10 @@ mod tests {
     #[test]
     fn synth_config_host_port_destination_writes_match_key() {
         let dir = tempfile::tempdir().unwrap();
-        let bin = write_script(dir.path(), "fake-ssh.sh", FAKE_SSH);
+        let Some(bin) = fake_ssh_binary() else { return };
         let mut cfg = tunnel(ForwardKind::Local);
         cfg.ssh_host = "alice@alpha:2222".into();
-        let path = write_synth_config_with(&bin, &cfg, dir.path(), None).unwrap();
+        let path = write_synth_config_with(bin, &cfg, dir.path(), None).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         // ssh matches `user@host:port` destinations against `Host host:port`.
         assert!(text.contains("Host alpha:2222"), "{text}");
@@ -939,23 +956,36 @@ mod tests {
     #[test]
     fn pick_binary_prefers_override_then_path() {
         let dir = tempfile::tempdir().unwrap();
-        let fake = write_script(dir.path(), "my-ssh", "#!/bin/sh\nexit 0\n");
+        // The override must be recognised as executable on this platform:
+        // a mode bit on Unix, a known extension on Windows.
+        let name = if cfg!(windows) { "my-ssh.exe" } else { "my-ssh" };
+        let fake = write_script(dir.path(), name, "#!/bin/sh\nexit 0\n");
         assert_eq!(pick_binary(Some(fake.as_os_str())), fake);
+
         // Non-executable override falls back to PATH resolution.
-        let plain = dir.path().join("plain");
+        let plain = dir.path().join(if cfg!(windows) { "plain.txt" } else { "plain" });
         std::fs::write(&plain, "not executable").unwrap();
         let picked = pick_binary(Some(plain.as_os_str()));
         assert_ne!(picked, plain);
-        assert!(picked.ends_with("ssh") || picked == Path::new("/usr/bin/ssh"));
+        // Whatever we fell back to must look like an ssh client for this OS.
+        let name = crate::sys::ssh_binary_name();
+        assert!(picked.ends_with(name) || picked.ends_with("ssh"), "unexpected fallback: {}", picked.display());
     }
 
     // Env-var overrides are process-global, so these two tests are merged into
     // one serial test to stay correct under `cargo test`'s thread pool.
 
     #[test]
-    fn ssh_available_is_true_on_this_machine() {
-        // The dev/CI box for this project is Linux with OpenSSH installed.
-        assert!(ssh_available(), "ssh should be available: {:?}", ssh_binary());
+    fn ssh_available_reports_the_binary_it_found() {
+        // Linux CI images ship OpenSSH; a Windows runner may not, so assert the
+        // *relationship* rather than the absolute truth: whatever we report must
+        // agree with whether the resolved path actually exists and is runnable.
+        let bin = ssh_binary();
+        let exists = bin.exists();
+        if cfg!(unix) {
+            assert!(exists, "Linux CI images ship ssh, expected {:?}", bin);
+        }
+        assert_eq!(ssh_available(), exists, "ssh_available() must agree with the resolved path {:?}", bin);
     }
 
     // -- ports --------------------------------------------------------------

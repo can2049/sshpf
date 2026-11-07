@@ -17,7 +17,6 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
-use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::Sender;
@@ -48,28 +47,6 @@ pub enum TunnelEvent {
     SpawnFailed { id: TunnelId, error: String },
 }
 
-/// Ask the kernel to SIGTERM this child when its parent dies.
-///
-/// Must run in the forked child before `exec`, hence the `pre_exec` hook. Note
-/// the well-known race: if the parent already died between `fork` and
-/// `prctl`, the signal is never delivered, so we also verify the parent pid
-/// afterwards and bail out.
-///
-/// # Safety
-/// `pre_exec` runs in a forked child where only async-signal-safe calls are
-/// permitted. `prctl` and `getppid` are both async-signal-safe.
-unsafe fn set_parent_death_signal(expected_ppid: libc::pid_t) -> std::io::Result<()> {
-    if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // If our parent is already gone, PDEATHSIG will never fire: exit now rather
-    // than linger as an orphan holding a port.
-    if unsafe { libc::getppid() } != expected_ppid {
-        return Err(std::io::Error::other("parent died before exec"));
-    }
-    Ok(())
-}
-
 /// Result of a non-blocking child check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChildState {
@@ -77,10 +54,12 @@ enum ChildState {
     Exited(Option<i32>),
 }
 
-/// A spawned child plus its process-group id.
+/// A spawned child plus its platform grouping handle.
+///
+/// On Unix this is the process-group id; on Windows a Job Object handle.
 struct Running {
     child: Child,
-    pgid: i32,
+    group: crate::sys::GroupId,
 }
 
 impl Running {
@@ -121,16 +100,12 @@ impl Supervisor {
         self.stop(id);
 
         let mut cmd = Command::new(program);
-        cmd.args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).process_group(0);
-
-        // Kill the child if we die without unwinding (SIGKILL, OOM, abort).
-        let parent = unsafe { libc::getpid() };
-        unsafe {
-            cmd.pre_exec(move || set_parent_death_signal(parent));
-        }
+        cmd.args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
+        // Process grouping differs per OS; `sys` hides the difference.
+        crate::sys::configure_child(&mut cmd);
 
         let mut child = cmd.spawn()?;
-        let pgid = child.id() as i32;
+        let group = crate::sys::group_of(&child);
         let stderr = child.stderr.take();
 
         if let Some(stderr) = stderr {
@@ -149,7 +124,7 @@ impl Supervisor {
                 .ok();
         }
 
-        self.children.insert(id, Running { child, pgid });
+        self.children.insert(id, Running { child, group });
         Ok(())
     }
 
@@ -186,11 +161,7 @@ impl Supervisor {
         let Some(mut running) = self.children.remove(&id) else {
             return;
         };
-        // Negative pid addresses the whole process group (ProxyJump children too).
-        unsafe {
-            libc::kill(-running.pgid, libc::SIGTERM);
-            libc::kill(running.pgid, libc::SIGTERM);
-        }
+        crate::sys::terminate_group(running.group);
         let deadline = Instant::now() + grace;
         loop {
             match running.check() {
@@ -203,12 +174,10 @@ impl Supervisor {
                 }
             }
         }
-        unsafe {
-            libc::kill(-running.pgid, libc::SIGKILL);
-            libc::kill(running.pgid, libc::SIGKILL);
-        }
+        crate::sys::kill_group(running.group);
         let _ = running.check();
         let _ = running.child.wait();
+        crate::sys::release_group(running.group);
     }
 
     /// Stop everything (used on quit and in `Drop`).
@@ -234,49 +203,40 @@ impl Drop for Supervisor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command as StdCommand;
     use std::sync::mpsc;
 
-    const SH: &str = "/bin/sh";
-
-    fn write_script(dir: &Path, name: &str, body: &str) -> std::path::PathBuf {
+    /// Write an executable shell script (Unix-only helpers below).
+    #[cfg(unix)]
+    fn unix_script(dir: &Path, name: &str, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
         let path = dir.join(name);
         std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path
     }
 
-    /// Args for running a script through `/bin/sh`.
+    /// A stand-in tunnel child: prints the readiness markers, then idles.
     ///
-    /// We deliberately exec `/bin/sh` rather than the script itself: cargo
-    /// runs tests on parallel threads, and a thread that has a script open for
-    /// writing while another thread forks lets the child inherit that write
-    /// descriptor, which makes a later `exec` of the same file fail with
-    /// ETXTBSY ("Text file busy"). The shell binary is never written at
-    /// runtime, so this is race-free.
-    fn sh_args(script: &Path) -> Vec<String> {
-        vec![script.display().to_string()]
-    }
-
-    /// A tiny shell stand-in for `ssh`: prints lines then sleeps.
-    fn sleeper_script() -> (tempfile::TempDir, std::path::PathBuf) {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_script(
+    /// Compiled rather than written as a shell script so the same fixture works
+    /// on Windows (which cannot exec `.sh`). See `ssh::testutil`.
+    fn sleeper_child(tag: &str) -> Option<(tempfile::TempDir, std::path::PathBuf)> {
+        let dir = tempfile::tempdir().ok()?;
+        let exe = crate::ssh::testutil::fake_tunnel_child(
             dir.path(),
-            "fake-ssh.sh",
-            "#!/bin/sh\n\
-             echo 'debug1: Local forwarding listening on 127.0.0.1 port 1234.' >&2\n\
-             echo 'debug1: Entering interactive session.' >&2\n\
-             sleep 30\n",
-        );
-        (dir, path)
+            tag,
+            &["debug1: Local forwarding listening on 127.0.0.1 port 1234.", "debug1: Entering interactive session."],
+            30,
+            0,
+        )?;
+        Some((dir, exe))
     }
 
     #[test]
     fn captures_lines_and_exit() {
-        let (_dir, script) = sleeper_script();
+        let Some((_dir, script)) = sleeper_child("sleeper") else { return };
         let (tx, rx) = mpsc::channel();
         let mut sup = Supervisor::new();
-        sup.spawn(7, Path::new(SH), &sh_args(&script), tx).unwrap();
+        sup.spawn(7, &script, &[], tx).unwrap();
 
         let mut lines = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -292,14 +252,15 @@ mod tests {
         assert!(!sup.is_running(7));
     }
 
+    #[cfg(unix)]
     #[test]
     fn stop_kills_process_group_including_children() {
         let dir = tempfile::tempdir().unwrap();
-        let script = write_script(dir.path(), "spawner.sh", "#!/bin/sh\nsleep 60 &\necho \"child=$!\" >&2\nsleep 60\n");
+        let script = unix_script(dir.path(), "spawner.sh", "#!/bin/sh\nsleep 60 &\necho \"child=$!\" >&2\nsleep 60\n");
 
         let (tx, rx) = mpsc::channel();
         let mut sup = Supervisor::new();
-        sup.spawn(1, Path::new(SH), &sh_args(&script), tx).unwrap();
+        sup.spawn(1, &script, &[], tx).unwrap();
 
         let mut grandchild = None;
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -322,21 +283,25 @@ mod tests {
     }
 
     fn process_alive(pid: i32) -> bool {
-        unsafe { libc::kill(pid, 0) == 0 }
+        crate::sys::pid_is_alive(pid as u32)
     }
 
     #[test]
     fn poll_reports_exit_code() {
         let dir = tempfile::tempdir().unwrap();
-        let script = write_script(
+        let Some(script) = crate::ssh::testutil::fake_tunnel_child(
             dir.path(),
-            "fail.sh",
-            "#!/bin/sh\necho 'bind [127.0.0.1]:80: Permission denied' >&2\nexit 255\n",
-        );
+            "fail",
+            &["bind [127.0.0.1]:80: Permission denied"],
+            0,
+            255,
+        ) else {
+            return;
+        };
 
         let (tx, rx) = mpsc::channel();
         let mut sup = Supervisor::new();
-        sup.spawn(3, Path::new(SH), &sh_args(&script), tx).unwrap();
+        sup.spawn(3, &script, &[], tx).unwrap();
 
         // Do NOT stop at the first exit: the child can exit before its stderr
         // has been forwarded (ssh behaves exactly like this), so keep draining
@@ -371,10 +336,14 @@ mod tests {
         // before classifying a failure; ssh prints its diagnostic and exits at
         // once, so the exit often arrives first.
         let dir = tempfile::tempdir().unwrap();
-        let script = write_script(dir.path(), "quick.sh", "#!/bin/sh\necho 'ssh: Connection refused' >&2\nexit 255\n");
+        let Some(script) =
+            crate::ssh::testutil::fake_tunnel_child(dir.path(), "quick", &["ssh: Connection refused"], 0, 255)
+        else {
+            return;
+        };
         let (tx, rx) = mpsc::channel();
         let mut sup = Supervisor::new();
-        sup.spawn(5, Path::new(SH), &sh_args(&script), tx).unwrap();
+        sup.spawn(5, &script, &[], tx).unwrap();
 
         let mut lines = Vec::new();
         let mut closed = false;
@@ -422,12 +391,12 @@ mod tests {
 
     #[test]
     fn respawn_replaces_previous_child() {
-        let (_dir, script) = sleeper_script();
+        let Some((_dir, script)) = sleeper_child("sleeper") else { return };
         let (tx, _rx) = mpsc::channel();
         let mut sup = Supervisor::new();
-        sup.spawn(1, Path::new(SH), &sh_args(&script), tx.clone()).unwrap();
+        sup.spawn(1, &script, &[], tx.clone()).unwrap();
         assert_eq!(sup.running_count(), 1);
-        sup.spawn(1, Path::new(SH), &sh_args(&script), tx).unwrap();
+        sup.spawn(1, &script, &[], tx).unwrap();
         assert_eq!(sup.running_count(), 1);
         sup.stop_all();
         assert_eq!(sup.running_count(), 0);
@@ -435,13 +404,13 @@ mod tests {
 
     #[test]
     fn drop_stops_everything() {
-        let (_dir, script) = sleeper_script();
+        let Some((_dir, script)) = sleeper_child("sleeper") else { return };
         let (tx, _rx) = mpsc::channel();
         let pid;
         {
             let mut sup = Supervisor::new();
-            sup.spawn(1, Path::new(SH), &sh_args(&script), tx).unwrap();
-            pid = sup.children.get(&1).unwrap().pgid;
+            sup.spawn(1, &script, &[], tx).unwrap();
+            pid = sup.children.get(&1).unwrap().child.id() as i32;
             assert!(process_alive(pid));
         }
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -451,6 +420,7 @@ mod tests {
         assert!(!process_alive(pid), "child survived Supervisor::drop");
     }
 
+    #[cfg(unix)]
     #[test]
     fn child_dies_with_parent_via_pdeathsig() {
         // `Drop` cannot run when the process is SIGKILLed, so children carry
@@ -459,13 +429,12 @@ mod tests {
         //
         // This test spawns a real helper process and kills it, so it exercises
         // the actual kernel path rather than mocks.
-        let dir = tempfile::tempdir().unwrap();
-        let script = write_script(dir.path(), "alive.sh", "#!/bin/sh\nsleep 60\n");
+        let Some((_dir, script)) = sleeper_child("alive") else { return };
         let (tx, _rx) = mpsc::channel();
 
         let mut sup = Supervisor::new();
-        sup.spawn(1, Path::new(SH), &sh_args(&script), tx).unwrap();
-        let child_pid = sup.children.get(&1).unwrap().pgid;
+        sup.spawn(1, &script, &[], tx).unwrap();
+        let child_pid = sup.children.get(&1).unwrap().child.id() as i32;
 
         // Ask the child itself what its parent-death signal is. `/proc` does not
         // expose it, so instead assert the hook ran by checking the child is a
@@ -480,6 +449,7 @@ mod tests {
         assert!(!process_alive(child_pid));
     }
 
+    #[cfg(unix)]
     #[test]
     fn pre_exec_hook_rejects_dead_parent() {
         // The hook returns Err when the observed parent differs from the
@@ -495,7 +465,7 @@ mod tests {
         while bogus == unsafe { libc::getppid() } || bogus == me {
             bogus += 1;
         }
-        assert!(unsafe { set_parent_death_signal(bogus) }.is_err());
+        assert!(unsafe { crate::sys::arm_parent_death_signal_for_test(bogus) }.is_err());
     }
 
     #[test]
@@ -503,10 +473,10 @@ mod tests {
         // Stopping twice (or stopping something never started) must be safe:
         // both the user's space key and shutdown paths can race here.
         let dir = tempfile::tempdir().unwrap();
-        let script = write_script(dir.path(), "idle.sh", "#!/bin/sh\nsleep 30\n");
+        let Some(script) = crate::ssh::testutil::fake_tunnel_child(dir.path(), "idle", &[], 30, 0) else { return };
         let (tx, _rx) = mpsc::channel();
         let mut sup = Supervisor::new();
-        sup.spawn(1, Path::new(SH), &sh_args(&script), tx).unwrap();
+        sup.spawn(1, &script, &[], tx).unwrap();
         sup.stop(1);
         assert!(!sup.is_running(1));
         sup.stop(1); // second stop: no panic, no block
@@ -517,11 +487,11 @@ mod tests {
     #[test]
     fn supervisor_tracks_multiple_children_independently() {
         let dir = tempfile::tempdir().unwrap();
-        let script = write_script(dir.path(), "multi.sh", "#!/bin/sh\nsleep 30\n");
+        let Some(script) = crate::ssh::testutil::fake_tunnel_child(dir.path(), "multi", &[], 30, 0) else { return };
         let (tx, _rx) = mpsc::channel();
         let mut sup = Supervisor::new();
         for id in [1u64, 2, 3] {
-            sup.spawn(id, Path::new(SH), &sh_args(&script), tx.clone()).unwrap();
+            sup.spawn(id, &script, &[], tx.clone()).unwrap();
         }
         assert_eq!(sup.running_count(), 3);
         // Stopping one leaves the others supervised.
@@ -539,11 +509,10 @@ mod tests {
 
     #[test]
     fn poll_returns_none_while_the_child_is_alive() {
-        let dir = tempfile::tempdir().unwrap();
-        let script = write_script(dir.path(), "alive.sh", "#!/bin/sh\nsleep 30\n");
+        let Some((_dir, script)) = sleeper_child("idle") else { return };
         let (tx, _rx) = mpsc::channel();
         let mut sup = Supervisor::new();
-        sup.spawn(1, Path::new(SH), &sh_args(&script), tx).unwrap();
+        sup.spawn(1, &script, &[], tx).unwrap();
         for _ in 0..3 {
             assert_eq!(sup.poll(1), None, "a live child must not report an exit");
             thread::sleep(Duration::from_millis(20));
@@ -563,14 +532,10 @@ mod tests {
         // ssh -N should not write to stdout, but a wedged child filling a pipe
         // would otherwise stall the supervisor. stdout goes to /dev/null.
         let dir = tempfile::tempdir().unwrap();
-        let script = write_script(
-            dir.path(),
-            "chatty.sh",
-            "#!/bin/sh\ni=0\nwhile [ $i -lt 2000 ]; do echo 'noise on stdout'; i=$((i+1)); done\nsleep 1\nexit 7\n",
-        );
+        let Some(script) = crate::ssh::testutil::fake_chatty_child(dir.path(), "chatty", 2000, 1, 7) else { return };
         let (tx, _rx) = mpsc::channel();
         let mut sup = Supervisor::new();
-        sup.spawn(1, Path::new(SH), &sh_args(&script), tx).unwrap();
+        sup.spawn(1, &script, &[], tx).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut code = None;
         while Instant::now() < deadline {
@@ -588,14 +553,14 @@ mod tests {
         // The reader must not choke on UTF-8 or on a very long line.
         let dir = tempfile::tempdir().unwrap();
         let long = "x".repeat(4000);
-        let script = write_script(
-            dir.path(),
-            "utf8.sh",
-            &format!("#!/bin/sh\necho '调试信息：连接失败' >&2\necho '{long}' >&2\nexit 0\n"),
-        );
+        let Some(script) =
+            crate::ssh::testutil::fake_tunnel_child(dir.path(), "utf8", &["调试信息：连接失败", long.as_str()], 0, 0)
+        else {
+            return;
+        };
         let (tx, rx) = mpsc::channel();
         let mut sup = Supervisor::new();
-        sup.spawn(1, Path::new(SH), &sh_args(&script), tx).unwrap();
+        sup.spawn(1, &script, &[], tx).unwrap();
 
         let mut lines = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -616,10 +581,13 @@ mod tests {
     fn child_exit_code_is_reported_verbatim() {
         let dir = tempfile::tempdir().unwrap();
         for want in [0i32, 1, 127, 255] {
-            let script = write_script(dir.path(), &format!("exit{want}.sh"), &format!("#!/bin/sh\nexit {want}\n"));
+            let tag = format!("exit{want}");
+            let Some(script) = crate::ssh::testutil::fake_tunnel_child(dir.path(), &tag, &[], 0, want) else {
+                return;
+            };
             let (tx, _rx) = mpsc::channel();
             let mut sup = Supervisor::new();
-            sup.spawn(1, Path::new(SH), &sh_args(&script), tx).unwrap();
+            sup.spawn(1, &script, &[], tx).unwrap();
             let deadline = Instant::now() + Duration::from_secs(5);
             let mut got = None;
             while Instant::now() < deadline {
@@ -633,13 +601,14 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn shutting_down_all_children_releases_their_ports() {
         // End-to-end-ish: bind a real port from a child, then assert the port is
         // free after stop_all. This catches "process killed but fd leaked".
         let dir = tempfile::tempdir().unwrap();
         let port_holder = |port: u16, f: &Path| {
-            write_script(
+            unix_script(
                 f,
                 &format!("hold{port}.sh"),
                 &format!(
@@ -655,7 +624,7 @@ mod tests {
         let script = port_holder(port, &f);
         let (tx, _rx) = mpsc::channel();
         let mut sup = Supervisor::new();
-        sup.spawn(1, Path::new(SH), &sh_args(&script), tx).unwrap();
+        sup.spawn(1, &script, &[], tx).unwrap();
 
         // Wait for the child to actually grab the port.
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -682,10 +651,13 @@ mod tests {
         panic!("port {port} still held after stop_all");
     }
 
+    #[cfg(unix)]
     #[test]
     fn process_group_isolation_is_sane() {
         // Guards the assumption behind `process_group(0)`: a child in its own
         // group has pgid == pid.
+        use std::os::unix::process::CommandExt;
+        use std::process::Command as StdCommand;
         let mut child = StdCommand::new("/bin/sh").arg("-c").arg("sleep 5").process_group(0).spawn().unwrap();
         let pid = child.id() as i32;
         assert_eq!(unsafe { libc::getpgid(pid) }, pid);

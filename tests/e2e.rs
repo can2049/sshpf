@@ -380,8 +380,11 @@ fn whoami() -> String {
 fn fixture_scripts_exist_and_are_executable() {
     let p = fake_ssh();
     assert!(p.exists(), "missing {}", p.display());
-    use std::os::unix::fs::PermissionsExt;
-    assert!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o111 != 0);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o111 != 0);
+    }
     let _ = repo_root().join("docs/research/tech-options.md");
     let _: Option<&Path> = None;
 }
