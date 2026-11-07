@@ -1,0 +1,99 @@
+name: Release
+
+# Triggered by pushing a version tag (e.g. `git push origin v0.1.0`). Builds the
+# Linux and Windows binaries for that exact tag, then creates the GitHub Release
+# with them attached. Publishing to crates.io is done manually by a maintainer
+# (`cargo publish`) because it needs the registry token — but it must point at
+# the same commit as the tag.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  build:
+    name: Build / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: sshpf-linux-x86_64
+            binary: target/release/sshpf
+            asset: sshpf-linux-x86_64
+          - os: windows-latest
+            artifact: sshpf-windows-x86_64
+            binary: target/release/sshpf.exe
+            asset: sshpf-windows-x86_64.exe
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+
+      # The tag must match Cargo.toml, otherwise the release and the crates.io
+      # version would silently diverge.
+      - name: Check tag matches Cargo.toml version
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          ver="$(cargo metadata --format-version 1 --no-deps | \
+            python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          if [ "$tag" != "$ver" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $ver"
+            exit 1
+          fi
+          echo "tag and Cargo.toml agree on $ver"
+
+      - name: Build (release)
+        run: cargo build --release --locked
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.binary }}
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Normalise asset names
+        run: |
+          set -eu
+          mkdir -p out
+          cp dist/sshpf out/sshpf-linux-x86_64
+          cp dist/sshpf.exe out/sshpf-windows-x86_64.exe
+          chmod +x out/sshpf-linux-x86_64
+          ls -l out/
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          # Tag push already exists; do not let the action create a second one.
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            out/sshpf-linux-x86_64
+            out/sshpf-windows-x86_64.exe
