@@ -14,11 +14,11 @@ SSH 端口转发管理器，命令行 TUI 表格界面。Linux 与 Windows 均�
 │  ● 2 已连通   ◐ 0 连接中   ◌ 0 重试   ✗ 1 失败   ○ 1 未启用                                      │
 ├──────────────────────────────────────────────────────────────────────────────────────────────────┤
 │   名称          T 本地             远端             SSH 主机    状态        最后错误       时长   │
-│ ▶ cloud-pc-ssh  L 127.0.0.1:19711  127.0.0.1:22    cloud_pc    ● 已连通    —            04:12   │
-│   jeprof-db     L 127.0.0.1:15432  127.0.0.1:5432  jeprof      ✗ 失败      主机密钥校验失败  —    │
+│ ▶ web-ssh       L 127.0.0.1:19711  127.0.0.1:22    web-server  ● 已连通    —            04:12   │
+│   staging-db    L 127.0.0.1:15432  127.0.0.1:5432  staging-db  ✗ 失败      主机密钥校验失败  —    │
 │   old-tunnel    L 127.0.0.1:18080  127.0.0.1:8080  dev-box     ○ 未启用    —             —     │
 ├──────────────────────────────────────────────────────────────────────────────────────────────────┤
-│  ✓ cloud-pc-ssh 已连通                                                                            │
+│  ✓ web-ssh 已连通                                                                                 │
 │  j/k ↑↓ 移动  space 启停  r 重启  n 新建  e 编辑  d 删除  enter 详情  l 日志  / 过滤  a 全启  x 全停 │
 │  g/G 首尾  ? 帮助  esc 关闭弹窗  q 退出                                                           │
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘
@@ -271,9 +271,11 @@ ui      ratatui 渲染（纯函数，无副作用）
 main    CLI、终端生命周期、信号处理
 ```
 
-调研依据：`docs/research/pure-rust-ssh-plan.md`（纯 Rust 化的决策与实测）、
-`docs/research/pure-rust-ssh-spike.md`（三种转发的端到端验证）、
-`docs/research/tech-options.md`（早期技术选型）、`docs/research/prior-art.md`（竞品与交互设计）。
+调研依据（`docs/research/` 下的早期调研笔记，不随 crates.io 包发布，仅在仓库中可读）：
+[pure-rust-ssh-plan.md](https://github.com/can2049/sshpf/blob/main/docs/research/pure-rust-ssh-plan.md)（纯 Rust 化的决策与实测）、
+[pure-rust-ssh-spike.md](https://github.com/can2049/sshpf/blob/main/docs/research/pure-rust-ssh-spike.md)（三种转发的端到端验证）、
+[tech-options.md](https://github.com/can2049/sshpf/blob/main/docs/research/tech-options.md)（早期技术选型）、
+[prior-art.md](https://github.com/can2049/sshpf/blob/main/docs/research/prior-art.md)（竞品与交互设计）。
 
 ## 已知限制（v1）
 

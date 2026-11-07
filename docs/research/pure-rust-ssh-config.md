@@ -183,7 +183,7 @@ UseKeychain（Linux 未编入）STRICT=ERR                          只有 ALLOW
 | **Host 多模式 + 通配 + 取反** | ✅ `Host *.example.com !bad.example.com` 正确；`Host a b c` 三个别名都生效；`Host web1:2222` 这种带端口的模式也支持 |
 | **首值优先（first obtained value）** | ✅ 与 ssh 完全一致，实测 `Host *` 在前的场景：ssh2-config 与 `ssh -G` 都返回 `globalu`；`Host *` 在后则都返回 `specific` |
 | **`IdentityFile` 多行累加** | ✅ 保留出现顺序（`Vec<PathBuf>`），跨块累加也正确 |
-| **`~` 展开** | ✅ `~/.ssh/id_rsa` → `/home/wangcan/.ssh/id_rsa`（0.9.0 起可配置 home，见 `home_dir()` builder） |
+| **`~` 展开** | ✅ `~/.ssh/id_rsa` → `/home/<user>/.ssh/id_rsa`（0.9.0 起可配置 home，见 `home_dir()` builder） |
 | **行内注释 / CRLF / 制表符缩进 / `Key=Value` / 大小写不敏感关键字** | ✅ 全部实测通过 |
 | **真实 13 主机 config 差分** | ✅ 12 个具体别名，`hostname`/`user`/`port`/`proxyjump`/`identityfile 条数` 与 `ssh -G` **全部一致** |
 | **嵌套 Include 的作用域继承**（含取反） | ✅ 见下方专项差分，三个查询点与 `ssh -G` **逐字段一致** |
@@ -212,9 +212,9 @@ Host *
 
 ```text
 alias                | ssh2-config                                              | ssh -G
-cloud_pc             | h=10.244.119.128 u=wangcan p=None id=1 pj=cloud_pc_jump    | h=10.244.119.128 u=wangcan p=22 id=1 pj=cloud_pc_jump
-cloud_pc_jump        | h=desk-ssh.srv.deeproute.cn u=cloud p=80 id=None           | h=desk-ssh.srv.deeproute.cn u=cloud p=80 id=7
-jeprof               | h=10.24.12.41 u=nvidia p=22 id=1                           | h=10.24.12.41 u=nvidia p=22 id=1
+cloud_pc             | h=10.0.0.11 u=alice p=None id=1 pj=cloud_pc_jump    | h=10.0.0.11 u=alice p=22 id=1 pj=cloud_pc_jump
+cloud_pc_jump        | h=jump.example.com u=bob p=80 id=None           | h=jump.example.com u=bob p=80 id=7
+jeprof               | h=10.0.0.12 u=carol p=22 id=1                           | h=10.0.0.12 u=carol p=22 id=1
 ```
 
 （`p=None` 与 `p=22` 的差异**不是 bug**：ssh 把 `Port` 补成默认 22，crate 保留 `None`。调用方 `.unwrap_or(22)` 即可。`id=1` vs `id=7` 同理：ssh 还会补 `~/.ssh/id_rsa`、`id_ed25519` 等**默认候选**，而 crate 只报告配置里显式写的。本项目只需要"配置里写的那个"，反而更准确。）
@@ -269,7 +269,7 @@ beta : user=matched  hostname=10.0.0.2   # Match host beta 命中 → 属下文
 
 ```text
 in : IdentityFile ~/.ssh/%r@%h-%p.key
-out: /home/wangcan/.ssh/%r@%h-%p.key        # %r %h %p 原样保留
+out: /home/<user>/.ssh/%r@%h-%p.key        # %r %h %p 原样保留
 in : IdentityFile %d/.ssh/id_ed25519
 out: %d/.ssh/id_ed25519                     # 连 ~ 都没展开（首字符不是 ~）
 ```
@@ -298,7 +298,7 @@ Host dup {User second}
 
 ```text
 in : IdentityFile "~/my keys/id_x"
-out: /home/wangcan/my keys/id_x              ✅
+out: /home/<user>/my keys/id_x              ✅
 ```
 
 （补充实测：真实 ssh 对**未加引号**的同内容会直接报错中止 —— `ssh -G -T -F … `/ stderr: `garbage at end of line; "keys/id_x".`，exit 255，**不是静默丢弃**。`ssh2-config` 则是"吃掉后面两个词"，两者都属错误处理路径，本项目用引号写法即可，无实际影响。）
