@@ -1,0 +1,31 @@
+[package]
+name = "sshpf"
+version = "0.1.0"
+edition = "2024"
+description = "SSH port forward manager with a TUI dashboard (Linux first)"
+
+[[bin]]
+name = "sshpf"
+path = "src/main.rs"
+
+[lib]
+name = "sshpf"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+crossterm = "0.29"
+dirs = "7"
+libc = "0.2"
+ratatui = "0.30"
+serde = { version = "1", features = ["derive"] }
+signal-hook = "0.4"
+toml = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+strip = true
+lto = "thin"
