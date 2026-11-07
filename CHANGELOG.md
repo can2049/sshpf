@@ -3,7 +3,7 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
+## [0.2.0] - 2026-11-08
 
 ### 新增
 
@@ -78,6 +78,6 @@
 - 不统计流量；同一主机多条转发各自建连，未做连接复用。
 - macOS 走 Unix 分支，未实测。
 
-[Unreleased]: https://github.com/can2049/sshpf/compare/v0.1.1...HEAD
+[0.2.0]: https://github.com/can2049/sshpf/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/can2049/sshpf/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/can2049/sshpf/releases/tag/v0.1.0
