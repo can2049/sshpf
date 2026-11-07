@@ -157,8 +157,9 @@ fn run_tui(paths: Paths, no_restore: bool) -> std::io::Result<ExitCode> {
     // A signal only flips this flag: the main loop then exits normally so that
     // `Drop` handlers stop the child processes. `process::exit()` would skip them.
     let quit = Arc::new(AtomicBool::new(false));
-    for sig in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM, signal_hook::consts::SIGHUP] {
-        let _ = signal_hook::flag::register(sig, quit.clone());
+    // Which signals exist differs per OS (no SIGHUP on Windows); `sys` knows.
+    for sig in sshpf::sys::quit_signals() {
+        let _ = signal_hook::flag::register(*sig, quit.clone());
     }
 
     if config::perms_too_open(&paths.config) {

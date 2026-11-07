@@ -17,7 +17,6 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
-use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::Sender;
@@ -48,28 +47,6 @@ pub enum TunnelEvent {
     SpawnFailed { id: TunnelId, error: String },
 }
 
-/// Ask the kernel to SIGTERM this child when its parent dies.
-///
-/// Must run in the forked child before `exec`, hence the `pre_exec` hook. Note
-/// the well-known race: if the parent already died between `fork` and
-/// `prctl`, the signal is never delivered, so we also verify the parent pid
-/// afterwards and bail out.
-///
-/// # Safety
-/// `pre_exec` runs in a forked child where only async-signal-safe calls are
-/// permitted. `prctl` and `getppid` are both async-signal-safe.
-unsafe fn set_parent_death_signal(expected_ppid: libc::pid_t) -> std::io::Result<()> {
-    if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // If our parent is already gone, PDEATHSIG will never fire: exit now rather
-    // than linger as an orphan holding a port.
-    if unsafe { libc::getppid() } != expected_ppid {
-        return Err(std::io::Error::other("parent died before exec"));
-    }
-    Ok(())
-}
-
 /// Result of a non-blocking child check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChildState {
@@ -77,10 +54,12 @@ enum ChildState {
     Exited(Option<i32>),
 }
 
-/// A spawned child plus its process-group id.
+/// A spawned child plus its platform grouping handle.
+///
+/// On Unix this is the process-group id; on Windows a Job Object handle.
 struct Running {
     child: Child,
-    pgid: i32,
+    group: crate::sys::GroupId,
 }
 
 impl Running {
@@ -121,16 +100,12 @@ impl Supervisor {
         self.stop(id);
 
         let mut cmd = Command::new(program);
-        cmd.args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).process_group(0);
-
-        // Kill the child if we die without unwinding (SIGKILL, OOM, abort).
-        let parent = unsafe { libc::getpid() };
-        unsafe {
-            cmd.pre_exec(move || set_parent_death_signal(parent));
-        }
+        cmd.args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
+        // Process grouping differs per OS; `sys` hides the difference.
+        crate::sys::configure_child(&mut cmd);
 
         let mut child = cmd.spawn()?;
-        let pgid = child.id() as i32;
+        let group = crate::sys::group_of(&child);
         let stderr = child.stderr.take();
 
         if let Some(stderr) = stderr {
@@ -149,7 +124,7 @@ impl Supervisor {
                 .ok();
         }
 
-        self.children.insert(id, Running { child, pgid });
+        self.children.insert(id, Running { child, group });
         Ok(())
     }
 
@@ -186,11 +161,7 @@ impl Supervisor {
         let Some(mut running) = self.children.remove(&id) else {
             return;
         };
-        // Negative pid addresses the whole process group (ProxyJump children too).
-        unsafe {
-            libc::kill(-running.pgid, libc::SIGTERM);
-            libc::kill(running.pgid, libc::SIGTERM);
-        }
+        crate::sys::terminate_group(running.group);
         let deadline = Instant::now() + grace;
         loop {
             match running.check() {
@@ -203,12 +174,10 @@ impl Supervisor {
                 }
             }
         }
-        unsafe {
-            libc::kill(-running.pgid, libc::SIGKILL);
-            libc::kill(running.pgid, libc::SIGKILL);
-        }
+        crate::sys::kill_group(running.group);
         let _ = running.check();
         let _ = running.child.wait();
+        crate::sys::release_group(running.group);
     }
 
     /// Stop everything (used on quit and in `Drop`).
@@ -234,7 +203,6 @@ impl Drop for Supervisor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command as StdCommand;
     use std::sync::mpsc;
 
     const SH: &str = "/bin/sh";
@@ -292,6 +260,7 @@ mod tests {
         assert!(!sup.is_running(7));
     }
 
+    #[cfg(unix)]
     #[test]
     fn stop_kills_process_group_including_children() {
         let dir = tempfile::tempdir().unwrap();
@@ -322,7 +291,7 @@ mod tests {
     }
 
     fn process_alive(pid: i32) -> bool {
-        unsafe { libc::kill(pid, 0) == 0 }
+        crate::sys::pid_is_alive(pid as u32)
     }
 
     #[test]
@@ -441,7 +410,7 @@ mod tests {
         {
             let mut sup = Supervisor::new();
             sup.spawn(1, Path::new(SH), &sh_args(&script), tx).unwrap();
-            pid = sup.children.get(&1).unwrap().pgid;
+            pid = sup.children.get(&1).unwrap().child.id() as i32;
             assert!(process_alive(pid));
         }
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -451,6 +420,7 @@ mod tests {
         assert!(!process_alive(pid), "child survived Supervisor::drop");
     }
 
+    #[cfg(unix)]
     #[test]
     fn child_dies_with_parent_via_pdeathsig() {
         // `Drop` cannot run when the process is SIGKILLed, so children carry
@@ -465,7 +435,7 @@ mod tests {
 
         let mut sup = Supervisor::new();
         sup.spawn(1, Path::new(SH), &sh_args(&script), tx).unwrap();
-        let child_pid = sup.children.get(&1).unwrap().pgid;
+        let child_pid = sup.children.get(&1).unwrap().child.id() as i32;
 
         // Ask the child itself what its parent-death signal is. `/proc` does not
         // expose it, so instead assert the hook ran by checking the child is a
@@ -480,6 +450,7 @@ mod tests {
         assert!(!process_alive(child_pid));
     }
 
+    #[cfg(unix)]
     #[test]
     fn pre_exec_hook_rejects_dead_parent() {
         // The hook returns Err when the observed parent differs from the
@@ -495,7 +466,7 @@ mod tests {
         while bogus == unsafe { libc::getppid() } || bogus == me {
             bogus += 1;
         }
-        assert!(unsafe { set_parent_death_signal(bogus) }.is_err());
+        assert!(unsafe { crate::sys::arm_parent_death_signal_for_test(bogus) }.is_err());
     }
 
     #[test]
@@ -633,6 +604,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn shutting_down_all_children_releases_their_ports() {
         // End-to-end-ish: bind a real port from a child, then assert the port is
@@ -682,10 +654,13 @@ mod tests {
         panic!("port {port} still held after stop_all");
     }
 
+    #[cfg(unix)]
     #[test]
     fn process_group_isolation_is_sane() {
         // Guards the assumption behind `process_group(0)`: a child in its own
         // group has pgid == pid.
+        use std::os::unix::process::CommandExt;
+        use std::process::Command as StdCommand;
         let mut child = StdCommand::new("/bin/sh").arg("-c").arg("sleep 5").process_group(0).spawn().unwrap();
         let pid = child.id() as i32;
         assert_eq!(unsafe { libc::getpgid(pid) }, pid);

@@ -11,13 +11,12 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
-  test:
-    name: Test / ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest]
+  # Fast feedback: formatting + lint on Linux only. Running this once instead of
+  # per-OS keeps the queue short; the OS matrix below focuses on compiling and
+  # testing.
+  lint:
+    name: Format & Lint
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -29,21 +28,57 @@ jobs:
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
 
-      - name: Format
-        run: cargo fmt --check
+      - name: cargo fmt
+        run: cargo fmt --all --check
 
-      - name: Clippy
+      - name: cargo clippy
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Tests
-        run: cargo test --all-targets
+  test:
+    name: Test / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
 
-      - name: Build release
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+
+      # Unit tests only: the e2e suite needs a real sshd, which is covered by
+      # the dedicated job below. Running `--lib` here keeps the Windows job
+      # meaningful instead of skipping everything.
+      - name: Unit tests
+        run: cargo test --lib
+
+      - name: Build (release)
         run: cargo build --release
 
+      # Upload the Windows binary so the port can be tried without a toolchain.
+      - name: Upload binary (Windows)
+        if: matrix.os == 'windows-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sshpf-windows-x86_64
+          path: target/release/sshpf.exe
+          if-no-files-found: error
+
+      - name: Upload binary (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sshpf-linux-x86_64
+          path: target/release/sshpf
+          if-no-files-found: error
+
   # The end-to-end test starts a throw-away sshd on loopback. It is `#[ignore]`d
-  # by default because it needs a working OpenSSH server and a usable key; this
-  # job runs it explicitly so the real forwarding path stays covered.
+  # by default because it needs a working OpenSSH server and a usable key, so it
+  # runs explicitly here to keep the real forwarding path covered.
   e2e:
     name: End-to-end (real sshd)
     runs-on: ubuntu-latest

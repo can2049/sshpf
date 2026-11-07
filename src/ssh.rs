@@ -75,7 +75,6 @@
 
 use std::ffi::OsStr;
 use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -320,17 +319,11 @@ fn write_synth_config_with(
 
     std::fs::create_dir_all(dir).with_context(|| format!("无法创建目录 {}", dir.display()))?;
     let path = dir.join(format!("sshpf-{}.conf", cfg.id));
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&path)
-        .with_context(|| format!("无法写入 {}", path.display()))?;
+    let mut file = crate::sys::create_private_file(&path).with_context(|| format!("无法写入 {}", path.display()))?;
     file.write_all(text.as_bytes())?;
     file.flush()?;
-    // `mode(0o600)` only applies on creation; force it if the file existed.
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    // Creation mode only applies to new files; tighten an existing one too.
+    crate::sys::restrict_file(&path)?;
     Ok(path)
 }
 
@@ -469,22 +462,37 @@ pub(crate) fn pick_binary(override_path: Option<&OsStr>) -> PathBuf {
             return p;
         }
     }
+    let name = crate::sys::ssh_binary_name();
     if let Some(path_var) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path_var) {
-            let candidate = dir.join("ssh");
+            let candidate = dir.join(name);
             if is_executable(&candidate) {
                 return candidate;
             }
+            // On Windows the client may also be present without the `.exe`
+            // suffix; try the bare name as a fallback.
+            #[cfg(windows)]
+            {
+                let bare = dir.join("ssh");
+                if is_executable(&bare) {
+                    return bare;
+                }
+            }
         }
     }
-    PathBuf::from("/usr/bin/ssh")
+    // Last resort: the conventional install path per OS.
+    #[cfg(unix)]
+    {
+        PathBuf::from("/usr/bin/ssh")
+    }
+    #[cfg(windows)]
+    {
+        PathBuf::from(r"C:\Windows\System32\OpenSSH\ssh.exe")
+    }
 }
 
 fn is_executable(path: &Path) -> bool {
-    match std::fs::metadata(path) {
-        Ok(meta) => meta.is_file() && (meta.permissions().mode() & 0o111 != 0),
-        Err(_) => false,
-    }
+    crate::sys::is_executable(path)
 }
 
 /// Whether `ssh` can actually be run.
@@ -864,9 +872,13 @@ mod tests {
         // multi-value line must stay unquoted, single path values are kept
         assert!(text.contains("userknownhostsfile ~/.ssh/known_hosts"), "{text}");
 
-        // 0600
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
+        // Owner-only permissions (Unix only: Windows relies on profile ACLs).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
     }
 
     #[test]
