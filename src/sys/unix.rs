@@ -23,6 +23,15 @@ pub fn create_private_file(path: &Path) -> std::io::Result<std::fs::File> {
     std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(PRIVATE_FILE_MODE).open(path)
 }
 
+/// Open for append, creating the file `0600` when it does not exist yet.
+///
+/// Append mode is what makes concurrent writers (UI thread plus tunnel threads)
+/// safe without an inter-process lock: each `write` of a whole record lands at
+/// the current end of file.
+pub fn open_private_append(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new().append(true).create(true).mode(PRIVATE_FILE_MODE).open(path)
+}
+
 /// Tighten a file to owner-only.
 pub fn restrict_file(path: &Path) -> std::io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(PRIVATE_FILE_MODE))

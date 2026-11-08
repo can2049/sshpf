@@ -768,6 +768,16 @@ impl BatchAction {
         }
     }
 
+    /// ASCII name, used for log fields (and therefore stable across UI wording).
+    pub fn name(self) -> &'static str {
+        match self {
+            BatchAction::Start => "start",
+            BatchAction::Stop => "stop",
+            BatchAction::Restart => "restart",
+            BatchAction::Delete => "delete",
+        }
+    }
+
     /// Every batch operation goes through the confirmation gate: even "enable"
     /// opens N listeners at once, which is exactly what the single-row flow
     /// already warns about.
@@ -829,6 +839,26 @@ impl FailureKind {
             FailureKind::Exited => "ssh 异常退出",
             FailureKind::Unsupported => "该类型暂未支持",
             FailureKind::Unknown => "未知错误",
+        }
+    }
+
+    /// ASCII name, used for log fields where a stable greppable token beats the
+    /// UI phrasing (`short()` is Chinese and may be reworded).
+    pub fn name(self) -> &'static str {
+        match self {
+            FailureKind::PortInUse => "port_in_use",
+            FailureKind::PermissionDenied => "permission_denied",
+            FailureKind::AuthFailed => "auth_failed",
+            FailureKind::DnsFailure => "dns_failure",
+            FailureKind::ConnectionRefused => "connection_refused",
+            FailureKind::Timeout => "timeout",
+            FailureKind::HostKeyMismatch => "host_key_mismatch",
+            FailureKind::RemoteForwardFailed => "remote_forward_failed",
+            FailureKind::TargetUnreachable => "target_unreachable",
+            FailureKind::SpawnFailed => "spawn_failed",
+            FailureKind::Exited => "exited",
+            FailureKind::Unsupported => "unsupported",
+            FailureKind::Unknown => "unknown",
         }
     }
 

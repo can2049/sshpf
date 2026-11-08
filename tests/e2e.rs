@@ -578,3 +578,75 @@ fn imported_ssh_config_forward_carries_traffic() {
     let banner = String::from_utf8_lossy(&buf[..n]).to_string();
     assert!(banner.starts_with("SSH-2.0-"), "expected the sshd banner through the import, got {banner:?}");
 }
+
+// ---------------------------------------------------------------------------
+// diagnostic log
+// ---------------------------------------------------------------------------
+
+/// The whole chain: a real tunnel goes up and down, and the file a user would
+/// attach to a bug report contains the lifecycle with usable fields.
+///
+/// Runs in its own temp log dir. Because the logger is process-global and only
+/// the first `init` wins, this test skips itself when another one already
+/// installed it (the suite runs single-threaded in CI, so the skip is rare).
+#[test]
+#[ignore = "needs a working sshd"]
+fn tunnel_lifecycle_is_written_to_the_log_file() {
+    let _guard = env_lock();
+    let Some(sshd) = start_sshd() else { return };
+    sshd.activate();
+
+    let log_dir = tempfile::tempdir().unwrap();
+    let log_path = match sshpf::logging::init(sshpf::logging::Config {
+        dir: log_dir.path().to_path_buf(),
+        level: sshpf::logging::Level::Debug,
+        ..Default::default()
+    }) {
+        Ok(path) => path,
+        // Another test installed the logger first: its file already proves the
+        // same thing, and init cannot be undone.
+        Err(_) => return,
+    };
+
+    let mut t = tunnel(1, "logged", free_port(), "testhost");
+    t.remote_host = "127.0.0.1".into();
+    t.remote_port = sshd.port;
+    t.auto_restart = false;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with(dir.path(), vec![t]);
+    app.start_tunnel(1);
+    assert!(
+        wait_for(&mut app, 30, |a| matches!(status_of(a, 1), TunnelStatus::Up { .. })),
+        "tunnel never came up: {:?}",
+        status_of(&app, 1)
+    );
+    app.stop_tunnel(1);
+
+    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let find = |event: &str| -> String {
+        log.lines()
+            .find(|l| l.contains(&format!("event={event}")))
+            .unwrap_or_else(|| panic!("no {event} record in:\n{log}"))
+            .to_string()
+    };
+
+    let start = find("tunnel.start");
+    assert!(start.contains("trigger=manual"), "why it started is recorded: {start}");
+    assert!(start.contains("name=logged"), "which tunnel: {start}");
+    assert!(start.contains("forward=local"), "which kind: {start}");
+
+    let spawn = find("tunnel.spawn");
+    assert!(spawn.contains("hostkey_policy=accept-new"), "connection parameters: {spawn}");
+
+    let ready = find("tunnel.ready");
+    assert!(ready.contains("tunnel=1"), "{ready}");
+    assert!(ready.contains("elapsed_ms="), "how long it took to come up: {ready}");
+
+    let stop = find("tunnel.stop");
+    assert!(stop.contains("trigger=manual"), "{stop}");
+
+    // The tunnel's own progress lines are mirrored at debug level, which is what
+    // makes the file enough to reconstruct a session without the TUI.
+    assert!(log.contains("event=tunnel.line"), "progress lines missing:\n{log}");
+}

@@ -4,6 +4,7 @@
 //! spawns, never persists, and can be unit-tested on its own. `App` owns one
 //! and drives it from key events.
 
+use crate::app::log as eventlog;
 use crate::app::{App, ConfirmAction};
 use crate::model::{
     self, FormField, FormMode, ForwardKind, ImportTable, InputBuf, TunnelConfig, TunnelId, TunnelView, now_unix,
@@ -379,12 +380,13 @@ impl App {
 
     fn commit_form_create(&mut self, mut cfg: TunnelConfig) {
         cfg.enabled = true;
+        eventlog::tunnel_created(&cfg, "form");
         self.cfg.tunnels.push(cfg.clone());
         self.tunnels.push(TunnelView::new(cfg.clone()));
         let pos = self.tunnels.len() - 1;
         let vis = self.visible_indices();
         self.selected = vis.iter().position(|i| *i == pos).unwrap_or(vis.len().saturating_sub(1));
-        self.start_tunnel(cfg.id);
+        self.start_tunnel_with(cfg.id, "created");
         self.close_overlay();
         self.persist_quietly();
     }
@@ -407,9 +409,12 @@ impl App {
             v.cfg.id = eid;
             v.cfg.enabled = enabled || v.cfg.enabled;
         }
+        if let Some(view) = self.tunnels.iter().find(|t| t.cfg.id == eid) {
+            eventlog::tunnel_updated(&view.cfg);
+        }
         self.supervisor.stop(eid);
         self.forget_runtime_state(eid);
-        self.start_tunnel(eid);
+        self.start_tunnel_with(eid, "edited");
         self.close_overlay();
         self.persist_quietly();
     }

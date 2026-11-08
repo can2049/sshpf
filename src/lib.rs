@@ -15,6 +15,7 @@
 pub mod app;
 pub mod config;
 pub mod keys;
+pub mod logging;
 pub mod model;
 pub mod ssh;
 pub mod sys;

@@ -6,16 +6,27 @@
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind};
 use crossterm::execute;
 use ratatui::DefaultTerminal;
 
 use sshpf::app::App;
+use sshpf::app::log as eventlog;
 use sshpf::config::{self, Paths};
+use sshpf::logging;
 use sshpf::model::StatusMsg;
 use sshpf::{keys, ssh, ui};
+
+/// Last quit signal received (`0` = none). Written by a signal handler, read
+/// after the loop, so it is an atomic rather than shared state.
+static RECEIVED_SIGNAL: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// Stable signal name for the log.
+fn signal_name(sig: i32) -> String {
+    signal_hook::low_level::signal_name(sig).unwrap_or("SIGUNKNOWN").to_string()
+}
 
 /// Poll interval: how often keys/events are checked and the UI redraws.
 const TICK: Duration = Duration::from_millis(200);
@@ -33,6 +44,13 @@ sshpf — SSH 端口转发 TUI 管理器
       --check           校验配置文件后退出（不启动 UI）
   -h, --help            显示本帮助
   -V, --version         显示版本
+
+日志:
+  每次运行都会向 ~/.local/state/sshpf/logs/sshpf.log 追加结构化日志
+  （启动/关闭、隧道启停与重连、异常与失败原因、panic 与致命信号）。
+  SSHPF_LOG_DIR=<目录>    改日志目录
+  SSHPF_LOG_LEVEL=<级别>  off|error|warn|info|debug（默认 info）
+  超过 2 MiB 自动轮转，保留 3 个归档（sshpf.log.1 … .3）。
 
 界面快捷键:
   j/k ↑↓   移动        space  启用/停用    r  重启
@@ -86,10 +104,18 @@ fn parse_args() -> Result<Option<Args>, String> {
 }
 
 fn main() -> ExitCode {
+    // Logging first: everything below, including a failed `--config` parse, is
+    // more useful with a record of it. A failure here is not fatal — sshpf works
+    // without a log — but it is reported once the TUI is up (see `run_tui`).
+    let log_path = logging::init_from_env().ok();
+    logging::install_crash_hooks();
+    let started = Instant::now();
+
     let args = match parse_args() {
         Ok(Some(a)) => a,
         Ok(None) => return ExitCode::SUCCESS,
         Err(e) => {
+            eventlog::cli_error("cli.bad_args", &e);
             eprintln!("{e}");
             return ExitCode::from(2);
         }
@@ -104,16 +130,27 @@ fn main() -> ExitCode {
         None => Paths::resolve(),
     };
 
+    eventlog::app_start(
+        env!("CARGO_PKG_VERSION"),
+        &config::display_path(&paths.config),
+        &log_path.as_ref().map(|p| config::display_path(p)).unwrap_or_default(),
+    );
+
     if args.list_hosts {
+        eventlog::cli_mode("list_hosts");
         return list_hosts();
     }
     if args.check {
+        eventlog::cli_mode("check");
         return check_config(&paths);
     }
 
-    match run_tui(paths, args.no_restore) {
+    match run_tui(paths, args.no_restore, started) {
         Ok(code) => code,
         Err(e) => {
+            // The TUI could not even start (terminal init, event loop I/O) — the
+            // one failure with no UI left to explain it.
+            logging::error("app.fatal", &[("stage", &"tui"), ("msg", &e.to_string())]);
             eprintln!("错误: {e}");
             ExitCode::FAILURE
         }
@@ -134,6 +171,7 @@ fn list_hosts() -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
+            eventlog::cli_error("sshconfig.load_failed", &e.to_string());
             eprintln!("读取 ~/.ssh/config 失败: {e}");
             ExitCode::FAILURE
         }
@@ -149,51 +187,94 @@ fn check_config(paths: &Paths) -> ExitCode {
                 println!("校验通过");
                 ExitCode::SUCCESS
             } else {
-                for p in problems {
+                for p in &problems {
                     println!("  警告: {p}");
                 }
+                eventlog::config_loaded(&config::display_path(&paths.config), cfg.tunnels.len(), &problems);
                 ExitCode::SUCCESS
             }
         }
         Err(e) => {
+            eventlog::cli_error("config.invalid", &e.to_string());
             eprintln!("配置错误: {e}");
             ExitCode::FAILURE
         }
     }
 }
 
-fn run_tui(paths: Paths, no_restore: bool) -> std::io::Result<ExitCode> {
+fn run_tui(paths: Paths, no_restore: bool, started: Instant) -> std::io::Result<ExitCode> {
     // A signal only flips this flag: the main loop then exits normally so that
     // `Drop` handlers stop the child processes. `process::exit()` would skip them.
     let quit = Arc::new(AtomicBool::new(false));
     // Which signals exist differs per OS (no SIGHUP on Windows); `sys` knows.
+    //
+    // Two things have to happen per signal: flip the quit flag (so the loop exits
+    // normally and every `Drop` runs), and remember *which* signal arrived — the
+    // TUI is gone by then and the exit code is a plain 0, so otherwise there is no
+    // way to tell Ctrl-C from a `kill`. Both are async-signal-safe: one atomic
+    // store each. Nothing else may run in a handler here (logging takes a mutex).
     for sig in sshpf::sys::quit_signals() {
-        let _ = signal_hook::flag::register(*sig, quit.clone());
+        let set_flag = quit.clone();
+        let sig = *sig;
+        // SAFETY: the closure only performs atomic stores.
+        unsafe {
+            let _ = signal_hook::low_level::register(sig, move || {
+                RECEIVED_SIGNAL.store(sig, Ordering::Relaxed);
+                set_flag.store(true, Ordering::SeqCst);
+            });
+        }
     }
 
     if config::perms_too_open(&paths.config) {
-        let _ = config::tighten_perms(&paths.config);
+        // Group/world readable config: it names hosts and key paths, so this is a
+        // real (if small) exposure and worth a record either way.
+        let ok = config::tighten_perms(&paths.config).is_ok();
+        eventlog::config_perms_tightened(&config::display_path(&paths.config), ok);
     }
 
     let mut app = App::new(paths);
+    if let Some(reason) = logging::init_error() {
+        // Silent logging loss is the worst failure mode for a diagnostic feature;
+        // the user finds out through the status line instead of an empty file.
+        app.set_status(StatusMsg::warn(format!("日志未启用: {reason}")));
+        logging::error("log.unavailable", &[("msg", &reason)]);
+    }
     app.load_hosts();
     if !no_restore {
         app.restore_enabled();
     } else {
+        logging::info("app.restore_skipped", &[("reason", &"no-restore")]);
         app.set_status(StatusMsg::info("已跳过自动恢复（--no-restore）"));
     }
 
     let mut terminal: DefaultTerminal = ratatui::init();
+    // From here on the crash handler must release the alternate screen before the
+    // message lands in the user's shell.
+    logging::set_tui_active(true);
     // Mouse capture is on for the whole session: the import table's filtering and
     // the table's row selection are click-driven, and terminals cannot report a
     // click without it. It is best-effort — a terminal that refuses capture (some
     // multiplexers, some CI ptys) must still give a working keyboard-only UI, so
     // a failure is ignored rather than fatal.
     let mouse = execute!(std::io::stdout(), EnableMouseCapture).is_ok();
+    if !mouse {
+        eventlog::mouse_capture_failed();
+    }
     let result = event_loop(&mut terminal, &mut app, &quit);
+    let received = RECEIVED_SIGNAL.load(Ordering::Relaxed);
+    if received != 0 {
+        logging::info("app.signal", &[("signal", &signal_name(received))]);
+    }
+    logging::set_tui_active(false);
     // Stop children and remove scratch files before restoring the terminal, so
     // a stray panic cannot leave the user's terminal in raw mode.
+    let was_quit = app.should_quit;
     app.shutdown();
+    eventlog::app_exit(
+        if was_quit { "user" } else { "signal" },
+        started.elapsed().as_millis(),
+        app.tunnels.iter().filter(|t| matches!(t.status, sshpf::model::TunnelStatus::Up { .. })).count(),
+    );
     if mouse {
         // Releasing capture matters more than the return value: leaving it on
         // makes the shell that regains control print garbage on every move.
@@ -205,9 +286,18 @@ fn run_tui(paths: Paths, no_restore: bool) -> std::io::Result<ExitCode> {
 
 fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, quit: &Arc<AtomicBool>) -> std::io::Result<()> {
     while !quit.load(Ordering::Relaxed) {
+        let frame_started = Instant::now();
         app.drain_events();
         terminal.draw(|frame| ui::draw(frame, app))?;
+        // A frame that overruns the tick is the first symptom of a wedged UI
+        // (a blocking call sneaking into the event pump). Logging it turns "the
+        // TUI felt stuck" into a timestamp.
+        let frame_ms = frame_started.elapsed().as_millis();
+        if frame_ms >= logging::SLOW_FRAME_MS {
+            eventlog::slow_frame(frame_ms);
+        }
         if app.should_quit {
+            logging::info("app.quit", &[("reason", &"user")]);
             break;
         }
         if event::poll(TICK)? {

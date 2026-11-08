@@ -5,6 +5,22 @@
 
 ## [Unreleased]
 
+### 新增
+
+- **结构化诊断日志**。每次运行向 `~/.local/state/sshpf/logs/sshpf.log` 追加
+  一行一条的记录：固定列顺序（RFC 3339 时间戳、级别、`seq`、`event`）+ `key=value`
+  字段，值含空白/引号/控制字符时自动加引号转义，因此一条记录永不跨行。
+  覆盖启动退出、配置读写、主机解析、隧道启停/就绪/重试/终态失败、主机密钥决策、
+  目标端口不可达、用户确认闸的放行与取消、批量操作的实际生效条数、UI 卡帧。
+  单文件 2 MiB 轮转、保留 3 个归档（上限约 8 MiB），目录 `0700` 文件 `0600`。
+  `SSHPF_LOG_DIR` 换目录、`SSHPF_LOG_LEVEL=off|error|warn|info|debug` 换级别。
+- **崩溃写入日志**。panic 记录线程名、源码位置、消息与前 25 帧栈（隧道线程崩了
+  与 UI 崩了能区分开）；SIGSEGV/SIGBUS/SIGABRT/SIGILL/SIGFPE 用 `sigaction` 在
+  处理器里直接 `write(2)` 一条记录，同时退出备用屏、往 stderr 提示路径，最后恢复
+  默认处理并重新 `raise`，退出状态与 core dump 行为保持不变。
+- `--help` 增加日志一节；新增 [docs/logging.md](docs/logging.md)（事件目录、
+  字段说明、排查配方）。
+
 ### 修复
 
 - **`--help` 没有列出本次新增的键与能力**：`v` 多选模式、导入面板的入口

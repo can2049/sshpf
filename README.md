@@ -369,6 +369,40 @@ note = ""
 
 无 ssh-agent 时的 `ssh_get_authentication_socket: Connection refused` 是**无害**提示，不会被误判为失败。
 
+## 诊断日志
+
+每次运行都往一个追加写的文件里记录结构化日志——启动与退出、隧道启停与重连、
+异常与失败原因、**panic 与致命信号（SIGSEGV/SIGABRT/…）**。TUI 里那份日志只活在
+进程内，进程一退（尤其是崩溃）就没了；这个文件是留给事后分析的。
+
+```bash
+tail -f ~/.local/state/sshpf/logs/sshpf.log     # 实时看
+grep ' ERROR ' ~/.local/state/sshpf/logs/*      # 只看出事的
+grep 'tunnel=3 ' ~/.local/state/sshpf/logs/sshpf.log   # 一条隧道的完整时间线
+```
+
+一行一条记录，列顺序固定：
+
+```
+2026-11-08T18:55:42.957+08:00 INFO  seq=12 event=tunnel.ready tunnel=3 name=cloud-pc forward=local listen=127.0.0.1:19711 target=127.0.0.1:22 host=cloud_pc elapsed_ms=812
+```
+
+崩溃也留得下来：
+
+```
+… ERROR seq=42 event=crash.panic thread=sshpf-tunnel-3 location=src/app.rs:112:9 msg="index out of bounds" backtrace=yes
+… ERROR seq=43 event=crash.panic.trace msg="  | panic backtrace\n  |    0: sshpf::tunnel::run\n  | …"
+ts=1794000000 ERROR seq=0 event=crash.signal signal=11 name=SIGSEGV pid=4242
+```
+
+- 目录 `0700`、文件 `0600`；单文件 2 MiB 轮转，保留 3 个归档（上限约 8 MiB）。
+- `SSHPF_LOG_DIR=<目录>` 换位置，`SSHPF_LOG_LEVEL=off|error|warn|info|debug` 换级别（默认 `info`）。
+  `off` 只关常规记录，**崩溃记录照写**。
+- 不记私钥、passphrase、`known_hosts` 内容。
+- **提 issue 请附整个 `logs/` 目录**（含 `.1`~`.3`），重连风暴、配置被改的证据都在更早的位置。
+
+完整事件目录、字段说明与排查配方见 [docs/logging.md](docs/logging.md)。
+
 ## 故障排查
 
 ```bash
@@ -384,7 +418,7 @@ sshpf --check               # 确认配置没写坏
 ## 开发
 
 ```bash
-cargo test                    # 386 单元 + 9 端到端（其中 8 个默认 #[ignore]，需真实 sshd）
+cargo test                    # 410 单元 + 25 集成（日志 15 个）+ 10 端到端（9 个默认 #[ignore]，需真实 sshd）
 cargo test --test e2e -- --ignored --test-threads=1   # 真实 sshd 端到端
 cargo clippy --all-targets    # 零警告
 cargo fmt --check             # 格式检查
@@ -401,6 +435,7 @@ cargo fmt --check             # 格式检查
 | `model` | 55 | 三种转发 spec、失败码分类、输入缓冲边界、逐列筛选与撤销栈、多选语义 |
 | `config` | 27 | 缺省值、原子写、0600/0700 权限、字段校验、容错 |
 | `tunnel` | 5 | 启停、事件顺序、重复启动、停止幂等 |
+| `logging` | 24 | 记录格式/转义、级别过滤、轮转不切记录、panic 与致命信号真写盘、0600/0700 |
 | `sys` / `text` | 8 | 文件权限、退出信号、显示宽度与截断 |
 
 模块分层（每层只依赖上层）：
@@ -410,6 +445,7 @@ model   纯数据类型，无 I/O、无 ratatui
 ssh     ~/.ssh/config 解析（连接参数 + 转发指令）、known_hosts 校验、SOCKS5、russh 客户端
 tunnel  隧道线程监管：启动 / 停止 / 事件
 config  TOML 持久化（原子写、0600）
+logging 诊断日志：结构化记录、轮转、panic/致命信号崩溃捕获
 app     状态机：持有转发、消费事件、导入批次、多选、鼠标派发
 keys    按键分发（从 main 抽出以便单元测试）
 ui      ratatui 渲染（纯函数，无副作用）+ 每帧重建的鼠标命中图
@@ -438,6 +474,10 @@ main    CLI、终端生命周期、信号处理、鼠标捕获
   （自动顺延 + 监听地址校验），所以结果仍安全。
 - 鼠标是 best-effort：终端拒绝捕获时只影响鼠标，键盘 UI 完整可用。字面字符 `f` 无法输入到导入表筛选里
   （`f` 优先用于切换筛选列）。
+- **崩溃日志在 Windows 上只覆盖 panic**。没有 `sigaction`/Unix 信号语义，SEH 层（访问违例）
+  不在此列；Windows 的 panic 记录、栈、日志文件与 Linux 一致。
+- 崩溃记录里的致命信号行用 epoch 秒（`ts=…`）而非格式化时间戳：信号处理器只能用
+  async-signal-safe 调用，首次 `localtime_r` 会分配内存。其余字段格式与普通记录一致。
 
 ## 许可证
 

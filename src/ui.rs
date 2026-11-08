@@ -771,6 +771,8 @@ const HELP_ITEMS: &[(&str, &str)] = &[
     ("", "都会先弹出确认，需按 y 或 enter 才执行，esc 或 n 取消。"),
     ("", "失败详情（原始 stderr）在详情面板完整保留，表格只放归类短句。"),
     ("", "设置 NO_COLOR=1 关闭全部颜色，状态仍由符号 + 文字表达。"),
+    ("", "诊断日志（含崩溃记录）在 ~/.local/state/sshpf/logs/sshpf.log，"),
+    ("", "SSHPF_LOG_DIR / SSHPF_LOG_LEVEL 可改目录与级别；详见 docs/logging.md。"),
 ];
 
 fn help_line_count() -> usize {
