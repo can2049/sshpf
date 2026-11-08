@@ -196,6 +196,7 @@ fn crash_child_helper() {
     let _ = logging::init(logging::Config { dir, ..logging::Config::default() });
     logging::install_crash_hooks();
     match kind.as_str() {
+        #[cfg(unix)]
         "signal" => {
             logging::info("test.before_crash", &[]);
             // SAFETY: deliberately crashing this short-lived child.
