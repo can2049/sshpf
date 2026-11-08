@@ -1624,7 +1624,7 @@ mod tests {
                 hostname: "1.1.1.1".into(),
                 user: None,
                 port: 22,
-                proxy_jump: None,
+                proxy_jump: Vec::new(),
                 identity_file: None,
             })
             .collect();
@@ -1645,7 +1645,7 @@ mod tests {
                 hostname: "1.1.1.1".into(),
                 user: None,
                 port: 22,
-                proxy_jump: None,
+                proxy_jump: Vec::new(),
                 identity_file: None,
             })
             .collect();

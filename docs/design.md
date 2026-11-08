@@ -724,3 +724,65 @@ JSON 每行都重复键名，肉眼扫起来噪声占一半，而 `key=value` �
 事件循环每帧量一次耗时，超过 500 ms（tick 的 2.5 倍）记一条 `ui.slow_frame`。
 "TUI 感觉卡住了"是最难复现的一类反馈，一行带毫秒数的时间戳能立刻区分
 "某一帧卡了"和"整个事件循环卡死"。
+
+## 18. 防御式边界
+
+这个程序读的东西全都不由我们控制：`~/.ssh/config` 是用户（或 dotfiles 管理器、或某个
+脚本）写的文本，`config.toml` 允许手改，环境变量是 shell 里的字符串，`stdin`/`stdout`
+可能根本不是终端。所以有一条硬边界：
+
+> **边界之外是任意的，边界之内不许 panic；出问题就降级，降级必须留痕。**
+
+分三层，从外到内：
+
+**第一层：输入解析一律不 panic。** 解析器面对的是"字节"而不是"我们已经相信的字符串"。
+这一轮真正崩过的两处说明了违反它是什么后果：
+
+- `strip_match_blocks` 用 `trimmed[..5]` 比较 `Match` 关键字。首行是中文注释时，第 5 个
+  字节落在一个 3 字节字符中间 ⇒ `byte index 5 is not a char boundary`。修法是按**字节**
+  比较（`as_bytes().get(..5)`），这本来也是 OpenSSH 的关键字语义：ASCII 大小写不敏感。
+- `std::env::args()` 对每个参数 `unwrap()` 成 UTF-8。路径是 `OsStr`，不是 `String`；
+  非 UTF-8 的路径在非 UTF-8 locale 下完全合法。改用 `args_os()`，路径按字节原样保留，
+  作**参数名**时才拒绝（那时它确实无法匹配任何已知 flag）。
+
+同类替换贯穿全部边界：`print!`/`println!`（写失败即 panic）改成显式句柄上的 `write_all`；
+`ratatui::init()`（内部 `expect`）改 `try_init()` 并把 `io::Error` 交给正常的 `app.fatal` 通路；
+所有 u16 算术先扩宽到 u32、用 `try_from` 收口；`max_id() + 1` 改 `saturating_add`。
+
+**第二层：只剩不变量可依赖的地方，降级而不是断言。** 有些下标"逻辑上一定安全"，但这个
+"一定"依赖于 ratatui 的 layout 契约、或某个 `len()` 与常量保持同步——两者都可能在下一次
+依赖升级或一次重构里悄悄失效，而代价是整帧 panic（终端停在 raw mode，界面全无）。
+这类位置改成 `get()` + 安全默认值：
+
+- 渲染层拿不到该有的 layout 分区 ⇒ 这一块这一帧不画，记 `ui.render_degraded`
+  （`reason=layout_band_missing`）。
+- 表格行号 + 表头顶出 `u16` ⇒ 视为"在屏幕外"，不再进命中图。
+- `ForwardKind::all()[kind_idx]` 越界 ⇒ 回落默认类型，记 `form.kind_index_invalid`。
+- 确认框的目标隧道已被删 ⇒ 对话框照常开（不卡住用户），渲染时没有名字，记
+  `action.target_missing`。
+
+代价是"降级"很容易变成静默的。所以有一条附加规则：**每次降级都写一条记录，
+且渲染层这类每帧都可能触发的路径必须限流**（`ui.render_degraded` 每进程每处只记一次，
+否则一次 resize 就能把 2 MiB 的日志刷满、把真正有意思的历史挤掉）。
+
+**第三层：日志系统自身是最后防线。** 前两层保证"别的地方不 panic"，但崩溃捕获机制本身
+也可能挂，而它挂了就什么都没了。三个约束：
+
+1. **panic hook 必须自安全。** 它要写日志，而写日志要拿锁。如果 panic 恰好发生在持锁的
+   写入过程中（某个值的 `Display` 里 panic 就会这样），hook 的 `lock()` 就是自己等自己
+   ⇒ 进程永久僵住。注意这**不是** `Mutex` 的 poison 语义：同线程重入不会返回
+   `Err(poisoned)`，而是直接挂死，所以"中毒了 `into_inner()` 一下"那种处理救不了它，
+   必须事先识别出"我就在临界区里"。用的是一个 thread-local 的
+   `Cell<bool>` 哨兵（`CriticalSection::enter()`，RAII `Drop` 复位，panic 展开也会复位）：
+   已在本线程的临界区内就直接降级、不碰锁，改用启动时 `dup` 出来的 fd 裸 `write(2)`
+   写一行 `crash.log_reentrant`（`ts=` epoch 秒、不分配、不格式化，和 `crash.signal`
+   同一风格），然后让原 panic 照常传播。**宁可少一条记录，不能不死。**
+2. **信号处理器只做 async-signal-safe 调用。** 不分配、不加锁、不用格式化机制；
+   记录是手工拼进固定缓冲区的，整数逐位转十进制，时间戳用 `time(2)` 而不是
+   `localtime_r`（首次调用会分配内存）。
+3. **线程 panic 不传染进程。** 每条隧道在自己的线程上，`catch_unwind` 把 panic 转成
+   `Event::Exited{code:101}` + `tunnel.thread_panic`；该行变成失败态，UI 和其余隧道继续。
+
+这一层只保"记录得下来"，不保"程序活着"——进程该崩还是崩，退出码和 core dump 行为不变
+（`a_fatal_signal_keeps_the_signal_exit_status` 钉住这一点）。把崩溃静默掉才是更坏的选择：
+用户会拿到一个行为异常但不报错的程序。
