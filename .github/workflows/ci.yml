@@ -62,21 +62,21 @@ jobs:
       - name: Unit tests
         run: cargo test --lib
 
-      # Integration tests that need no external service. `cargo test --lib`
-      # above compiles and runs the library's own `#[cfg(test)]` modules only,
-      # so `--tests`-style targets were previously never executed by CI at all —
-      # `tests/logging.rs` had been silently unrun since it was added, and the
-      # help-coverage test would have joined it.
+      # Help-coverage test. It only reads source files and compares them against
+      # `src/help.rs`, so it needs no service and runs on every OS in the matrix —
+      # which is the point: "every dispatched key is documented" is a property of
+      # the source, not of the platform.
       #
-      # All of these are pure-Rust and platform-guarded where they are not (the
-      # logging and panic-hardening suites wrap their permission/signal/exit-status
-      # assertions in `#[cfg(unix)]`), so they run on every OS in the matrix
-      # rather than being Linux-only.
-      # `tests/e2e.rs` is excluded on purpose: it needs a real `sshd` and has its
-      # own job below (it is `#[ignore]`d, so it would otherwise pass trivially
-      # here while covering nothing).
-      - name: Integration tests
-        run: cargo test --test help_coverage --test logging --test panic_hardening
+      # `cargo test --lib` above only compiles the library's own `#[cfg(test)]`
+      # modules, so a `tests/*.rs` target is not executed by it. Without this step
+      # the whole guarantee of the in-app help would sit in a file CI never runs.
+      #
+      # `tests/logging.rs` and `tests/panic_hardening.rs` are *not* listed here:
+      # they drive the real binary and must not overlap, so they run in the
+      # dedicated `hardening` job below (`--test-threads=1`). `tests/e2e.rs` needs
+      # a real `sshd` and likewise has its own job.
+      - name: Help coverage
+        run: cargo test --test help_coverage
 
       - name: Build (release)
         run: cargo build --release
