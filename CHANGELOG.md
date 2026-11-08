@@ -112,6 +112,68 @@
 有对应事件）；[docs/logging.md](docs/logging.md) 增加「panic 加固」一节、13 个新事件和按症状
 索引的排查配方。
 
+## [0.3.0] - 2026-11-09
+
+本次是**纯重构版本**：不改变任何外部可观察行为（日志的 `event=` 值、帮助文案、键位、
+渲染文本逐字保持），目标是把单体大文件拆成高内聚、低耦合的小模块，并把安全约束
+从评审口径变成可执行断言。唯一的行为变化是「不再可能因内部错误 panic」这一类加固。
+
+### 重构
+
+- **大文件拆分为按职责命名的子模块**，公共 API 路径保持不变（父模块保留 `mod` + `pub use`）：
+  - `src/model.rs`（2532 行）→ `model/{tunnel,import,batch,failure,status,form,picker,msg,match}.rs`
+  - `src/ui.rs`（3095 行）→ `ui/{palette,text,frame,header,hints,table,selection,help,form,dropdown,confirm,detail,filter}.rs`；
+    `ui/import.rs` 再拆 `import/{body,header,footer,row,cursor}.rs`
+  - `src/logging.rs`（1522 行）→ `logging/{level,sink,format,panic,crash}.rs`
+  - `src/keys.rs`（1828 行）→ `keys/{main,select,form,import,dropdown,misc}.rs`
+  - `app/log.rs`（727 行，已删除）→ 顶层 `src/eventlog.rs` + `eventlog/{process,tunnel,ssh,user}.rs`
+  - `src/ssh/client.rs`（814 行）→ `ssh/client/{classify,handler,auth,connect,driver}.rs`
+  - `src/main.rs` → `main.rs`（入口 + 事件循环）+ `cli.rs`（参数解析与 `USAGE`）
+- **修掉依赖倒置**：`ssh/client.rs` 不再依赖 `crate::app::log`（事件词汇上移为顶层
+  `eventlog`）；`model` 与 `ui` 不再依赖 `help` 的渲染无关内容。
+- **`src/text.rs` 成为唯一字符串层**：显示宽度、截断、填充、双语拼接、双语渐进降级、
+  贪心折行、glob 匹配。此前 `ui` / `help` / `ssh` 各有一份拷贝并已漂移。
+- **单文件生产行数 ≤ 400、单函数 ≤ 60 行**，由 `tests/safety_guards.rs` 断言（`SIZE_EXEMPT`
+  为空，即没有例外）。
+
+### 安全加固
+
+- **`unsafe` 收口到 `src/logging/crash.rs` 一个文件**，文件头写明 SAFETY CONTRACT
+  （每块理由、只允许 async-signal-safe 调用、不得分配/加锁）；其余全仓安全 Rust，同样是断言。
+- **去掉 `main.rs` 里唯一的 `unsafe`**：信号注册改用 `signal_hook` 的安全 API，
+  行为不变（仍只做原子写、仍在循环结束后记录信号名、仍返回 `ExitCode::SUCCESS`）。
+- **消除 `src/help.rs` 的 `expect`**：14 个 section 的唯一性改为常量兜底 + 测试断言，不再 panic。
+- **`tests/safety_guards.rs`（新增）**：逐文件扫描生产代码，断言无 `.unwrap()` / `.expect()` /
+  `panic!` / `unreachable!` / `todo!`、`unsafe` 只出现在 `*crash*.rs` 且每块有 `// SAFETY:`、
+  每个源文件有 `//!` 模块文档、`src/lib.rs` 的每个 `pub mod` 都有真实文件。
+- `logging/crash.rs` 新增单元测试作为 `unsafe` 的看护证据：`build_signal_record` 的格式/截断/
+  边界（`i32::MIN`）、`push_int` 边界、`signal_name` 全覆盖。
+
+### 文档
+
+文档按「**AI agent 是主要读者**」重建信息架构：入口是 [docs/index.md](docs/index.md)
+（表格式「我想…→ 读哪篇 / 看哪个文件」），每篇开头 3–8 行写明「回答什么问题 / 不负责什么 /
+相关代码路径」，单篇 ≤ 400 行，同一事实只详述一处。
+
+- 新增 [docs/index.md](docs/index.md)（agent 入口）、[docs/architecture.md](docs/architecture.md)
+  （分层、逐文件模块地图、依赖方向规则、新功能放哪）、[docs/runtime.md](docs/runtime.md)
+  （隧道生命周期/就绪/重试/事件泵）、[docs/tui.md](docs/tui.md)（渲染与交互）、
+  [docs/security.md](docs/security.md)（panic/unsafe 政策、崩溃捕获、权限、脱敏）、
+  [docs/testing.md](docs/testing.md)（测试分层与怎么跑）、[docs/agents.md](docs/agents.md)
+  （给 agent 的改码约定与 checklist）、[docs/logging/events.md](docs/logging/events.md)（事件目录整表）。
+- [docs/design.md](docs/design.md) **文件名保留**（`src/` 多处引用），内容重写为「设计决策索引」：
+  30 条决策各 1 段 + 链接到新文档，不再与 README / import-forwards 重复叙述。
+- [docs/import-forwards.md](docs/import-forwards.md)、[docs/logging.md](docs/logging.md)
+  精简：保留规则、坑与排查配方，例子与长论证收进小节；事件整表搬到 `logging/events.md`。
+- [docs/keymap.md](docs/keymap.md) 重排（加开头路标与格式约定），**未删除任何按键 token**
+  ——它被 `tests/help_coverage.rs` 用 `include_str!` 校验，删 token 会让测试失败。
+- [docs/research/README.md](docs/research/README.md)（新增）声明该目录是**历史调研，不是当前事实来源**。
+- [README.md](README.md) 精简到用户视角（是什么 / 装 / 用 / 风险 / 配置 / 排查 / 开发），
+  内部结构一律链接 [docs/index.md](docs/index.md)；删掉与 `design.md`、
+  `import-forwards.md` 互相复制的大段内容。
+- 修正 v0.2.1 文档里记录但**代码从未 emit** 的 `tunnel.state` 事件：状态变化由
+  `tunnel.ready` / `tunnel.exit` / `tunnel.retry_scheduled` / `tunnel.failed` 表达。
+
 ## [0.2.1] - 2026-11-08
 
 ### 新增
@@ -210,7 +272,8 @@
 - 不统计流量；同一主机多条转发各自建连，未做连接复用。
 - macOS 走 Unix 分支，未实测。
 
-[Unreleased]: https://github.com/can2049/sshpf/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/can2049/sshpf/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/can2049/sshpf/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/can2049/sshpf/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/can2049/sshpf/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/can2049/sshpf/compare/v0.1.0...v0.1.1
