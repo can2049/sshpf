@@ -737,8 +737,9 @@ const HELP_ITEMS: &[(&str, &str)] = &[
     ("表单内：", ""),
     ("tab / ↑↓", "切换字段"),
     ("← / →", "切换转发类型 L / R / D"),
-    ("enter/↓", "在 SSH 主机字段展开 ~/.ssh/config 下拉"),
-    ("space / i", "展开 / 收起「从 ~/.ssh/config 导入转发」面板"),
+    ("enter", "在 SSH 主机字段展开 ~/.ssh/config 下拉"),
+    ("选中主机", "其声明的转发自动列进导入面板，且默认全部勾选"),
+    ("space / i", "收起 / 重新展开「从 ~/.ssh/config 导入转发」面板"),
     ("enter", "校验并保存（保存后立即连接）"),
     ("esc", "取消编辑（有未保存内容会确认）"),
     ("", ""),
@@ -877,7 +878,7 @@ fn draw_form(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     let current_idx = FormField::ORDER.iter().position(|f| *f == form.field).unwrap_or(0);
 
     let lines = form_field_lines(app, form, p, value_w, current_idx);
-    let extra = form_notes(form, p, inner.width as usize);
+    let mut extra = form_notes(form, p, inner.width as usize);
 
     // Reserve the pane out of the bottom, but only after the fields and their
     // notes have their rows: on a short terminal the pane is what shrinks (and
@@ -891,6 +892,19 @@ fn draw_form(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
                 let pane = Rect { x: inner.x, y: inner.y + body.height, width: inner.width, height: room };
                 (body, Some(pane))
             } else {
+                // The pane does not fit, but `import_open` is still true and the
+                // submit path keys off it: `ctrl+s` would create the ticked rows
+                // while the user cannot see a single one of them. Say so instead
+                // of silently acting on an invisible table — and point at the key
+                // that gets them out of that state.
+                if form.import_open && !form.import.is_empty() {
+                    let msg = format!(
+                        "⚠ 终端太矮，导入面板未显示；ctrl+s 仍会按已勾选的 {} 条创建。i 收起面板可改用手填",
+                        form.import.checked_count()
+                    );
+                    extra
+                        .push(Line::from(Span::styled(truncate_to_width(&msg, inner.width as usize), p.fg(p.pending))));
+                }
                 (inner, None)
             }
         }
@@ -2097,6 +2111,25 @@ mod tests {
         }
         let text = render_to_text(&mut app, 120, 45);
         assert!(text.contains("监听:8"), "the column being typed into must echo the input:\n{text}");
+    }
+
+    #[test]
+    fn a_terminal_too_short_for_the_pane_says_the_batch_will_still_be_created() {
+        // The pane shrinks away on a short terminal, but `import_open` stays true
+        // and `submit_form` keys off it: `ctrl+s` creates the ticked rows even
+        // though not one of them is on screen. Silence there means creating
+        // tunnels the user cannot see, so the form has to say it.
+        let mut app = app_with_import(sample_forwards());
+        let text = render_to_text(&mut app, 100, 14);
+        assert!(!text.contains("从 ~/.ssh/config 导入转发"), "precondition: the pane does not fit:\n{text}");
+        assert!(text.contains("导入面板未显示"), "the invisible-batch state must be announced:\n{text}");
+        assert!(text.contains("ctrl+s"), "and it must say what ctrl+s will do:\n{text}");
+
+        // Collapsing the pane (which is what the message suggests) makes the
+        // warning moot: the form is back in charge and nothing is hidden.
+        app.close_import_pane();
+        let text = render_to_text(&mut app, 100, 14);
+        assert!(!text.contains("导入面板未显示"), "a collapsed pane has nothing hidden:\n{text}");
     }
 
     #[test]

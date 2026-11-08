@@ -307,15 +307,21 @@ impl App {
     /// for confirmation (editing an existing one, which replaces a running
     /// process and therefore drops live connections).
     pub fn submit_form(&mut self) {
-        // The import pane, once it has loaded rows, owns the submit: it lists what
+        // The import pane owns the submit *while it is on screen*: it lists what
         // the host already declares, so those rows are the intent and the port
         // fields are only a scratch pad. Validating the scratch fields would
         // reject a perfectly good batch (they are typically empty once the pane is
         // in use) — and worse, unticking every row would fall through to the
         // single-field path and report "名称不能为空", which describes a field the
         // user is not even looking at.
+        //
+        // The pane is open by default now, so "has rows" alone would hijack the
+        // submit for someone who collapsed it on purpose to type one forward by
+        // hand. Visibility, not row count, is what says which of the two the user
+        // is working with.
         if let Some(form) = self.form.as_ref()
             && !form.is_modifying()
+            && form.import_open
             && !form.import.is_empty()
         {
             self.commit_form_create_from_import();

@@ -172,8 +172,13 @@ fn handle_form_key(app: &mut App, key: KeyEvent) {
     if app.host_picker_open() && handle_dropdown_key(app, key) {
         return;
     }
-    // The import pane, when open, owns its own navigation and filter keys.
-    if app.import_pane_open() && handle_import_key(app, key) {
+    // The import pane owns its row/filter keys, but *not* while a text field is
+    // being edited: the pane is open by default as soon as a host is committed,
+    // and `j`/`a`/`i` are ordinary letters in a tunnel name. Without this guard,
+    // typing `api` into 名称 would tick every row (`a`), leave the letters that
+    // are not bindings, and close the pane (`i`).
+    if !app.form.as_ref().is_some_and(|f| f.is_editing_field()) && app.import_pane_open() && handle_import_key(app, key)
+    {
         return;
     }
 
@@ -1100,6 +1105,66 @@ mod tests {
         assert!(!app.form.as_ref().unwrap().import.rows[0].checked);
         handle_key(&mut app, ch(' '));
         assert!(app.form.as_ref().unwrap().import.rows[0].checked);
+    }
+
+    // -- the pane is open by default, so typing must still win --------------
+
+    /// A create form with a host and a *default-open* pane holding three rows.
+    fn default_open_import_app() -> (tempfile::TempDir, App) {
+        let (d, mut app) = form_app();
+        let forwards = (0..3)
+            .map(|i| crate::model::SshForward {
+                kind: crate::model::ForwardKind::Local,
+                listen_addr: "127.0.0.1".into(),
+                listen_port: 19001 + i,
+                target_host: "10.0.0.1".into(),
+                target_port: 80,
+                host_alias: "testhost".into(),
+                line: (i as usize) + 1,
+                raw: format!("LocalForward {} 10.0.0.1:80", 19001 + i),
+            })
+            .collect();
+        {
+            let f = app.form.as_mut().unwrap();
+            f.ssh_host.set("testhost");
+            f.set_import_table("testhost", crate::model::ImportTable::new(forwards));
+            f.import_open = true;
+        }
+        (d, app)
+    }
+
+    #[test]
+    fn typing_a_name_is_not_swallowed_by_the_default_open_pane() {
+        // The pane now opens itself, so it must not steal `j`/`a`/`i`/`k` while a
+        // text field is being edited: those are ordinary letters in a tunnel name
+        // (`api-db`, `jenkins`). Without the guard, ticking a whole batch and
+        // closing the pane would happen behind the user as they type.
+        let (_d, mut app) = default_open_import_app();
+        assert!(app.import_pane_open(), "precondition: the pane is open by default");
+        app.form.as_mut().unwrap().field = FormField::Name;
+        handle_key(&mut app, key(KeyCode::Enter)); // start editing 名称
+        for c in "api-db".chars() {
+            handle_key(&mut app, ch(c));
+        }
+        assert_eq!(app.form.as_ref().unwrap().name.value(), "api-db", "letters must reach the field");
+        assert_eq!(app.form.as_ref().unwrap().import.checked_count(), 3, "`a` must not tick everything");
+        assert!(app.import_pane_open(), "`i` must not close the pane either");
+    }
+
+    #[test]
+    fn the_pane_takes_the_keys_back_once_editing_ends() {
+        // The guard is scoped to the editing stage, not "forever after the pane
+        // opened": `esc` out of the field and `j` walks the rows again.
+        let (_d, mut app) = default_open_import_app();
+        app.form.as_mut().unwrap().field = FormField::Name;
+        handle_key(&mut app, key(KeyCode::Enter));
+        handle_key(&mut app, ch('j'));
+        assert_eq!(app.form.as_ref().unwrap().name.value(), "j");
+        handle_key(&mut app, key(KeyCode::Esc)); // leave editing
+        assert!(!app.form.as_ref().unwrap().is_editing_field());
+        handle_key(&mut app, ch('j'));
+        assert_eq!(app.form.as_ref().unwrap().import.cursor, 1, "once not editing, j is the row cursor again");
+        assert_eq!(app.form.as_ref().unwrap().name.value(), "j", "and the field did not grow a second j");
     }
 
     #[test]
