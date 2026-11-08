@@ -5,8 +5,8 @@
 //! next to the action that runs makes it hard to add a risky operation without
 //! also adding its confirmation.
 
-use crate::app::log as eventlog;
 use crate::app::{App, ConfirmAction, Overlay};
+use crate::eventlog;
 use crate::help;
 use crate::model::{StatusMsg, TunnelId};
 
@@ -72,65 +72,78 @@ impl App {
     /// generic "continue?" and is reported to the log, because silently
     /// rendering nothing would leave a dialog the user cannot read and a
     /// `panic!` would kill a session over a UI string.
+    /// The sentence shown in the confirmation dialog for `action`.
+    ///
+    /// Named targets (delete / stop / restart / apply-edit) read better with the
+    /// tunnel's name; the rest describe a count or are fixed. Every sentence is
+    /// bilingual, Chinese first — the Chinese half is what the tests and the
+    /// user's scanning eye key off, the English half makes the dialog usable for
+    /// a non-Chinese reader.
+    ///
+    /// Split in two so the "which words for this action" table
+    /// ([`App::confirm_prompt`]) stays separate from the "which tunnel / how many"
+    /// arithmetic ([`App::named_prompt`] / [`App::count_prompt`]).
     fn confirm_prompt(&self, action: &ConfirmAction) -> String {
-        // Named targets (delete/stop/restart/apply-edit) read better with the
-        // tunnel's name in the sentence; the rest describe a count or are fixed.
-        //
-        // Every sentence is bilingual, Chinese first: the Chinese half is what
-        // the existing tests and the user's scanning eye key off, and the English
-        // half is what makes the dialog usable for a non-Chinese reader.
-        let named = |id: &TunnelId| self.tunnel(*id).map(|t| t.cfg.name.clone());
         match action {
-            ConfirmAction::Delete(id) => match named(id) {
-                Some(n) => help::bi(
-                    &format!("确认删除「{n}」？此操作不可撤销。"),
-                    &format!("Delete \"{n}\"? This cannot be undone."),
-                ),
-                None => unknown_target_prompt(action),
-            },
-            ConfirmAction::Stop(id) => match named(id) {
-                Some(n) => help::bi(
-                    &format!("确认停用「{n}」？将断开其现有连接。"),
-                    &format!("Stop \"{n}\"? Its live connection will be dropped."),
-                ),
-                None => unknown_target_prompt(action),
-            },
-            ConfirmAction::Restart(id) => match named(id) {
-                Some(n) => help::bi(
-                    &format!("确认重启「{n}」？连接会短暂中断。"),
-                    &format!("Restart \"{n}\"? The connection will briefly drop."),
-                ),
-                None => unknown_target_prompt(action),
-            },
-            ConfirmAction::ApplyEdit(id) => match named(id) {
-                Some(n) => help::bi(
-                    &format!("确认保存对「{n}」的修改？运行中的连接会重建。"),
-                    &format!("Save the changes to \"{n}\"? A running connection will be rebuilt."),
-                ),
-                None => unknown_target_prompt(action),
-            },
+            ConfirmAction::Delete(id)
+            | ConfirmAction::Stop(id)
+            | ConfirmAction::Restart(id)
+            | ConfirmAction::ApplyEdit(id) => self.named_prompt(action, id),
+            ConfirmAction::StopAll | ConfirmAction::StartAll | ConfirmAction::Quit => self.count_prompt(action),
+            ConfirmAction::DiscardForm => help::bi(
+                "确认放弃未保存的修改？已输入的内容会丢失。",
+                "Discard the unsaved changes? What you typed will be lost.",
+            ),
+            // The batch path builds its prompt from the action and the effective
+            // count, so this arm is only reachable if a caller forgot to do that.
+            ConfirmAction::Batch { action, count } => action.prompt(*count),
+        }
+    }
+
+    /// A sentence that names one tunnel, or the "it disappeared" fallback.
+    fn named_prompt(&self, action: &ConfirmAction, id: &TunnelId) -> String {
+        let Some(name) = self.tunnel(*id).map(|t| t.cfg.name.clone()) else {
+            return unknown_target_prompt(action);
+        };
+        let (zh, en) = match action {
+            ConfirmAction::Delete(_) => {
+                (format!("确认删除「{name}」？此操作不可撤销。"), format!("Delete \"{name}\"? This cannot be undone."))
+            }
+            ConfirmAction::Stop(_) => (
+                format!("确认停用「{name}」？将断开其现有连接。"),
+                format!("Stop \"{name}\"? Its live connection will be dropped."),
+            ),
+            ConfirmAction::Restart(_) => (
+                format!("确认重启「{name}」？连接会短暂中断。"),
+                format!("Restart \"{name}\"? The connection will briefly drop."),
+            ),
+            // A save always rebuilds a running connection, so say so.
+            _ => (
+                format!("确认保存对「{name}」的修改？运行中的连接会重建。"),
+                format!("Save the changes to \"{name}\"? A running connection will be rebuilt."),
+            ),
+        };
+        help::bi(&zh, &en)
+    }
+
+    /// A sentence built from the live counters (all-rows actions and quit).
+    fn count_prompt(&self, action: &ConfirmAction) -> String {
+        let counts = self.counts();
+        match action {
             ConfirmAction::StopAll => {
-                let n = self.counts().up + self.counts().starting + self.counts().retrying;
+                let n = counts.up + counts.starting + counts.retrying;
                 help::bi(
                     &format!("确认停用全部 {n} 条运行中的转发？将断开所有连接。"),
                     &format!("Stop all {n} running forwards? Every connection will be dropped."),
                 )
             }
             ConfirmAction::StartAll => {
-                let n = self.counts().off;
+                let n = counts.off;
                 help::bi(
                     &format!("确认启用全部转发？将新开 {n} 个监听端口。"),
                     &format!("Start all forwards? {n} new listening ports will open."),
                 )
             }
-            ConfirmAction::DiscardForm => help::bi(
-                "确认放弃未保存的修改？已输入的内容会丢失。",
-                "Discard the unsaved changes? What you typed will be lost.",
-            ),
-            // The batch path builds its prompt from the action and the
-            // effective count, so this arm is only reachable if a caller
-            // forgot to do that.
-            ConfirmAction::Batch { action, count } => action.prompt(*count),
             ConfirmAction::Quit => {
                 let running = self.supervisor.running_count();
                 if running == 0 {
@@ -142,6 +155,8 @@ impl App {
                     )
                 }
             }
+            // Only reachable if a caller passes a non-counted action here.
+            _ => unknown_target_prompt(action),
         }
     }
 

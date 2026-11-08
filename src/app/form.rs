@@ -4,12 +4,9 @@
 //! spawns, never persists, and can be unit-tested on its own. `App` owns one
 //! and drives it from key events.
 
-use crate::app::log as eventlog;
-use crate::app::{App, ConfirmAction};
+use crate::eventlog;
 use crate::help;
-use crate::model::{
-    self, FormField, FormMode, ForwardKind, ImportTable, InputBuf, TunnelConfig, TunnelId, TunnelView, now_unix,
-};
+use crate::model::{self, FormField, FormMode, ForwardKind, ImportTable, InputBuf, TunnelConfig, TunnelId, now_unix};
 use crate::ssh;
 
 /// How the form is currently being driven.
@@ -256,259 +253,103 @@ impl FormState {
 
     /// Build a config from the form; `Err` carries field-level problems.
     pub fn to_config(&self, id: TunnelId, existing: Option<&TunnelConfig>) -> Result<TunnelConfig, Vec<String>> {
-        let mut errs = Vec::new();
-        let name = self.name.value().trim().to_string();
-        let ssh_host = self.ssh_host.value().trim().to_string();
-        let local_addr = self.local_addr.value().trim().to_string();
-        let kind = self.kind();
-
-        if name.is_empty() {
-            errs.push(help::bi("名称不能为空", "Name must not be empty"));
-        }
-        if ssh_host.is_empty() {
-            errs.push(help::bi("SSH 主机不能为空", "SSH host must not be empty"));
-        }
-        if ssh_host.chars().any(char::is_whitespace) {
-            errs.push(help::bi("SSH 主机不能包含空格", "SSH host must not contain spaces"));
-        }
-        if kind != ForwardKind::Remote && local_addr.is_empty() {
-            errs.push(help::bi("本地地址不能为空", "Local address must not be empty"));
-        }
-
-        let mut local_port = 0u16;
-        match self.local_port.value().trim().parse::<u16>() {
-            Ok(0) | Err(_) => {
-                errs.push(help::bi("本地端口必须是 1-65535 的数字", "Local port must be a number 1-65535"));
-            }
-            Ok(p) => local_port = p,
-        }
-
-        let mut remote_port = 0u16;
-        let mut remote_host = String::new();
-        if kind != ForwardKind::Dynamic {
-            match self.remote_port.value().trim().parse::<u16>() {
-                Ok(0) | Err(_) => {
-                    errs.push(help::bi("远端端口必须是 1-65535 的数字", "Remote port must be a number 1-65535"));
-                }
-                Ok(p) => remote_port = p,
-            }
-            remote_host = self.remote_host.value().trim().to_string();
-            if remote_host.is_empty() {
-                errs.push(help::bi("远端地址不能为空", "Remote address must not be empty"));
-            }
-        }
-
+        let draft = self.draft();
+        let errs = self.validate(&draft);
         if !errs.is_empty() {
             return Err(errs);
         }
+        Ok(self.assemble(draft, id, existing))
+    }
 
-        Ok(TunnelConfig {
+    /// The trimmed text of every field, before any validation.
+    fn draft(&self) -> Draft {
+        Draft {
+            name: self.name.value().trim().to_string(),
+            ssh_host: self.ssh_host.value().trim().to_string(),
+            local_addr: self.local_addr.value().trim().to_string(),
+            local_port: parse_port(self.local_port.value()),
+            remote_host: self.remote_host.value().trim().to_string(),
+            remote_port: parse_port(self.remote_port.value()),
+            kind: self.kind(),
+        }
+    }
+
+    /// Every validation failure at once, in the order the fields appear on
+    /// screen, so the user fixes one pass instead of one field per attempt.
+    fn validate(&self, d: &Draft) -> Vec<String> {
+        let mut errs = Vec::new();
+        if d.name.is_empty() {
+            errs.push(help::bi("名称不能为空", "Name must not be empty"));
+        }
+        if d.ssh_host.is_empty() {
+            errs.push(help::bi("SSH 主机不能为空", "SSH host must not be empty"));
+        }
+        if d.ssh_host.chars().any(char::is_whitespace) {
+            errs.push(help::bi("SSH 主机不能包含空格", "SSH host must not contain spaces"));
+        }
+        if d.kind != ForwardKind::Remote && d.local_addr.is_empty() {
+            errs.push(help::bi("本地地址不能为空", "Local address must not be empty"));
+        }
+        if d.local_port == 0 {
+            errs.push(help::bi("本地端口必须是 1-65535 的数字", "Local port must be a number 1-65535"));
+        }
+        // A dynamic (`-D`) forward has no remote side at all, so its remote
+        // fields are neither required nor validated.
+        if d.kind != ForwardKind::Dynamic {
+            if d.remote_port == 0 {
+                errs.push(help::bi("远端端口必须是 1-65535 的数字", "Remote port must be a number 1-65535"));
+            }
+            if d.remote_host.is_empty() {
+                errs.push(help::bi("远端地址不能为空", "Remote address must not be empty"));
+            }
+        }
+        errs
+    }
+
+    /// Build the persisted config, carrying over the fields the form does not
+    /// expose (`enabled`, `ssh_options`, `note`, `created_at`).
+    fn assemble(&self, d: Draft, id: TunnelId, existing: Option<&TunnelConfig>) -> TunnelConfig {
+        TunnelConfig {
             id,
-            name,
-            kind,
-            ssh_host,
-            local_addr,
-            local_port,
-            remote_host,
-            remote_port,
+            name: d.name,
+            kind: d.kind,
+            ssh_host: d.ssh_host,
+            local_addr: d.local_addr,
+            local_port: d.local_port,
+            remote_host: if d.kind == ForwardKind::Dynamic { String::new() } else { d.remote_host },
+            remote_port: if d.kind == ForwardKind::Dynamic { 0 } else { d.remote_port },
             enabled: existing.map(|e| e.enabled).unwrap_or(true),
             auto_restart: self.auto_restart,
             ssh_options: existing.map(|e| e.ssh_options.clone()).unwrap_or_default(),
             note: existing.map(|e| e.note.clone()).unwrap_or_default(),
             created_at: existing.map(|e| e.created_at).filter(|v| *v != 0).unwrap_or_else(now_unix),
-        })
+        }
     }
 }
-// ---------------------------------------------------------------------------
-// Form-driven App operations
-// ---------------------------------------------------------------------------
-//
-// Saving the form touches three collaborators (validation, persistence, the
-// process supervisor), so it needs `App`; but it is entirely about the form,
-// hence it lives next to the form state rather than in the orchestration file.
 
-impl App {
-    /// Validate the open form and either save immediately (new tunnel) or ask
-    /// for confirmation (editing an existing one, which replaces a running
-    /// process and therefore drops live connections).
-    pub fn submit_form(&mut self) {
-        // The import pane owns the submit *while it is on screen*: it lists what
-        // the host already declares, so those rows are the intent and the port
-        // fields are only a scratch pad. Validating the scratch fields would
-        // reject a perfectly good batch (they are typically empty once the pane is
-        // in use) — and worse, unticking every row would fall through to the
-        // single-field path and report "名称不能为空", which describes a field the
-        // user is not even looking at.
-        //
-        // The pane is open by default now, so "has rows" alone would hijack the
-        // submit for someone who collapsed it on purpose to type one forward by
-        // hand. Visibility, not row count, is what says which of the two the user
-        // is working with.
-        if let Some(form) = self.form.as_ref()
-            && !form.is_modifying()
-            && form.import_open
-            && !form.import.is_empty()
-        {
-            self.commit_form_create_from_import();
-            return;
-        }
+/// The trimmed text of every editable field, before validation.
+///
+/// A named struct rather than a tuple: the validation and assembly steps both
+/// read it, and a six-field tuple would make a field swap a silent bug.
+struct Draft {
+    name: String,
+    ssh_host: String,
+    local_addr: String,
+    local_port: u16,
+    remote_host: String,
+    remote_port: u16,
+    kind: ForwardKind,
+}
 
-        let Some(cfg) = self.validated_form_config() else {
-            return;
-        };
-        match cfg.clone() {
-            // Creating a tunnel is additive and easily undone by deleting it,
-            // so it saves straight away and connects immediately.
-            _ if matches!(self.form.as_ref().map(|f| f.mode), Some(FormMode::Create)) => {
-                self.commit_form_create(cfg);
-            }
-            // Editing rewrites persisted config and bounces a live process.
-            _ => {
-                let id = cfg.id;
-                self.pending_form = Some(cfg);
-                self.ask_confirm(ConfirmAction::ApplyEdit(id));
-            }
-        }
-    }
-
-    /// Turn the current form into a validated `TunnelConfig`, reporting field
-    /// errors into the form instead of acting when anything is wrong.
-    fn validated_form_config(&mut self) -> Option<TunnelConfig> {
-        let form = self.form.clone()?;
-        let existing = match form.mode {
-            FormMode::Edit(id) => self.cfg.find(id).cloned(),
-            FormMode::Create => None,
-        };
-        let id = match form.mode {
-            FormMode::Edit(id) => id,
-            // A hand-edited `id = u64::MAX` leaves no allocatable id; report it
-            // like any other validation problem instead of overflowing.
-            FormMode::Create => match self.next_tunnel_id() {
-                Some(id) => id,
-                None => {
-                    if let Some(f) = self.form.as_mut() {
-                        f.errors = vec!["无法分配新的转发编号，请检查配置中的 id".to_string()];
-                    }
-                    return None;
-                }
-            },
-        };
-        let mut cfg = match form.to_config(id, existing.as_ref()) {
-            Ok(c) => c,
-            Err(errs) => {
-                if let Some(f) = self.form.as_mut() {
-                    f.errors = errs;
-                }
-                return None;
-            }
-        };
-        // Cross-entry conflict: same listen endpoint as another enabled tunnel.
-        if let Some(conflict) = self.listen_conflict(&cfg) {
-            if let Some(f) = self.form.as_mut() {
-                f.errors = vec![help::bi(
-                    &format!("监听地址与「{conflict}」冲突"),
-                    &format!("Listen endpoint collides with \"{conflict}\""),
-                )];
-            }
-            return None;
-        }
-        cfg.name = self.cfg.unique_name(
-            &cfg.name,
-            match form.mode {
-                FormMode::Edit(id) => Some(id),
-                FormMode::Create => None,
-            },
-        );
-        Some(cfg)
-    }
-
-    fn commit_form_create(&mut self, mut cfg: TunnelConfig) {
-        cfg.enabled = true;
-        eventlog::tunnel_created(&cfg, "form");
-        self.cfg.tunnels.push(cfg.clone());
-        // Remember where the row landed *before* pushing, rather than recovering
-        // it as `len() - 1` afterwards: the arithmetic is the same today, but it
-        // stops being an underflow trap if the push ever moves.
-        let pos = self.tunnels.len();
-        self.tunnels.push(TunnelView::new(cfg.clone()));
-        let vis = self.visible_indices();
-        self.selected = vis.iter().position(|i| *i == pos).unwrap_or(vis.len().saturating_sub(1));
-        self.start_tunnel_with(cfg.id, "created");
-        self.close_overlay();
-        self.persist_quietly();
-    }
-
-    /// Apply the pending edit that the user confirmed.
-    pub(crate) fn commit_form_edit(&mut self, eid: TunnelId) {
-        let Some(cfg) = self.pending_form.take() else {
-            return;
-        };
-        if let Some(slot) = self.cfg.find_mut(eid) {
-            let keep_enabled = slot.enabled;
-            let mut next = cfg.clone();
-            next.id = eid;
-            next.enabled = keep_enabled || next.enabled;
-            *slot = next;
-        }
-        if let Some(v) = self.tunnels.iter_mut().find(|t| t.cfg.id == eid) {
-            let enabled = v.cfg.enabled;
-            v.cfg = cfg.clone();
-            v.cfg.id = eid;
-            v.cfg.enabled = enabled || v.cfg.enabled;
-        }
-        if let Some(view) = self.tunnels.iter().find(|t| t.cfg.id == eid) {
-            eventlog::tunnel_updated(&view.cfg);
-        }
-        self.supervisor.stop(eid);
-        self.forget_runtime_state(eid);
-        self.start_tunnel_with(eid, "edited");
-        self.close_overlay();
-        self.persist_quietly();
-    }
-
-    /// Whether the open form has changes worth warning about when discarding.
-    pub fn form_has_unsaved_edits(&self) -> bool {
-        let Some(form) = self.form.as_ref() else {
-            return false;
-        };
-        match form.mode {
-            FormMode::Create => {
-                !form.ssh_host.value().trim().is_empty()
-                    || !form.name.value().trim().is_empty()
-                    || !form.remote_port.value().trim().is_empty()
-                    || !form.local_port.value().trim().is_empty()
-            }
-            // Editing: compare against the stored definition.
-            FormMode::Edit(id) => match self.cfg.find(id) {
-                Some(orig) => {
-                    form.name.value() != orig.name
-                        || form.ssh_host.value() != orig.ssh_host
-                        || form.local_addr.value() != orig.local_addr
-                        || form.local_port.value() != orig.local_port.to_string()
-                        || form.remote_host.value() != orig.remote_host
-                        || form.remote_port.value() != orig.remote_port.to_string()
-                        || form.kind() != orig.kind
-                        || form.auto_restart != orig.auto_restart
-                }
-                None => true,
-            },
-        }
-    }
-
-    /// Request closing the form, asking first if there is unsaved input.
-    pub fn request_close_form(&mut self) {
-        if self.form_has_unsaved_edits() {
-            self.ask_confirm(ConfirmAction::DiscardForm);
-        } else {
-            self.close_overlay();
-        }
-    }
+/// `0` for anything that is not a valid 1..=65535 number, so the caller has one
+/// failure to report instead of two shapes (`Err` and `Ok(0)`).
+fn parse_port(text: &str) -> u16 {
+    text.trim().parse::<u16>().unwrap_or(0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ConfigFile, Paths};
     use crate::model::InputBuf;
 
     fn create_form() -> FormState {
@@ -709,62 +550,5 @@ mod tests {
         f.revalidate();
         // The buffer is not edited here, but `to_config` reads it.
         let _ = f.to_config(1, None);
-    }
-
-    #[test]
-    fn an_exhausted_id_space_is_reported_into_the_form() {
-        let dir = tempfile::tempdir().unwrap();
-        let paths = Paths { config: dir.path().join("config.toml"), state: dir.path().join("state.toml") };
-        let mut cfg = ConfigFile::default();
-        cfg.tunnels.push(crate::model::TunnelConfig {
-            id: u64::MAX,
-            name: "huge".into(),
-            kind: ForwardKind::Local,
-            ssh_host: "h".into(),
-            local_addr: "127.0.0.1".into(),
-            local_port: 18001,
-            remote_host: "127.0.0.1".into(),
-            remote_port: 22,
-            enabled: false,
-            auto_restart: false,
-            ssh_options: vec![],
-            note: String::new(),
-            created_at: 1,
-        });
-        crate::config::save(&paths.config, &cfg).unwrap();
-        let mut app = App::new(paths);
-        app.open_form_create();
-        {
-            let f = app.form.as_mut().unwrap();
-            f.ssh_host.set("host");
-            f.name.set("fresh");
-            f.remote_port.set("22");
-            f.local_port.set("18002");
-        }
-        app.submit_form();
-        assert_eq!(app.tunnels.len(), 1, "no new definition without a free id");
-        let errors = app.form.as_ref().map(|f| f.errors.clone()).unwrap_or_default();
-        assert!(errors.iter().any(|e| e.contains("编号")), "{errors:?}");
-    }
-
-    #[test]
-    fn a_new_tunnel_lands_on_the_row_it_was_added_at() {
-        // `commit_form_create` used to recover the new row as `len() - 1`; the
-        // cursor must still land on that row.
-        let dir = tempfile::tempdir().unwrap();
-        let paths = Paths { config: dir.path().join("config.toml"), state: dir.path().join("state.toml") };
-        crate::config::save(&paths.config, &ConfigFile::default()).unwrap();
-        let mut app = App::new(paths);
-        app.open_form_create();
-        {
-            let f = app.form.as_mut().unwrap();
-            f.ssh_host.set("host");
-            f.name.set("fresh");
-            f.remote_port.set("22");
-            f.local_port.set("18003");
-        }
-        app.submit_form();
-        assert_eq!(app.tunnels.len(), 1);
-        assert_eq!(app.selected_tunnel().map(|t| t.cfg.name.as_str()), Some("fresh"));
     }
 }

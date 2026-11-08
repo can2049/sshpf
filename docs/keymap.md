@@ -1,15 +1,14 @@
 # 键位参考 / Keymap reference
 
-sshpf 的**全部**按键与鼠标操作，按上下文分组。每一行都给出中文与英文说明。
+> **这份文档回答**：某个键（或鼠标手势）在当前上下文里做什么？界面底部提示和 `?` 帮助里写的是真的吗？
+> **不负责**：为什么这样设计（见 [design.md](design.md)）、渲染规则（见 [tui.md](tui.md)）、按键路由代码结构（见 [architecture.md](architecture.md#keys-键分发--srckeys)）。
+> **相关代码路径**：`src/keys/`（真正的 dispatch）、`src/help.rs`（界面内帮助目录，本文与之同源）、`tests/help_coverage.rs`（机器校验）。
+>
+> **本文被 `tests/help_coverage.rs` 用 `include_str!` 嵌入并校验**：帮助目录里的每个 token 都必须在本文中以反引号出现。**不要删除任何按键 token**，只加不删。
+> This page is parsed by `tests/help_coverage.rs`; every catalog token must appear here as a backticked cell. Never delete a token.
 
-Every key and mouse gesture sshpf understands, grouped by context. Each row is
-given in Chinese **and** English.
-
-> 界面内随时按 `?` 打开分区帮助，内容与本文一致（帮助浮层是同一份数据渲染出来的）。
-> Press `?` anywhere to open the in-app help; it renders the same catalog as this page.
-
-相关文档 / Related docs：[README](../README.md) · [设计说明](design.md) ·
-[导入转发](import-forwards.md) · [诊断日志](logging.md)
+界面内随时按 `?` 打开分区帮助，内容与本文一致（帮助浮层是同一份数据渲染出来的）。
+Press `?` anywhere to open the in-app help; it renders the same catalog as this page.
 
 ## 目录 / Contents
 
@@ -272,6 +271,16 @@ The classified failure reason and the raw ssh stderr are kept here in full; the 
 | `enter` | 保留过滤并关闭输入 | Keep the filter and close the input |
 | `esc` | 清除过滤并关闭输入 | Clear the filter and close the input |
 
+三种约定 / Three conventions:
+
+- **中文在前、英文在后**（`中文 English`）是界面所有文案的统一形式，窄列放不下时用
+  `text::fit` 退化为纯中文。Chinese always comes first; narrow columns fall back to
+  Chinese-only via `text::fit`.
+- 并列可选的键写作 `a / b`。Parallel alternatives are written `a / b`.
+- 组合键用 `+` 连接，不分隔：`ctrl+s`、`shift+tab`。Modifiers use `+` and stay glued.
+
+---
+
 ## 帮助浮层 / Help overlay
 
 按 `?` 打开的这份帮助。它按上下文分区，内容就是本文的数据来源。
@@ -284,28 +293,8 @@ This help, opened with `?`. It is split by context and is the data source for th
 | `pgdn` / `pgup` | 向下 / 向上翻页 | Page down / up |
 | `?` / `esc` / `q` / `enter` | 关闭帮助 | Close the help |
 
-说明 / Notes: 浮层每行是「键列 | 中文 | 英文」。键列宽度不是写死的，而是**按目录里最宽的
-绑定实测**得出（钳制在 10~22 列，且不超过半行）——写死过一次 12，比 `g / G / home / end`
-（18）和 `J / K / shift+↓ / shift+↑`（25）都窄，于是绑定直接贴到说明上。因此：
-
-- 双语放不下时，中文先排、英文换到续行并缩进到键列之后（**换行不截断**，任何一边都不丢）；
-- 少数**超长组合键会单独占一行**，说明从下一行按键列缩进开始；
-- note 行没有键列，整行 prose，中文在上、英文在下。
-
-滚动上限按**折行后的实际行数**计算，所以到底不会卡住也不会留白。
-
-Each row is a measured key cell plus Chinese and English. The key column is not a
-hard-coded width: it is the widest binding in the catalog, clamped to 10–22 cells and to
-at most half the row. A fixed 12 was tried and was narrower than `g / G / home / end` (18)
-and `J / K / shift+↓ / shift+↑` (25), which glued bindings onto their descriptions. So:
-
-- when both languages do not fit, Chinese is laid out first and English moves to continuation
-  lines indented past the key column (**wrapped, never truncated** — neither language is lost);
-- the few **very long bindings take a row of their own**, with the description starting on the
-  next row at the key-column indent;
-- note rows have no key cell: they are full-width prose, Chinese above English.
-
-The scroll limit counts the wrapped lines, so it neither sticks nor leaves blank at the end.
+说明 / Notes: 浮层每行是「键列 | 中文 | 英文」，键列宽度**实测**得出（目录里最宽的 binding +2，钳制 10~22 列且不超半行——写死 12 曾窄于 `g / G / home / end`（18）和 `J / K / shift+↓ / shift+↑`（25），于是绑定直接贴住说明）；放不下时中文先排、英文换到续行；超长组合键独占一行；note 行整行 prose。滚动上限按**折行后的实际行数**计算。渲染规则见 [tui.md](tui.md#浮层--overlays)。
+Notes: key cell width is measured, English wraps to continuation lines, over-long bindings take a row of their own, and the scroll limit counts wrapped lines. See [tui.md](tui.md#浮层--overlays).
 
 ## 鼠标 / Mouse
 

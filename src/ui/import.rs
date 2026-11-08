@@ -1,26 +1,47 @@
 //! The "import the forwards `~/.ssh/config` already declares" pane.
 //!
-//! Rendered *inside* the create form (see [`crate::ui::draw_form`]): the form
-//! stays the single place where a new tunnel is defined, and this pane is the
-//! shortcut for a host that already describes what should be forwarded, so the
-//! user does not retype ports that sit in the config file next to it.
+//! Rendered *inside* the create form (see [`crate::ui::form::draw_form`]): the
+//! form stays the single place where a new tunnel is defined, and this pane is
+//! the shortcut for a host that already describes what should be forwarded, so
+//! the user does not retype ports that sit in the config file next to it.
 //!
 //! Pure rendering like the rest of `ui`: it reads `form.import`, draws, and
-//! records what it drew into the mouse [`HitMap`]. Nothing here mutates state —
-//! the pane's scroll/window correction is computed locally for the same reason.
+//! records what it drew into the mouse [`crate::ui::hit::HitMap`]. Nothing here
+//! mutates state — the pane's scroll/window correction is computed locally for
+//! the same reason.
+//!
+//! # Module map
+//!
+//! | file | what it draws |
+//! |---|---|
+//! | this file | the pane frame, its title, and the empty/error states |
+//! | [`body`] | the visible rows and the scroll window that selects them |
+//! | [`header`] | column headers, filter chips, select/filter buttons |
+//! | [`footer`] | the selection summary and the wrapped key hints |
+//! | [`row`] | column geometry and one rendered row |
+//! | [`cursor`] | the span builder that keeps hits aligned with drawn text |
+//!
+//! Adding a column: [`row`] (width) + [`header`] (label) + [`crate::model::ImportColumn`].
+//! Adding a key: [`footer`]'s `HINTS` and `crate::help::import`.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
 use crate::app::App;
-use crate::help;
-use crate::model::{ImportColumn, ImportRow, ImportTable};
-use crate::text::{display_width, pad_to_width, truncate_to_width};
-use crate::ui::hit::{HitMap, HitTarget};
-use crate::ui::{Palette, palette};
+use crate::text::{fit, truncate_to_width};
+use crate::ui::hit::HitMap;
+use crate::ui::palette::{Palette, palette};
+
+pub mod body;
+pub mod cursor;
+pub mod footer;
+pub mod header;
+pub mod row;
+
+use body::draw_body;
 
 /// Preferred height of the pane. `ui::draw_form` adds this to the popup it would
 /// draw anyway, so the form grows instead of squeezing the fields.
@@ -35,67 +56,6 @@ pub const PREF_HEIGHT: u16 = 19;
 /// space for its own fields (a pane with no row in it is pure noise).
 pub const MIN_HEIGHT: u16 = 8;
 
-/// The checkbox column: ` [x]` / ` [ ]` / ` [–]`, with `▸` marking the cursor
-/// row. The cursor keeps a *symbol* as well as the highlight bar so a NO_COLOR
-/// run still shows where the selection is.
-const CHECK_W: u16 = 4;
-
-/// Rows the footer gets: the state summary plus the bilingual key hints. Six is
-/// what the twelve bindings need at the form's default width; when the pane is
-/// shorter the hints first drop to Chinese-only (denser, so nothing is lost) and
-/// only then clip.
-const FOOTER_H: u16 = 6;
-
-/// Separator between two hints on the same footer row.
-const HINT_SEP: &str = " · ";
-
-/// Base minimum width of the type column (its Chinese label plus the `▾` marker).
-const MIN_KIND_W: u16 = 5;
-const MIN_LISTEN_W: u16 = 9;
-const MIN_TARGET_W: u16 = 9;
-const MIN_RAW_W: u16 = 9;
-
-/// One footer key hint: the binding, its Chinese wording, its English wording.
-///
-/// Mirrors `keys.rs` exactly; see the module docs for the rules that matter:
-/// `a` is a toggle (not "全不选"), there is no `c`/`A`, `space` ticks a row once
-/// the pane is open (so the pane closes with `i`/`esc`), and a literal `f`
-/// always means "next column" — it can never be typed into a filter.
-struct Hint {
-    keys: &'static str,
-    zh: &'static str,
-    en: &'static str,
-}
-
-impl Hint {
-    /// `space 勾选` — used when the bilingual form does not fit one row.
-    fn zh_text(&self) -> String {
-        format!("{} {}", self.keys, self.zh)
-    }
-
-    /// `space 勾选 / Select`
-    fn bi_text(&self) -> String {
-        format!("{} {} / {}", self.keys, self.zh, self.en)
-    }
-}
-
-/// Footer key hints, in reading order: the tick and filter keys first (the
-/// pane's main job), then movement, then how to leave.
-const HINTS: &[Hint] = &[
-    Hint { keys: "space", zh: "勾选", en: "Select" },
-    Hint { keys: "f/←→", zh: "选列", en: "Column" },
-    Hint { keys: "F", zh: "清该列", en: "Clear" },
-    Hint { keys: "ctrl+r", zh: "清全部", en: "All" },
-    Hint { keys: "z", zh: "撤销", en: "Undo" },
-    Hint { keys: "a/U/I", zh: "全选/全不选/反选", en: "All/None/Invert" },
-    Hint { keys: "j/k ↑↓", zh: "移动", en: "Move" },
-    Hint { keys: "g/G", zh: "首尾", en: "Top/End" },
-    Hint { keys: "pgup/pgdn", zh: "翻页", en: "Page" },
-    Hint { keys: "enter", zh: "结束筛选", en: "Done" },
-    Hint { keys: "esc/i", zh: "收起", en: "Close" },
-    Hint { keys: "ctrl+s", zh: "保存", en: "Save" },
-];
-
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -108,9 +68,10 @@ pub fn draw_pane(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     }
     let p = palette();
     let host = form.ssh_host.value();
-    let title = help::fit(
+    let title = fit(
         &format!(" 从 ~/.ssh/config 导入转发 · {host} "),
         &format!(" Import forwards from ~/.ssh/config · {host} "),
+        " ",
         area.width.saturating_sub(2) as usize,
     );
     let block = Block::default()
@@ -146,930 +107,235 @@ fn draw_empty(frame: &mut Frame, app: &App, inner: Rect, p: Palette) {
         ),
     };
     let first = match en {
-        Some(en) => help::fit(&zh, en, width),
+        Some(en) => fit(&zh, en, " ", width),
         None => truncate_to_width(&zh, width),
     };
     let lines = vec![
         Line::from(Span::styled(first, style)),
         Line::from(Span::styled(
-            help::fit("esc 收起 · 也可以直接在表单里手填端口", "esc Close · Or type the ports in the form", width),
+            fit("esc 收起 · 也可以直接在表单里手填端口", "esc Close · Or type the ports in the form", " ", width),
             p.fg(p.dim),
         )),
     ];
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-// ---------------------------------------------------------------------------
-// Body: header / rows / filters / buttons / footer
-// ---------------------------------------------------------------------------
-
-fn draw_body(frame: &mut Frame, table: &ImportTable, inner: Rect, p: Palette, hits: &mut HitMap) {
-    let width = inner.width as usize;
-    if inner.height < 3 {
-        // Not even a header + one row: show only the state summary rather than a
-        // half-painted table.
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(truncate_to_width(&footer_summary(table), width), p.fg(p.accent)))),
-            inner,
-        );
-        return;
-    }
-
-    // Reserve from the bottom up: the footer (summary + wrapped key hints), then
-    // the button row, then the chip line — each only while a header and at least
-    // one data row still fit above it. The footer's height depends on the pane
-    // width, so it is measured first and clipped rather than overflowing.
-    let max_footer_rows = inner.height.saturating_sub(2).max(1);
-    let hint_lines = pack_hints(width, (FOOTER_H.saturating_sub(1)).min(max_footer_rows.saturating_sub(1)) as usize);
-    let footer_rows = (1 + hint_lines.len() as u16).min(max_footer_rows);
-    let footer_y = inner.bottom() - footer_rows;
-    let mut list_bottom = footer_y;
-
-    let mut buttons_y = None;
-    if list_bottom > inner.y + 2 {
-        list_bottom -= 1;
-        buttons_y = Some(list_bottom);
-    }
-    let mut chips_y = None;
-    if table.has_filters() && list_bottom > inner.y + 2 {
-        list_bottom -= 1;
-        chips_y = Some(list_bottom);
-    }
-
-    let cols = columns(inner.width);
-    draw_header(frame, table, &cols, inner, p, hits);
-
-    let list_area =
-        Rect { x: inner.x, y: inner.y + 1, width: inner.width, height: list_bottom.saturating_sub(inner.y + 1) };
-    draw_rows(frame, table, &cols, list_area, inner, p, hits);
-
-    if let Some(y) = chips_y {
-        draw_chips(frame, table, inner, y, p, hits);
-    }
-    if let Some(y) = buttons_y {
-        draw_buttons(frame, table, inner, y, p, hits);
-    }
-    draw_footer(frame, table, inner, footer_y, inner.bottom(), &hint_lines, p);
-}
-
-/// One row per line: `▸[x] | T | 监听 | 目标 | 原始指令`.
-fn draw_rows(
-    frame: &mut Frame,
-    table: &ImportTable,
-    cols: &[ColSpec],
-    list_area: Rect,
-    inner: Rect,
-    p: Palette,
-    hits: &mut HitMap,
-) {
-    let visible = table.visible();
-    // The whole list area is one scrolling target; rows are pushed after it so a
-    // click on a row wins over the background.
-    hits.push(list_area, HitTarget::ImportList);
-
-    if visible.is_empty() {
-        let msg =
-            help::fit("没有匹配的行 · 按 F 清除筛选", "No matching rows · F clears the filter", inner.width as usize);
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(truncate_to_width(&msg, inner.width as usize), p.fg(p.dim)))),
-            Rect { height: 1, ..list_area },
-        );
-        return;
-    }
-    if list_area.height == 0 {
-        return;
-    }
-
-    let rows_h = list_area.height as usize;
-    let start = window_start(table, &visible, rows_h);
-    let mut lines: Vec<Line<'static>> = Vec::with_capacity(rows_h.min(visible.len()));
-    for (i, idx) in visible.iter().enumerate().skip(start).take(rows_h) {
-        let Some(row) = table.rows.get(*idx) else { continue };
-        // Belt and braces on top of `.take(rows_h)`: a row drawn below the pane
-        // must not get a hit rect, or a click on the form's own fields would
-        // resolve to an import row that is not actually there.
-        let y = list_area.y + lines.len() as u16;
-        if y >= list_area.bottom() {
-            break;
-        }
-        lines.push(row_line(row, i == table.cursor, cols, inner.width, p));
-        let rect = Rect { x: inner.x, y, width: inner.width, height: 1 };
-        // Two hits per row, narrow last: a click on the box toggles, a click
-        // anywhere else only moves the cursor there.
-        hits.push(rect, HitTarget::ImportRow(*idx));
-        hits.push(Rect { width: CHECK_W.min(inner.width), ..rect }, HitTarget::ImportCheckbox(*idx));
-    }
-    frame.render_widget(Paragraph::new(lines), list_area);
-}
-
-/// The first visible row to draw.
-///
-/// `ImportTable::scroll` is the anchor (`App` keeps it roughly right with its own
-/// row-count constant), but the pane's real row budget depends on the popup size,
-/// so the renderer nudges the window when the cursor would otherwise be outside
-/// it. Read-only on purpose: rendering must never move app state.
-fn window_start(table: &ImportTable, visible: &[usize], rows_h: usize) -> usize {
-    if visible.is_empty() {
-        return 0;
-    }
-    let rows_h = rows_h.max(1);
-    let last = visible.len() - 1;
-    let mut start = (table.scroll as usize).min(last);
-    let cursor = table.cursor.min(last);
-    if cursor < start {
-        start = cursor;
-    } else if cursor >= start + rows_h {
-        start = cursor + 1 - rows_h;
-    }
-    start
-}
-
-/// Header row. A filtered column shows `监听▾`; the column being typed into shows
-/// `监听:8080` and takes the text cursor, so it is obvious where input goes.
-///
-/// Each label comes from [`header_text`], which is bilingual while the column is
-/// wide enough and Chinese-only below that. The hit rect always spans the whole
-/// column (`spec.width`), so a truncated label is still fully clickable.
-fn draw_header(frame: &mut Frame, table: &ImportTable, cols: &[ColSpec], inner: Rect, p: Palette, hits: &mut HitMap) {
-    let mut spans: Vec<Span<'static>> = Vec::with_capacity(cols.len() + 2);
-    spans.push(Span::raw(" ".repeat(CHECK_W as usize + 1)));
-    let mut x = inner.x + CHECK_W + 1;
-    for (i, spec) in cols.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::raw(" "));
-            x += 1;
-        }
-        let editing = table.editing == Some(spec.col);
-        let filtered = !table.filter(spec.col).trim().is_empty();
-        let text = header_text(spec.col, table, spec.width);
-        let style = if editing {
-            p.focused().add_modifier(Modifier::BOLD)
-        } else if filtered {
-            p.fg(p.accent).add_modifier(Modifier::BOLD)
-        } else {
-            p.fg(p.dim).add_modifier(Modifier::BOLD)
-        };
-        spans.push(cell_span(&text, spec.width, style));
-        hits.push(Rect { x, y: inner.y, width: spec.width, height: 1 }, HitTarget::ImportColumnHeader(spec.col));
-        if editing {
-            // `text` is `label:value` with a user-typed value: unbounded, so the
-            // cursor offset is clamped in `usize` instead of wrapping a u16.
-            let want = usize::from(x) + display_width(&text);
-            let cap = usize::from(x) + usize::from(spec.width);
-            let cx = want.min(cap);
-            if cx < usize::from(inner.right())
-                && let Ok(cx) = u16::try_from(cx)
-            {
-                frame.set_cursor_position((cx, inner.y));
-            }
-        }
-        x += spec.width;
-    }
-    frame.render_widget(Paragraph::new(Line::from(spans)), Rect { height: 1, ..inner });
-}
-
-/// The label drawn in one column's header.
-///
-/// Three states, in priority order:
-///
-/// * being typed into → `监听:8080`, the literal filter text, so the user can see
-///   what they are entering and where the cursor is;
-/// * filtered → `监听▾ Listen`: the marker stays glued to the Chinese label (the
-///   existing `类型▾` assertion and, more importantly, the visual pairing of
-///   marker and column both depend on it), with the English half after it when
-///   the column is wide enough;
-/// * idle → `监听 Listen`, bilingual while the column is wide enough.
-///
-/// Every state falls back to Chinese only before it truncates, so a header never
-/// reads as a half English word.
-fn header_text(col: ImportColumn, table: &ImportTable, width: u16) -> String {
-    let cells = width as usize;
-    if table.editing == Some(col) {
-        return truncate_to_width(&format!("{}:{}", col.label(), table.filter(col)), cells);
-    }
-    let zh = col.label();
-    let en = col.label_en();
-    if !table.filter(col).trim().is_empty() {
-        let with_marker = format!("{zh}▾");
-        let both = format!("{with_marker} {en}");
-        return if display_width(&both) <= cells { both } else { with_marker };
-    }
-    if cells >= bilingual_width(col) as usize { help::bi(zh, en) } else { zh.to_string() }
-}
-
-/// Active filters as deletable chips: `筛选: 类型=R ×  监听=8080 × / Filter`.
-fn draw_chips(frame: &mut Frame, table: &ImportTable, inner: Rect, y: u16, p: Palette, hits: &mut HitMap) {
-    let mut line = LineCursor::new(inner.x, y, inner.right(), hits);
-    line.text("筛选: ", p.fg(p.dim));
-    for col in ImportColumn::ALL {
-        let value = table.filter(col).trim();
-        if value.is_empty() {
-            continue;
-        }
-        // Chinese label only: a chip is a narrow, clickable token and the `×` is
-        // its affordance; the bilingual form would push the second chip off the
-        // row long before a user needed it.
-        let chip = format!("{}={value} ×", col.label());
-        if !line.button(&chip, p.fg(p.accent).add_modifier(Modifier::BOLD), HitTarget::ImportFilterChip(col)) {
-            break;
-        }
-        line.gap(2);
-    }
-    // English half of the "筛选:" prefix, appended only when it still fits: the
-    // chips themselves are the important part of this row.
-    line.text(" / Filter", p.fg(p.dim));
-    frame.render_widget(Paragraph::new(line.finish()), Rect { x: inner.x, y, width: inner.width, height: 1 });
-}
-
-/// `全选 / 反选 / 全不选` and the filter actions. Disabled ones are dim and are
-/// *not* clickable, so a click never silently does nothing.
-///
-/// The five labels do not fit one row at the pane's usual width in bilingual
-/// form, and a button that is pushed off the row is a button the mouse cannot
-/// reach. So each label asks the cursor whether the bilingual form fits in what
-/// is left and drops to Chinese-only when it does not; the clickable rect is
-/// always the *rendered* width, so hit testing stays exact.
-fn draw_buttons(frame: &mut Frame, table: &ImportTable, inner: Rect, y: u16, p: Palette, hits: &mut HitMap) {
-    let mut line = LineCursor::new(inner.x, y, inner.right(), hits);
-    for (zh, en, target) in [
-        ("全选", "All", HitTarget::ImportCheckAll),
-        ("反选", "Invert", HitTarget::ImportInvert),
-        ("全不选", "None", HitTarget::ImportUncheckAll),
-    ] {
-        let label = line.fit_label(zh, en);
-        if !line.button(&label, p.fg(p.accent), target) {
-            break;
-        }
-        line.gap(1);
-    }
-
-    let has_filters = table.has_filters();
-    let clear = if has_filters { p.fg(p.accent) } else { p.fg(p.dim) };
-    let undo = if table.can_undo_filter() { p.fg(p.accent) } else { p.fg(p.dim) };
-    line.gap(2);
-    let clear_label = line.fit_label("清除全部筛选", "Clear all");
-    if has_filters {
-        line.button(&clear_label, clear, HitTarget::ImportClearFilters);
-    } else {
-        line.text(&clear_label, clear);
-    }
-    line.gap(1);
-    let undo_label = line.fit_label("撤销筛选", "Undo");
-    if table.can_undo_filter() {
-        line.button(&undo_label, undo, HitTarget::ImportUndoFilter);
-    } else {
-        line.text(&undo_label, undo);
-    }
-    frame.render_widget(Paragraph::new(line.finish()), Rect { x: inner.x, y, width: inner.width, height: 1 });
-}
-
-/// The footer: the state summary, then the key hints wrapped to as many rows as
-/// the pane can spare.
-///
-/// The hints are deliberately *not* one clipped line any more: the pane has a
-/// dozen bindings and hiding half of them behind `…` is how a help line stops
-/// being help. `hints` has already been wrapped by [`pack_hints`], so all this
-/// has to do is draw them and clip to the room left above the border.
-fn draw_footer(frame: &mut Frame, table: &ImportTable, inner: Rect, y: u16, bottom: u16, hints: &[String], p: Palette) {
-    let width = inner.width as usize;
-    let mut lines: Vec<Line<'static>> = Vec::with_capacity(1 + hints.len());
-    lines.push(Line::from(Span::styled(
-        truncate_to_width(&footer_summary(table), width),
-        p.fg(p.accent).add_modifier(Modifier::BOLD),
-    )));
-    for hint in hints {
-        lines.push(Line::from(Span::styled(truncate_to_width(hint, width), p.fg(p.dim))));
-    }
-    let height = bottom.saturating_sub(y).min(lines.len() as u16);
-    lines.truncate(height as usize);
-    frame.render_widget(Paragraph::new(lines), Rect { x: inner.x, y, width: inner.width, height });
-}
-
-/// The footer's first line: `2/3 条勾选 / 2/3 checked · 筛选: 类型=R / filter: 类型=R`.
-///
-/// Counts come from the table's public API rather than reusing
-/// [`ImportTable::summary`], so the English half is composed here next to the
-/// Chinese one and the two cannot drift apart.
-fn footer_summary(table: &ImportTable) -> String {
-    let checked = table.checked_count();
-    let importable = table.importable_count();
-    let mut s = format!("{checked}/{importable} 条勾选 / {checked}/{importable} checked");
-    if table.has_filters() {
-        let active = ImportColumn::ALL.into_iter().filter(|c| !table.filter(*c).trim().is_empty());
-        let zh: Vec<String> = active.clone().map(|c| format!("{}={}", c.label(), table.filter(c))).collect();
-        let en: Vec<String> = active.map(|c| format!("{}={}", c.label_en(), table.filter(c))).collect();
-        s.push_str(&format!(" · 筛选: {} / filter: {}", zh.join(", "), en.join(", ")));
-    }
-    s
-}
-
-/// Wrap the [`HINTS`] into at most `max_lines` rows of `width` cells.
-///
-/// Two passes, because the pane must never *lose* a binding:
-///
-/// 1. bilingual (`space 勾选 / Select`) — the normal case, and the only one on a
-///    wide pane;
-/// 2. Chinese only (`space 勾选`), which is roughly 40 % narrower. On a pane too
-///    narrow for the bilingual form this is what keeps every key on screen
-///    instead of dropping the tail behind `…`.
-///
-/// Only if even the Chinese pass needs more rows than exist does this clip, and
-/// then the *whole* footer is at its narrowest, where a truncated last row is
-/// the honest limit rather than a silently unreachable key.
-fn pack_hints(width: usize, max_lines: usize) -> Vec<String> {
-    if width == 0 || max_lines == 0 {
-        return Vec::new();
-    }
-    if let Some(full) = wrap_hints(width, max_lines, false) {
-        return full;
-    }
-    // Chinese-only is much denser; retry before giving up on any binding.
-    wrap_hints(width, max_lines, true).unwrap_or_else(|| {
-        let lines = wrap_hints(width, usize::MAX, true).unwrap_or_default();
-        lines.into_iter().take(max_lines).collect()
-    })
-}
-
-/// One wrapping pass. `chinese_only` picks the compact form every hint uses.
-///
-/// Returns `None` when the hints need more than `max_lines` rows, so the caller
-/// can retry in a denser form rather than silently truncating the list.
-fn wrap_hints(width: usize, max_lines: usize, chinese_only: bool) -> Option<Vec<String>> {
-    let mut lines: Vec<String> = Vec::new();
-    let mut cur = String::new();
-    let mut cur_w = 0usize;
-    for hint in HINTS {
-        let mut text = if chinese_only { hint.zh_text() } else { hint.bi_text() };
-        if display_width(&text) > width {
-            // Not even this form fits one row: the compact Chinese one might, and
-            // otherwise the binding is truncated but still named.
-            text = hint.zh_text();
-            if display_width(&text) > width {
-                text = truncate_to_width(&text, width);
-            }
-        }
-        let w = display_width(&text);
-        let sep_w = if cur.is_empty() { 0 } else { display_width(HINT_SEP) };
-        if !cur.is_empty() && cur_w + sep_w + w > width {
-            lines.push(std::mem::take(&mut cur));
-            cur_w = 0;
-            if lines.len() > max_lines {
-                return None;
-            }
-        }
-        if !cur.is_empty() {
-            cur.push_str(HINT_SEP);
-            cur_w += sep_w;
-        }
-        cur.push_str(&text);
-        cur_w += w;
-    }
-    if !cur.is_empty() {
-        lines.push(cur);
-    }
-    (lines.len() <= max_lines).then_some(lines)
-}
-
-// ---------------------------------------------------------------------------
-// Row / column geometry
-// ---------------------------------------------------------------------------
-
-/// One data column: which model column it is, and how many cells it owns.
-#[derive(Debug, Clone, Copy)]
-struct ColSpec {
-    col: ImportColumn,
-    width: u16,
-}
-
-/// Minimum width a column needs, derived from its own labels with
-/// `display_width` rather than hardcoded numbers.
-///
-/// The floor is the *bilingual* label (`监听 Listen`) plus one cell for the `▾`
-/// filtered marker, so a header is never truncated and a filter marker never
-/// pushes the English half out. At this width the data still fits; the larger
-/// width a column actually gets is the elastic spare, distributed below.
-fn min_width(col: ImportColumn) -> u16 {
-    let base = match col {
-        ImportColumn::Kind => MIN_KIND_W as usize,
-        ImportColumn::Listen => MIN_LISTEN_W as usize,
-        ImportColumn::Target => MIN_TARGET_W as usize,
-        ImportColumn::Raw => MIN_RAW_W as usize,
-    };
-    (base.max(bilingual_width(col) as usize) + 1) as u16
-}
-
-/// The width at which a column's header can show both languages.
-///
-/// The `▾` filtered marker is *not* counted here: [`header_text`] reserves it
-/// separately, so this is exactly the room the two labels need side by side.
-fn bilingual_width(col: ImportColumn) -> u16 {
-    (display_width(col.label()) + 1 + display_width(col.label_en())) as u16
-}
-
-/// The columns that fit `width`, left to right.
-///
-/// Degradation order is 「原始指令」→「目标」: the raw directive is the least
-/// needed once the row is recognised, and the listen/target pair is what the
-/// user actually filters on.
-fn columns(width: u16) -> Vec<ColSpec> {
-    let mut out: Vec<ColSpec> = Vec::with_capacity(4);
-    // checkbox cell + one separating space + the kind column
-    let kind_w = min_width(ImportColumn::Kind);
-    let mut used = CHECK_W + 1 + kind_w;
-    out.push(ColSpec { col: ImportColumn::Kind, width: kind_w });
-    for col in [ImportColumn::Listen, ImportColumn::Target, ImportColumn::Raw] {
-        let min = min_width(col);
-        if width >= used + 1 + min {
-            out.push(ColSpec { col, width: min });
-            used += 1 + min;
-        }
-    }
-
-    // A pane narrower than the fixed part still must not overflow: shrink the
-    // type column (the only survivor down here) rather than drawing past the edge.
-    if used > width {
-        let fixed = CHECK_W + 1;
-        let room = width.saturating_sub(fixed);
-        if let Some(first) = out.first_mut() {
-            first.width = room;
-        }
-        out.truncate(1);
-        if room == 0 {
-            out.clear();
-        }
-        return out;
-    }
-
-    // Every spare cell goes to the elastic columns, weighted towards 监听: it is
-    // the column a user narrows by when the list is long.
-    //
-    // The arithmetic runs in u32: `width` is the pane's cell count and can be
-    // anything up to `u16::MAX`, where `spare * 4` overflows a u16 and panics in
-    // a debug build (release would wrap and hand out a nonsensical width). The
-    // shares are provably `<= spare`, so narrowing back to u16 cannot clip.
-    let spare = width.saturating_sub(used);
-    let flexible: Vec<usize> =
-        out.iter().enumerate().filter(|(_, spec)| spec.col != ImportColumn::Kind).map(|(i, _)| i).collect();
-    if !flexible.is_empty() {
-        let weights = [4u32, 3, 3];
-        let mut left = u32::from(spare);
-        let total = u32::from(spare);
-        for (k, &i) in flexible.iter().enumerate() {
-            let share = if k + 1 == flexible.len() { left } else { (total * weights[k.min(2)] / 10).min(left) };
-            let share = u16::try_from(share).unwrap_or(u16::MAX);
-            out[i].width = out[i].width.saturating_add(share);
-            left = left.saturating_sub(u32::from(share));
-        }
-    }
-    out
-}
-
-/// `中文 English` for the reason a row cannot be imported.
-///
-/// Both halves come from `model.rs` (`unsupported_reason` /
-/// `unsupported_reason_en`), so adding a third un-importable case is a
-/// compile-visible edit there and the two languages cannot drift apart — no
-/// local translation table that could silently fall back to a generic wording.
-///
-/// The fallback below is for the case the model does *not* describe: it is only
-/// reached for a row that is genuinely un-importable (`importable()` false), yet
-/// both accessors returned `None`, which would otherwise print a bare `⚠`.
-fn unsupported_label(row: &ImportRow) -> String {
-    match (row.forward.unsupported_reason(), row.forward.unsupported_reason_en()) {
-        (Some(zh), Some(en)) => help::bi(zh, en),
-        _ => help::bi("无法导入", "Cannot import"),
-    }
-}
-
-/// One row, padded to the full width so the cursor bar spans the whole line.
-fn row_line(row: &ImportRow, is_cursor: bool, cols: &[ColSpec], width: u16, p: Palette) -> Line<'static> {
-    let importable = row.importable();
-    let mut spans: Vec<Span<'static>> = Vec::with_capacity(cols.len() + 2);
-
-    let lead = if is_cursor { "▸" } else { " " };
-    let check = if !importable {
-        "[–]"
-    } else if row.checked {
-        "[x]"
-    } else {
-        "[ ]"
-    };
-    let check_style = if !importable || !row.checked { p.fg(p.dim) } else { p.fg(p.up) };
-    spans.push(Span::styled(format!("{lead}{check}"), check_style));
-    spans.push(Span::raw(" "));
-
-    for (i, spec) in cols.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::raw(" "));
-        }
-        let last = i + 1 == cols.len();
-        // For a row we cannot import, the reason is the only thing the user needs
-        // from it, so it takes *all* the width the remaining columns would have
-        // used instead of being squeezed into the last one. It is the label on
-        // the row, not a column value, hence the indent kept below the headers.
-        if !importable && last {
-            // The bilingual reason comes from `unsupported_label`, so the two
-            // languages are paired at the source instead of drifting here.
-            let reason = format!("⚠ {}", unsupported_label(row));
-            // Widened before summing: the widths come from a pane that can be up
-            // to `u16::MAX` cells wide, and the running total plus the separator
-            // cells can pass that.
-            let rest: u32 = cols[i..].iter().map(|c| u32::from(c.width)).sum::<u32>() + (cols.len() - i - 1) as u32;
-            let rest = u16::try_from(rest).unwrap_or(u16::MAX);
-            spans.push(cell_span(&reason, rest.max(spec.width), p.fg(p.failed)));
-            continue;
-        }
-        let style = if !importable {
-            p.fg(p.dim)
-        } else if spec.col == ImportColumn::Kind {
-            p.fg(p.accent).add_modifier(Modifier::BOLD)
-        } else {
-            p.fg(p.text)
-        };
-        spans.push(cell_span(&spec.col.cell(&row.forward), spec.width, style));
-    }
-
-    // Fill the rest of the line: the cursor highlight is a bar, and a bar that
-    // stops mid-row reads as a text selection instead of a focused row. The
-    // reason span above can already have absorbed the spare width, so this only
-    // ever pads — it never truncates.
-    // Same widening: this total is only compared against `width` and used as a
-    // padding count, so an over-wide sum simply means "no padding needed".
-    let mut used = u32::from(CHECK_W) + 1;
-    for (i, spec) in cols.iter().enumerate() {
-        used += u32::from(spec.width) + u32::from(i > 0);
-    }
-    if used < u32::from(width) {
-        spans.push(Span::raw(" ".repeat((u32::from(width) - used) as usize)));
-    }
-
-    let line = Line::from(spans);
-    if is_cursor { line.style(p.focused()) } else { line }
-}
-
-/// `text` padded or truncated to exactly `width` cells.
-fn cell_span(text: &str, width: u16, style: Style) -> Span<'static> {
-    let cells = width as usize;
-    Span::styled(pad_to_width(&truncate_to_width(text, cells), cells), style)
-}
-
-// ---------------------------------------------------------------------------
-// Line building with hit rects
-// ---------------------------------------------------------------------------
-
-/// Appends clickable labels to one line while keeping the drawn x position in
-/// sync with the recorded hit rects — the one place in this pane where the two
-/// could drift apart, so they are computed together.
-struct LineCursor<'a> {
-    spans: Vec<Span<'static>>,
-    hits: &'a mut HitMap,
-    x: u16,
-    y: u16,
-    right: u16,
-}
-
-impl<'a> LineCursor<'a> {
-    fn new(x: u16, y: u16, right: u16, hits: &'a mut HitMap) -> Self {
-        LineCursor { spans: Vec::new(), hits, x, y, right }
-    }
-
-    /// Plain text, no hit rect.
-    ///
-    /// Chip and button labels embed user-typed filter text, which has no length
-    /// cap, so the label's cell width is measured wide and the fit test is done
-    /// in `usize` — a u16 sum of `x + w` would wrap and let an oversized label
-    /// be placed on top of the ones after it.
-    fn text(&mut self, text: &str, style: Style) {
-        let Some(w) = self.fit(text) else { return };
-        self.spans.push(Span::styled(text.to_string(), style));
-        self.x += w;
-    }
-
-    /// A clickable label. Returns false when it does not fit, so callers stop
-    /// instead of drawing a half-clipped button.
-    fn button(&mut self, label: &str, style: Style, target: HitTarget) -> bool {
-        let Some(w) = self.fit(label) else { return false };
-        self.hits.push(Rect { x: self.x, y: self.y, width: w, height: 1 }, target);
-        self.spans.push(Span::styled(label.to_string(), style));
-        self.x += w;
-        true
-    }
-
-    /// Blank separator cells (never clickable).
-    fn gap(&mut self, width: u16) {
-        let room = self.right.saturating_sub(self.x).min(width);
-        if room == 0 {
-            return;
-        }
-        self.spans.push(Span::raw(" ".repeat(room as usize)));
-        self.x = self.x.saturating_add(room);
-    }
-
-    /// The label's width in cells if it still fits on the line.
-    fn fit(&self, label: &str) -> Option<u16> {
-        let w = display_width(label);
-        let end = usize::from(self.x) + w;
-        if end > usize::from(self.right) {
-            return None;
-        }
-        // `end <= right <= u16::MAX`, so the cast cannot truncate.
-        u16::try_from(w).ok()
-    }
-
-    /// `中文/English` when it still fits the row, otherwise `中文`.
-    ///
-    /// Buttons are the case where the bilingual form can genuinely push a
-    /// *later* button off the row, and an unreachable button is worse than an
-    /// untranslated one, so the fallback is decided per label against the room
-    /// actually left rather than against the pane's full width.
-    fn fit_label(&self, zh: &str, en: &str) -> String {
-        let room = self.right.saturating_sub(self.x) as usize;
-        let both = format!("{zh}/{en}");
-        if display_width(&both) <= room { both } else { zh.to_string() }
-    }
-
-    fn finish(self) -> Line<'static> {
-        Line::from(self.spans)
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::model::{ForwardKind, SshForward};
-    use crate::ui::palette_with;
+    use crate::model::{FormField, ImportColumn, TunnelConfig};
+    use crate::ui::draw;
+    use crate::ui::hit::HitTarget;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
-    fn forward(kind: ForwardKind, listen_port: u16, raw: &str) -> SshForward {
+    use crate::app::App;
+    use crate::model::{ForwardKind, ImportTable, SshForward};
+    use crate::ui::test_support::*;
+
+    fn fwd(kind: ForwardKind, listen: u16, target: &str, target_port: u16, raw: &str) -> SshForward {
         SshForward {
             kind,
             listen_addr: String::new(),
-            listen_port,
-            target_host: "127.0.0.1".to_string(),
-            target_port: 3000,
+            listen_port: listen,
+            target_host: target.to_string(),
+            target_port,
             host_alias: "dev-box".to_string(),
-            line: 7,
+            line: 12,
             raw: raw.to_string(),
         }
     }
 
-    #[test]
-    fn columns_fit_the_width_and_degrade_from_the_right() {
-        // Wide: all four data columns, and the footprint equals the budget.
-        let wide = columns(90);
-        assert_eq!(wide.len(), 4);
-        let footprint: u16 =
-            CHECK_W + 1 + wide.iter().map(|c| c.width).sum::<u16>() + wide.len().saturating_sub(1) as u16;
-        assert_eq!(footprint, 90, "spare width must be fully distributed");
-
-        // Narrow: 原始指令 goes first, then 目标. 类型 always survives.
-        for w in 8u16..=120 {
-            let cols = columns(w);
-            assert!(!cols.is_empty(), "width {w} produced no columns");
-            let used: u16 =
-                CHECK_W + 1 + cols.iter().map(|c| c.width).sum::<u16>() + cols.len().saturating_sub(1) as u16;
-            assert!(used <= w, "width {w} overflows: {cols:?}");
+    /// An app with a create form whose SSH HOST is set and whose import table
+    /// holds `rows`, pane open.
+    fn app_with_import(rows: Vec<SshForward>) -> App {
+        let mut app = app_with_tunnels(vec![]);
+        app.open_form_create();
+        app.hosts = vec![crate::ssh::SshHost {
+            alias: "dev-box".into(),
+            hostname: "10.0.0.9".into(),
+            user: None,
+            port: 22,
+            proxy_jump: Vec::new(),
+            identity_file: None,
+        }];
+        if let Some(f) = app.form.as_mut() {
+            f.ssh_host.set("dev-box");
+            f.set_import_table("dev-box", ImportTable::new(rows));
+            f.import_open = true;
         }
-        // Even 20 columns still fits a few columns; 12 leaves only the type.
-        assert_eq!(columns(10).iter().map(|c| c.col).collect::<Vec<_>>(), vec![ImportColumn::Kind]);
+        app
     }
 
-    /// The elastic-space pass must not overflow on a very wide pane.
-    ///
-    /// `share = spare * weight / 10` is computed in u16 upstream; `spare` can be
-    /// almost `u16::MAX` (a pane spanning a very wide terminal), so `spare * 4`
-    /// overflows and panics in a debug build. The widths it then hands out also
-    /// have to stay within the pane.
-    #[test]
-    fn columns_survive_a_very_wide_pane_without_overflowing() {
-        for w in [4_000u16, 20_000, u16::MAX - 1, u16::MAX] {
-            let cols = columns(w);
-            assert!(!cols.is_empty(), "width {w} produced no columns");
-            let used = u32::from(CHECK_W)
-                + 1
-                + cols.iter().map(|c| u32::from(c.width)).sum::<u32>()
-                + cols.len().saturating_sub(1) as u32;
-            assert!(used <= u32::from(w), "width {w} overflows: {cols:?}");
-        }
-    }
-
-    /// A row whose reason absorbs the remaining columns sums those widths in
-    /// u32, so the same wide-pane case cannot wrap into a tiny span.
-    #[test]
-    fn an_unimportable_row_on_a_wide_pane_keeps_its_reason_readable() {
-        let p = palette_with(true);
-        let bad =
-            ImportRow { forward: forward(ForwardKind::Local, 0, "LocalForward abc 127.0.0.1:3000"), checked: false };
-        for w in [90u16, 4_000, u16::MAX] {
-            let cols = columns(w);
-            let line = row_line(&bad, false, &cols, w, p);
-            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-            assert!(text.contains("⚠ 端口无法解析"), "width {w}: {text}");
-        }
-    }
-
-    /// Chip/button labels embed user-typed filter text; `LineCursor` must refuse
-    /// to place one that does not fit rather than wrapping its x coordinate.
-    #[test]
-    fn line_cursor_refuses_a_label_wider_than_the_line() {
-        let mut hits = HitMap::new();
-        let mut line = LineCursor::new(0, 0, 10, &mut hits);
-        assert!(line.button("abc", Style::default(), HitTarget::ImportCheckAll));
-        assert!(!line.button(&"x".repeat(65_535), Style::default(), HitTarget::ImportInvert), "must not fit");
-        assert!(!line.button("abcdefghij", Style::default(), HitTarget::ImportUndoFilter), "must not fit");
-        // Only the first button was recorded, and it is where it was drawn.
-        assert_eq!(hits.rect_of(&HitTarget::ImportCheckAll), Some(Rect { x: 0, y: 0, width: 3, height: 1 }));
-        assert!(hits.rect_of(&HitTarget::ImportInvert).is_none());
+    fn sample_forwards() -> Vec<SshForward> {
+        vec![
+            fwd(ForwardKind::Local, 8080, "127.0.0.1", 80, "LocalForward 8080 127.0.0.1:80"),
+            fwd(ForwardKind::Remote, 9000, "127.0.0.1", 9001, "RemoteForward 9000 127.0.0.1:9001"),
+            // Un-importable: listen port could not be parsed.
+            fwd(ForwardKind::Local, 0, "127.0.0.1", 5432, "LocalForward abc 127.0.0.1:5432"),
+        ]
     }
 
     #[test]
-    fn column_minimums_are_derived_from_the_header_label() {
-        // The floor must hold the Chinese label plus the `▾` marker, so a header
-        // is never truncated into `监…`. The English half is offered on top when
-        // the elastic space allows it (see `bilingual_width`).
-        for col in ImportColumn::ALL {
-            let min = min_width(col) as usize;
-            assert!(min > display_width(col.label()), "{col:?} too narrow for its Chinese header");
-            // The floor reserves the bilingual labels *and* the `▾` marker.
-            let needed = usize::from(bilingual_width(col));
-            assert!(min > needed, "{col:?}: floor leaves no room for the English half plus the filter marker");
+    fn import_pane_renders_rows_checkboxes_and_summary() {
+        let mut app = app_with_import(sample_forwards());
+        let text = render_to_text(&mut app, 120, 45);
+        assert!(text.contains("从 ~/.ssh/config 导入转发"), "pane title missing:\n{text}");
+        assert!(text.contains("localhost:8080"), "listen cell missing:\n{text}");
+        assert!(text.contains("(SOCKS5)") || text.contains("127.0.0.1:9001"), "target cell missing:\n{text}");
+        // The 原始指令 column is the elastic one, so a long directive is shown
+        // truncated with an ellipsis rather than being allowed to overflow.
+        assert!(text.contains("LocalForward 8080"), "raw directive missing:\n{text}");
+        // Two importable rows are pre-ticked, the un-importable one is not.
+        assert!(text.contains("[x]"), "checked box missing:\n{text}");
+        assert!(text.contains("[–]"), "un-importable box should be the striped form:\n{text}");
+        assert!(text.contains("2/2 条勾选"), "summary must count importable rows only:\n{text}");
+        assert!(text.contains("space 勾选"), "pane footer hints missing:\n{text}");
+    }
+
+    #[test]
+    fn unimportable_import_row_shows_its_reason_and_cannot_be_ticked() {
+        let mut app =
+            app_with_import(vec![fwd(ForwardKind::Local, 0, "127.0.0.1", 5432, "LocalForward abc 127.0.0.1:5432")]);
+        let text = render_to_text(&mut app, 120, 45);
+        let row =
+            text.lines().find(|l| l.contains("端口无法解析")).unwrap_or_else(|| panic!("reason missing:\n{text}"));
+        assert!(!row.contains("[x]"), "a broken row must not look ticked: {row:?}");
+        assert!(row.contains("[–]"), "it should look untickable, not merely unticked: {row:?}");
+        assert!(text.contains("0/0 条勾选"), "summary should show nothing importable:\n{text}");
+        // Ticking it is a no-op, at the model level too.
+        let form = app.form.as_mut().unwrap();
+        form.import.toggle_cursor();
+        assert_eq!(form.import.checked_count(), 0, "un-importable rows must not become checked");
+    }
+
+    #[test]
+    fn import_pane_shows_filtered_header_chips_and_buttons() {
+        let mut app = app_with_import(sample_forwards());
+        if let Some(f) = app.form.as_mut() {
+            f.import.set_filter(ImportColumn::Kind, "R");
         }
-        // Every column that survives at its minimum renders a full Chinese header.
-        for w in [40u16, 60, 90, 120] {
-            for spec in columns(w) {
-                let table = ImportTable::new(vec![]);
-                let text = header_text(spec.col, &table, spec.width);
-                assert!(display_width(&text) <= spec.width as usize, "{w}/{col:?}: {text:?}", col = spec.col);
-                if spec.width >= min_width(spec.col) {
-                    assert!(
-                        text.starts_with(spec.col.label()),
-                        "{w}/{col:?}: header lost its Chinese label: {text:?}",
-                        col = spec.col
-                    );
-                }
+        let text = render_to_text(&mut app, 120, 45);
+        // The filtered column header is marked distinctly (`▾`) ...
+        assert!(text.contains("类型▾"), "filtered header marker missing:\n{text}");
+        // ... and the chip line names the active filter with a delete affordance.
+        assert!(text.contains("筛选: 类型=R ×"), "filter chip missing:\n{text}");
+        assert!(text.contains("清除全部筛选"), "clear-all affordance missing:\n{text}");
+        assert!(text.contains("撤销筛选"), "undo affordance missing:\n{text}");
+        assert!(text.contains("全选"), "select-all button missing:\n{text}");
+        // Only the R row survives the filter.
+        assert!(text.contains("RemoteForward 900"), "filtered row missing:\n{text}");
+        assert!(!text.contains("LocalForward 8080"), "filter did not narrow:\n{text}");
+    }
+
+    #[test]
+    fn import_pane_shows_the_editing_column_with_a_cursor() {
+        let mut app = app_with_import(sample_forwards());
+        if let Some(f) = app.form.as_mut() {
+            f.import.begin_filter(ImportColumn::Listen);
+            f.import.filter_char(ImportColumn::Listen, '8');
+        }
+        let text = render_to_text(&mut app, 120, 45);
+        assert!(text.contains("监听:8"), "the column being typed into must echo the input:\n{text}");
+    }
+
+    #[test]
+    fn import_pane_renders_at_small_sizes_without_panicking() {
+        // The pane must degrade, never panic: it is opened by a key press, and a
+        // panic would leave the terminal in raw mode.
+        for rows in [0usize, 1, 3, 40] {
+            let mut app = app_with_import(
+                (0..rows)
+                    .map(|i| fwd(ForwardKind::Local, 8000 + i as u16, "127.0.0.1", 80, "LocalForward x"))
+                    .collect(),
+            );
+            if rows == 0 {
+                app.form.as_mut().unwrap().import_open = true;
+            }
+            for (w, h) in [(1u16, 1u16), (8, 6), (20, 8), (40, 12), (74, 24), (120, 45)] {
+                let backend = TestBackend::new(w, h);
+                let mut term = Terminal::new(backend).unwrap();
+                term.draw(|f| draw(f, &mut app)).unwrap_or_else(|e| panic!("import pane at {w}x{h}: {e}"));
             }
         }
     }
 
     #[test]
-    fn header_is_bilingual_and_marks_a_filtered_column() {
-        let mut table = ImportTable::new(vec![]);
-        // Wide enough for both languages.
-        assert_eq!(header_text(ImportColumn::Listen, &table, bilingual_width(ImportColumn::Listen)), "监听 Listen");
-        assert_eq!(header_text(ImportColumn::Kind, &table, bilingual_width(ImportColumn::Kind)), "类型 Kind");
-        // Too narrow for both: Chinese only, never a dangling English word.
-        assert_eq!(header_text(ImportColumn::Listen, &table, 6), "监听");
-        // A filter keeps its `▾` marker whether or not both languages fit.
-        table.set_filter(ImportColumn::Kind, "R");
-        assert_eq!(header_text(ImportColumn::Kind, &table, 6), "类型▾");
-        // The marker stays glued to the Chinese label, with the English after it.
-        assert_eq!(header_text(ImportColumn::Kind, &table, 20), "类型▾ Kind");
-        // While typing, the header echoes the literal filter text.
-        table.begin_filter(ImportColumn::Listen);
-        table.filter_char(ImportColumn::Listen, '8');
-        assert!(header_text(ImportColumn::Listen, &table, 12).starts_with("监听:8"));
-    }
-
-    #[test]
-    fn footer_hints_cover_every_binding_once() {
-        // The pane's whole point is that no key is a secret; a dropped hint is a
-        // regression, so every binding the module documents is asserted here.
-        // The token set is also cross-checked against `HINTS` itself, so adding a
-        // binding without covering it here is a test failure too.
-        let expected =
-            ["space", "f/←→", "F", "ctrl+r", "z", "a/U/I", "j/k ↑↓", "g/G", "pgup/pgdn", "enter", "esc/i", "ctrl+s"];
-        assert_eq!(expected.len(), HINTS.len(), "a hint was added to HINTS without a coverage entry");
-        let packed = pack_hints(120, 4).join(" ");
-        for token in expected {
-            assert!(packed.contains(token), "footer hint {token:?} missing from {packed:?}");
-        }
-        for hint in HINTS {
-            assert!(packed.contains(hint.keys), "binding {:?} lost: {packed:?}", hint.keys);
-            assert!(packed.contains(hint.zh), "Chinese half of {:?} lost: {packed:?}", hint.keys);
-            assert!(packed.contains(hint.en), "English half of {:?} lost: {packed:?}", hint.keys);
+    fn import_pane_empty_state_says_there_are_no_forwards() {
+        // `import_open` on an empty table with no error: reachable when a host
+        // switch empties the list. It must not collapse silently — the pane says
+        // why it is empty, and the manual form fields all stay on screen.
+        let mut app = app_with_import(vec![]);
+        app.form.as_mut().unwrap().import_open = true;
+        app.import_error = None;
+        let text = render_to_text(&mut app, 120, 45);
+        assert!(text.contains("没有端口转发配置"), "empty state missing:\n{text}");
+        assert!(text.contains("从 ~/.ssh/config 导入转发"), "pane title missing:\n{text}");
+        for field in FormField::ORDER {
+            assert!(text.contains(field.label()), "form field {field:?} pushed out by the pane:\n{text}");
         }
     }
 
     #[test]
-    fn every_binding_survives_a_narrow_or_short_pane() {
-        // The real failure mode this guards: clipping the footer's tail at a
-        // realistic size, which would make the last few keys undiscoverable.
-        // Chinese-only wrapping is what keeps all twelve on screen.
-        for (width, rows) in [(120usize, 4usize), (100, 4), (80, 4), (60, 5), (60, 4)] {
-            let packed = pack_hints(width, rows).join(" ");
-            for hint in HINTS {
-                assert!(packed.contains(hint.keys), "{width}x{rows} lost {:?}: {packed:?}", hint.keys);
-            }
-            assert!(pack_hints(width, rows).len() <= rows, "{width}: more rows than allowed");
-        }
+    fn import_pane_empty_state_surfaces_a_discovery_error() {
+        let mut app = app_with_import(vec![]);
+        app.form.as_mut().unwrap().import_open = true;
+        app.import_error = Some("读取 ~/.ssh/config 转发配置失败: permission denied".to_string());
+        let text = render_to_text(&mut app, 120, 45);
+        assert!(text.contains("permission denied"), "the reason must be readable:\n{text}");
+        assert!(!text.contains("没有端口转发配置"), "a failure is not the same as 'no forwards':\n{text}");
     }
 
     #[test]
-    fn footer_hints_wrap_within_the_width_and_degrade_to_chinese() {
-        for width in [12usize, 24, 40, 60, 120] {
-            for line in pack_hints(width, 6) {
-                assert!(display_width(&line) <= width, "hint line overflows {width}: {line:?}");
-            }
-        }
-        // Every line is non-empty: an empty row would waste the footer budget.
-        assert!(pack_hints(80, 4).iter().all(|l| !l.is_empty()));
-        // A narrow pane keeps the key tokens (Chinese only) rather than dropping
-        // the binding entirely.
-        let narrow = pack_hints(20, 8).join(" ");
-        assert!(narrow.contains("space"), "{narrow:?}");
-        // Zero width/rows must not panic or produce content.
-        assert!(pack_hints(0, 4).is_empty());
-        assert!(pack_hints(80, 0).is_empty());
+    fn hits_are_not_pushed_for_rows_outside_the_list_area() {
+        // 30 tunnels into a 14-row terminal: most rows are below the table area,
+        // and a click down there must not resolve to a row that is not drawn.
+        let tunnels: Vec<TunnelConfig> = (1..=30).map(|i| sample(i, &format!("t-{i:02}"), 8000 + i as u16)).collect();
+        let mut app = app_with_tunnels(tunnels);
+        let _ = render_to_text(&mut app, 100, 14);
+
+        let list = app.hits.rect_of(&HitTarget::TunnelList).expect("table area must be recorded");
+        let pushed: Vec<u16> =
+            (1..=30u64).filter_map(|i| app.hits.rect_of(&HitTarget::TunnelRow(i)).map(|r| r.y)).collect();
+        assert!(!pushed.is_empty(), "some rows must be clickable");
+        assert!(pushed.iter().all(|y| *y < list.bottom()), "a row hit escaped the table area: {pushed:?}");
+        assert!(pushed.len() < 30, "off-screen rows must not be clickable: {pushed:?}");
     }
 
     #[test]
-    fn footer_summary_is_bilingual_and_counts_importable_rows() {
-        let table = ImportTable::new(vec![
-            forward(ForwardKind::Local, 8080, "LocalForward 8080 127.0.0.1:3000"),
-            // Un-importable: it must not inflate the denominator.
-            forward(ForwardKind::Local, 0, "LocalForward abc 127.0.0.1:5432"),
-        ]);
-        let s = footer_summary(&table);
-        assert!(s.contains("1/1 条勾选"), "{s}");
-        assert!(s.contains("1/1 checked"), "{s}");
+    fn import_pane_hits_resolve_to_the_checkbox_and_row() {
+        let mut app = app_with_import(sample_forwards());
+        let _ = render_to_text(&mut app, 120, 45);
 
-        let mut filtered = ImportTable::new(vec![forward(ForwardKind::Local, 8080, "LocalForward 8080 x:1")]);
-        filtered.set_filter(ImportColumn::Kind, "L");
-        let s = footer_summary(&filtered);
-        assert!(s.contains("筛选: 类型=L"), "{s}");
-        assert!(s.contains("filter: Kind=L"), "{s}");
+        // The first row's checkbox cell: the hit map must resolve to the *raw
+        // row index*, not the visible position.
+        let cb = app.hits.rect_of(&HitTarget::ImportCheckbox(0)).expect("first checkbox must be clickable");
+        assert_eq!(app.hits.at(cb.x, cb.y), Some(&HitTarget::ImportCheckbox(0)));
+
+        // Somewhere else on the same row: selects rather than toggles.
+        let row = app.hits.rect_of(&HitTarget::ImportRow(0)).expect("first row must be clickable");
+        let far_x = row.right().saturating_sub(2).max(row.x);
+        assert_eq!(app.hits.at(far_x, row.y), Some(&HitTarget::ImportRow(0)), "wide part of the row selects");
+
+        // Column headers and the action buttons are recorded too.
+        assert!(app.hits.rect_of(&HitTarget::ImportColumnHeader(ImportColumn::Listen)).is_some());
+        assert!(app.hits.rect_of(&HitTarget::ImportCheckAll).is_some());
+        assert!(app.hits.rect_of(&HitTarget::ImportInvert).is_some());
+        assert!(app.hits.rect_of(&HitTarget::ImportUncheckAll).is_some());
+        assert!(app.hits.rect_of(&HitTarget::ImportList).is_some());
     }
 
     #[test]
-    fn unimportable_rows_explain_themselves_in_both_languages() {
-        // Built through real `ImportRow`s rather than by passing strings, so this
-        // exercises the actual path `row_line` takes (and would break the day the
-        // model's two accessors disagree about whether a row is importable).
-        let row = |forward: SshForward| ImportRow { forward, checked: false };
-
-        // `listen_port == 0`: the port could not be parsed.
-        let bad_port = row(forward(ForwardKind::Local, 0, "LocalForward abc 127.0.0.1:3000"));
-        assert!(!bad_port.importable(), "the fixture must really be un-importable");
-        assert_eq!(unsupported_label(&bad_port), "端口无法解析 Unparseable port");
-
-        // Non-Dynamic with no target: the destination could not be parsed.
-        let mut no_target = forward(ForwardKind::Local, 8080, "LocalForward 8080");
-        no_target.target_host = String::new();
-        no_target.target_port = 0;
-        let bad_target = row(no_target);
-        assert!(!bad_target.importable(), "the fixture must really be un-importable");
-        assert_eq!(unsupported_label(&bad_target), "目标地址无法解析 Unparseable target");
-
-        // A `-D` forward needs no target, so it is importable and must never be
-        // labelled with a failure reason.
-        let dynamic = row(forward(ForwardKind::Dynamic, 1080, "DynamicForward 1080"));
-        assert!(dynamic.importable(), "a DynamicForward without a target is valid");
-        assert_eq!(unsupported_label(&dynamic), "无法导入 Cannot import");
+    fn import_pane_hits_are_rebuilt_every_frame() {
+        let mut app = app_with_import(sample_forwards());
+        let _ = render_to_text(&mut app, 120, 45);
+        let first = app.hits.len();
+        assert!(first > 0);
+        // Closing the pane must not leave its rects behind, or a click would hit
+        // a widget that is no longer drawn.
+        app.form.as_mut().unwrap().import_open = false;
+        let _ = render_to_text(&mut app, 120, 45);
+        assert!(app.hits.rect_of(&HitTarget::ImportCheckbox(0)).is_none(), "stale import hits survived");
     }
 
-    #[test]
-    fn window_follows_the_scroll_anchor_but_never_hides_the_cursor() {
-        let visible = [0usize, 1, 2, 3];
-        let mut table = ImportTable::new(vec![]);
-        table.scroll = 1;
-        table.cursor = 1;
-        assert_eq!(window_start(&table, &visible, 2), 1, "the anchor is honoured while the cursor is inside");
-
-        table.cursor = 3;
-        table.scroll = 0;
-        assert_eq!(window_start(&table, &visible, 2), 2, "cursor below the window scrolls it into view");
-
-        table.cursor = 0;
-        table.scroll = 3;
-        assert_eq!(window_start(&table, &visible, 2), 0, "cursor above the window pulls it back");
-
-        // Absurd scroll offsets cannot panic or point past the last row.
-        table.scroll = u16::MAX;
-        table.cursor = 0;
-        assert_eq!(window_start(&table, &visible, 1), 0);
-        assert_eq!(window_start(&table, &[], 3), 0);
-    }
-
-    #[test]
-    fn unimportable_rows_render_the_reason_not_the_directive() {
-        let p = palette_with(true);
-        let cols = columns(90);
-        let bad =
-            ImportRow { forward: forward(ForwardKind::Local, 0, "LocalForward abc 127.0.0.1:3000"), checked: false };
-        let line = row_line(&bad, false, &cols, 90, p);
-        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.contains("⚠ 端口无法解析"), "{text}");
-        assert!(text.contains("[–]"), "un-importable rows must not look tickable: {text}");
-        assert!(!text.contains("[x]"), "{text}");
-    }
-
-    #[test]
-    fn cursor_rows_are_flagged_with_a_symbol_too() {
-        let p = palette_with(true);
-        let cols = columns(90);
-        let good =
-            ImportRow { forward: forward(ForwardKind::Local, 8080, "LocalForward 8080 127.0.0.1:3000"), checked: true };
-        let text = |l: Line<'static>| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>();
-        assert!(text(row_line(&good, true, &cols, 90, p)).starts_with("▸[x]"));
-        assert!(text(row_line(&good, false, &cols, 90, p)).starts_with(" [x]"));
-    }
+    // -- selection mode -----------------------------------------------------
 }

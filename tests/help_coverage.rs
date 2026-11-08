@@ -66,7 +66,42 @@ use std::collections::{BTreeMap, BTreeSet};
 use sshpf::help::{SECTIONS, SectionId};
 
 /// The real key dispatch. Embedded so this test re-runs whenever it changes.
-const KEYS_SRC: &str = include_str!("../src/keys.rs");
+///
+/// The handlers no longer live in one file: `src/keys.rs` is the routing map, and
+/// each context has its own submodule. Every file that binds a key must be listed
+/// here — `include_str!` only embeds the one file it names, so a missing entry
+/// would silently drop a whole context from the comparison (the section would
+/// look "documented but not dispatched", or worse, pass vacuously). Adding a key
+/// binding file under `src/keys/` therefore means adding a line here too; the
+/// `every_key_handler_file_is_embedded` test below fails if you forget.
+const KEYS_SRC: &str = concat!(
+    include_str!("../src/keys.rs"),
+    include_str!("../src/keys/main.rs"),
+    include_str!("../src/keys/select.rs"),
+    include_str!("../src/keys/form.rs"),
+    include_str!("../src/keys/import.rs"),
+    include_str!("../src/keys/dropdown.rs"),
+    include_str!("../src/keys/misc.rs"),
+    // `testkit.rs` is test-only fixtures and binds no keys, so it is deliberately
+    // absent: including it would add the tests' own `handle_key(...)` calls to the
+    // scanned text for no benefit.
+);
+
+/// Every file under `src/keys/` that really binds keys, i.e. must be in
+/// [`KEYS_SRC`]. Kept next to the list so the two cannot drift apart unnoticed.
+///
+/// `src/keys.rs` (the router) plus one file per context; `testkit.rs` is the only
+/// submodule that is not a dispatcher.
+const KEY_HANDLER_FILES: &[&str] = &[
+    "src/keys.rs",
+    "src/keys/main.rs",
+    "src/keys/select.rs",
+    "src/keys/form.rs",
+    "src/keys/import.rs",
+    "src/keys/dropdown.rs",
+    "src/keys/misc.rs",
+];
+
 /// The mouse hit-target enum: one variant per clickable thing.
 const HIT_SRC: &str = include_str!("../src/ui/hit.rs");
 /// The human-facing key reference. Every documented token must appear in it.
@@ -78,13 +113,33 @@ const KEYMAP_DOC: &str = include_str!("../docs/keymap.md");
 
 /// Which help section owns each dispatch function.
 ///
+/// The unit is the **handler function**, not the file: after the v0.3.0 split the
+/// dispatch is spread across `src/keys.rs` and `src/keys/*.rs`, and this table is
+/// what keeps the mapping intact now that "one file" no longer implies "one
+/// context". The functions are still named by what context they serve, so the
+/// table is unchanged by the move — only [`KEYS_SRC`] had to grow.
+///
+/// A handler that is split into "entry + called helpers" is listed as *separate
+/// rows*, each mapped to the same section: the section's code tokens are the union
+/// of its handlers, so `handle_field_editing` + `edit_field` together describe
+/// "form editing". Splitting a body must therefore add a row here for the new
+/// function, or `every_dispatched_key_is_documented` reports the moved keys as
+/// undocumented (they would be dispatched by a function this table does not know).
+///
 /// `handle_form_key` only delegates (its body contains no `KeyCode` literal), so
 /// it contributes nothing on its own; it is listed anyway so that a future key
 /// added directly to the delegation layer is caught by this test instead of being
-/// silently undocumented.
+/// silently undocumented. The same holds for `handle_key`, the global entry point:
+/// its only literal is the `ctrl+c` quit binding, which belongs to the
+/// cross-cutting "Safety" section.
 ///
-/// `handle_key` is the global entry point; its only literal is the `ctrl+c`
-/// quit binding, which belongs to the cross-cutting "Safety" section.
+/// A handler split for length (entry + `handle_import_row_key`) is listed twice for
+/// the same section on purpose: the tokens live in the helper, but the context is
+/// the entry point's.
+///
+/// Not listed on purpose: `move_field` (pure field arithmetic, no `KeyCode`) and
+/// `active_filter_column` (returns a column, no key). Listing them would add
+/// nothing and would make the "handler was renamed" failure message misleading.
 const HANDLERS: &[(&str, SectionId)] = &[
     ("handle_key", SectionId::Safety),
     ("handle_main_key", SectionId::Main),
@@ -97,6 +152,11 @@ const HANDLERS: &[(&str, SectionId)] = &[
     ("edit_field", SectionId::FormEditing),
     ("handle_dropdown_key", SectionId::HostPicker),
     ("handle_import_key", SectionId::ImportPane),
+    // `handle_import_key` delegates its row half to a helper: same context, so the
+    // same section. Listing it is what keeps the moved keys attributed to
+    // `import_pane` instead of vanishing from the comparison.
+    ("handle_import_row_key", SectionId::ImportPane),
+    ("handle_import_move_key", SectionId::ImportPane),
     ("handle_import_filter_key", SectionId::ImportFilter),
     ("handle_confirm_key", SectionId::Confirm),
     ("handle_detail_key", SectionId::Detail),
@@ -628,6 +688,60 @@ fn every_documented_key_is_dispatched() {
         "the in-app help advertises keys that do nothing (fix or remove the rows named below):\n{}",
         report.join("\n")
     );
+}
+
+/// Every key-binding file is embedded, and no handler vanished in the move.
+///
+/// `concat!(include_str!(…))` is the one part of this test that cannot be derived
+/// from the source it checks: a new `src/keys/<context>.rs` would compile fine
+/// while its keys silently left the comparison, and the section it belongs to
+/// would just look "documented but not dispatched" — a false red, or worse a
+/// vacuous green if the section were prose. Two independent guards:
+///
+/// * the files listed in [`KEY_HANDLER_FILES`] are on disk (a rename breaks the
+///   build loudly), and each one still contains at least one `KeyCode::` literal
+///   after [`strip_noise`] (so an emptied or gutted file is caught);
+/// * the directory and the list are the same set, so adding a dispatcher requires
+///   adding it to [`KEYS_SRC`] in the same edit.
+#[test]
+fn every_key_handler_file_is_embedded() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/keys");
+    let mut on_disk: Vec<String> = std::fs::read_dir(&dir)
+        .expect("src/keys/ must exist: the key dispatch is split into it")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .filter(|name| name.ends_with(".rs"))
+        .collect();
+    on_disk.sort();
+
+    // `testkit.rs` is test-only fixtures; every other submodule binds keys.
+    let expected: Vec<String> = KEY_HANDLER_FILES
+        .iter()
+        .filter_map(|path| path.strip_prefix("src/keys/"))
+        .map(str::to_string)
+        .chain(std::iter::once("testkit.rs".to_string()))
+        .collect();
+    let mut expected = expected;
+    expected.sort();
+    assert_eq!(
+        on_disk, expected,
+        "`src/keys/` and KEY_HANDLER_FILES disagree. A file in the directory but not in the list \
+         means its keys are NOT compared against the help — add it to KEYS_SRC and KEY_HANDLER_FILES."
+    );
+
+    let mut missing = Vec::new();
+    for path in KEY_HANDLER_FILES {
+        let full = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(path);
+        let Ok(text) = std::fs::read_to_string(&full) else {
+            missing.push(format!("  {path}: listed in KEY_HANDLER_FILES but does not exist"));
+            continue;
+        };
+        let clean: String = strip_noise(&text).iter().collect();
+        if !clean.contains("KeyCode::") {
+            missing.push(format!("  {path}: listed as a key handler but dispatches no `KeyCode::`"));
+        }
+    }
+    assert!(missing.is_empty(), "the embedded key sources are out of date:\n{}", missing.join("\n"));
 }
 
 /// The two sets really are compared, not trivially empty.
