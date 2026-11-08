@@ -78,6 +78,19 @@ jobs:
       - name: Help coverage
         run: cargo test --test help_coverage
 
+      # Safety and size policy: no `.unwrap()`/`.expect()`/`panic!` in production
+      # code, `unsafe` only in the crash writer with a `// SAFETY:` note, a `//!`
+      # module doc on every source file, and no file over the production-line
+      # budget. Like the help-coverage test this reads the source tree, so it is
+      # platform-independent — and like it, it would otherwise never run, because
+      # `cargo test --lib` does not execute `tests/*.rs` targets.
+      #
+      # These are properties of the checkout, not of the OS, so running the same
+      # scan on both matrix entries is cheap and catches a Windows-authored file
+      # that skipped the check locally.
+      - name: Safety & size policy
+        run: cargo test --test safety_guards
+
       - name: Build (release)
         run: cargo build --release
 

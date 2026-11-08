@@ -8,27 +8,36 @@
 
 use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use crate::app::log as eventlog;
 use crate::config::{self, ConfigFile, Paths};
+use crate::eventlog;
 use crate::help;
 use crate::logging;
 use crate::model::{
     BatchAction, FailureInfo, FormMode, ForwardKind, HostPicker, MultiSelect, StatusMsg, TunnelConfig, TunnelId,
-    TunnelStatus, TunnelView, fuzzy_match, now_unix,
+    TunnelView,
 };
-use crate::ssh::{self, SshHost};
+use crate::ssh::SshHost;
 use crate::tunnel::{Supervisor, TunnelEvent};
 
 pub mod confirm;
+pub mod events;
 pub mod form;
+pub mod form_submit;
+pub mod helpers;
 pub mod import;
-pub mod log;
+pub mod import_pane;
 pub mod mouse;
+pub mod overlay;
+pub mod persist;
 pub mod picker;
+pub mod query;
 pub mod runtime;
 pub mod select;
+
+pub(crate) use helpers::deadline_after;
+pub use helpers::{backoff, build_views, sanitize_config};
 
 pub use form::{EditMode, FormState};
 
@@ -214,128 +223,6 @@ impl App {
         }
     }
 
-    // -- queries -----------------------------------------------------------
-
-    /// Indices into `tunnels` for rows matching the current filter, in order.
-    pub fn visible_indices(&self) -> Vec<usize> {
-        self.tunnels
-            .iter()
-            .enumerate()
-            .filter(|(_, t)| {
-                self.filter.is_empty()
-                    || fuzzy_match(&self.filter, &t.cfg.name)
-                    || fuzzy_match(&self.filter, &t.cfg.ssh_host)
-            })
-            .map(|(i, _)| i)
-            .collect()
-    }
-
-    /// Ids of the rows currently visible (filter applied), in display order.
-    pub fn visible_ids(&self) -> Vec<TunnelId> {
-        self.visible_indices().iter().filter_map(|i| self.tunnels.get(*i)).map(|t| t.cfg.id).collect()
-    }
-
-    /// Marked ids that still exist, in display order so prompts and bulk logs
-    /// read in the same order as the table.
-    pub fn marked_ids_in_view_order(&self) -> Vec<TunnelId> {
-        self.visible_ids().into_iter().filter(|id| self.select_mode.is_marked(*id)).collect()
-    }
-
-    pub fn selected_tunnel(&self) -> Option<&TunnelView> {
-        self.visible_indices().get(self.selected).and_then(|i| self.tunnels.get(*i))
-    }
-
-    pub fn selected_id(&self) -> Option<TunnelId> {
-        self.selected_tunnel().map(|t| t.cfg.id)
-    }
-
-    pub fn tunnel(&self, id: TunnelId) -> Option<&TunnelView> {
-        self.tunnels.iter().find(|t| t.cfg.id == id)
-    }
-
-    /// Clamp `selected` into the current (possibly filtered) view.
-    ///
-    /// `selected` indexes `visible_indices()`, so narrowing the filter can leave
-    /// it pointing past the end. Every reader of `selected` goes through
-    /// `visible_indices()`, so one clamp here keeps the cursor valid after any
-    /// filter change or deletion.
-    pub fn clamp_selection(&mut self) {
-        let n = self.visible_indices().len();
-        if n == 0 {
-            self.selected = 0;
-        } else if self.selected >= n {
-            self.selected = n - 1;
-        }
-    }
-
-    pub fn select_next(&mut self) {
-        self.clamp_selection();
-        let n = self.visible_indices().len();
-        if n > 0 && self.selected + 1 < n {
-            self.selected += 1;
-        }
-    }
-
-    pub fn select_prev(&mut self) {
-        self.clamp_selection();
-        self.selected = self.selected.saturating_sub(1);
-    }
-
-    pub fn select_first(&mut self) {
-        self.selected = 0;
-    }
-
-    pub fn select_last(&mut self) {
-        self.selected = self.visible_indices().len().saturating_sub(1);
-    }
-
-    pub fn counts(&self) -> Counts {
-        let mut c = Counts::default();
-        for t in &self.tunnels {
-            match &t.status {
-                TunnelStatus::Up { .. } => c.up += 1,
-                TunnelStatus::Starting { .. } => c.starting += 1,
-                TunnelStatus::Retrying { .. } => c.retrying += 1,
-                TunnelStatus::Failed { .. } => c.failed += 1,
-                TunnelStatus::Stopped => c.off += 1,
-            }
-        }
-        c.total = self.tunnels.len();
-        c
-    }
-
-    pub fn running_count(&self) -> usize {
-        self.supervisor.running_count()
-    }
-
-    pub fn set_status(&mut self, msg: StatusMsg) {
-        self.status = Some(msg);
-    }
-
-    /// Drop the transient message once it has aged out.
-    pub fn expire_status(&mut self) {
-        if self.status.as_ref().is_some_and(|s| s.expired()) {
-            self.status = None;
-        }
-    }
-
-    // -- host discovery ----------------------------------------------------
-
-    pub fn load_hosts(&mut self) {
-        match ssh::list_hosts() {
-            Ok(hosts) => {
-                eventlog::hosts_loaded(hosts.len());
-                self.hosts = hosts;
-                self.hosts_error = None;
-            }
-            Err(e) => {
-                eventlog::hosts_failed(&e.to_string());
-                self.hosts.clear();
-                self.hosts_error = Some(e.to_string());
-            }
-        }
-    }
-
     // -- mutation ----------------------------------------------------------
 
     /// Allocate the next free tunnel id, or `None` when the space is exhausted.
@@ -463,76 +350,6 @@ impl App {
         self.supervisor.stop_all();
         self.save_state();
     }
-
-    // -- overlays ----------------------------------------------------------
-
-    pub fn open_help(&mut self) {
-        self.overlay = Overlay::Help;
-        self.help_scroll = 0;
-    }
-
-    pub fn open_form_create(&mut self) {
-        let bind = self.cfg.defaults.bind.clone();
-        let mut form = FormState::create(&bind);
-        form.auto_restart = self.cfg.defaults.auto_restart;
-        self.form = Some(form);
-        self.overlay = Overlay::Form;
-    }
-
-    pub fn open_form_edit(&mut self) {
-        let Some(view) = self.selected_tunnel() else {
-            return;
-        };
-        self.form = Some(FormState::edit(&view.cfg));
-        self.overlay = Overlay::Form;
-    }
-
-    pub fn open_detail(&mut self) {
-        if let Some(id) = self.selected_id() {
-            self.overlay = Overlay::Detail(id);
-            self.detail_scroll = 0;
-        }
-    }
-
-    pub fn close_overlay(&mut self) {
-        self.overlay = Overlay::None;
-        self.form = None;
-        self.picker = None;
-    }
-
-    // -- persistence -------------------------------------------------------
-
-    pub fn persist(&mut self) -> Result<(), String> {
-        for view in &self.tunnels {
-            if let Some(slot) = self.cfg.find_mut(view.cfg.id) {
-                slot.enabled = view.cfg.enabled;
-                slot.name = view.cfg.name.clone();
-            }
-        }
-        config::save(&self.paths.config, &self.cfg).map_err(|e| {
-            eventlog::config_save_failed(&config::display_path(&self.paths.config), &e.to_string());
-            e.to_string()
-        })
-    }
-
-    fn persist_quietly(&mut self) {
-        if let Err(e) = self.persist() {
-            self.set_status(StatusMsg::error(help::bi(
-                &format!("保存配置失败: {e}"),
-                &format!("Cannot save the config: {e}"),
-            )));
-        }
-    }
-
-    pub fn save_state(&self) {
-        let mut st = config::StateFile { last_run: now_unix(), ..Default::default() };
-        for view in &self.tunnels {
-            st.last_state.insert(view.cfg.id.to_string(), view.status.key().to_string());
-        }
-        if let Err(e) = config::save_state(&self.paths.state, &st) {
-            eventlog::state_save_failed(&config::display_path(&self.paths.state), &e.to_string());
-        }
-    }
 }
 
 /// Counters for the header line.
@@ -546,73 +363,11 @@ pub struct Counts {
     pub total: usize,
 }
 
-fn build_views(cfg: &ConfigFile) -> Vec<TunnelView> {
-    cfg.tunnels
-        .iter()
-        .map(|c| {
-            let mut v = TunnelView::new(c.clone());
-            // Nothing is running until `restore_enabled` says so.
-            v.status = TunnelStatus::Stopped;
-            v
-        })
-        .collect()
-}
-
-/// Coerce hand-edited numeric defaults into the range the app can operate in.
-///
-/// Each field is clamped separately and any change is logged, so a config that
-/// was quietly repaired is discoverable afterwards (`retry_initial_secs = 0`
-/// would otherwise look like "sshpf reconnects in a tight loop for no reason").
-fn sanitize_config(cfg: &mut ConfigFile) {
-    let defaults = &mut cfg.defaults;
-    let initial = defaults.retry_initial_secs.clamp(MIN_RETRY_SECS, MAX_RETRY_SECS);
-    if initial != defaults.retry_initial_secs {
-        eventlog::config_defaults_clamped("retry_initial_secs", defaults.retry_initial_secs, initial);
-        defaults.retry_initial_secs = initial;
-    }
-    let max = defaults.retry_max_secs.clamp(MIN_RETRY_SECS, MAX_RETRY_SECS);
-    if max != defaults.retry_max_secs {
-        eventlog::config_defaults_clamped("retry_max_secs", defaults.retry_max_secs, max);
-        defaults.retry_max_secs = max;
-    }
-    // `backoff` takes `max_secs.max(initial)` so an inverted pair is survivable,
-    // but the cap should still be the larger of the two by the time it is used.
-    if defaults.retry_max_secs < defaults.retry_initial_secs {
-        let raised = defaults.retry_initial_secs;
-        eventlog::config_defaults_clamped("retry_max_secs", defaults.retry_max_secs, raised);
-        defaults.retry_max_secs = raised;
-    }
-}
-
-/// Add `delay` to `now` without the panic `Instant + Duration` raises on
-/// overflow.
-///
-/// `retry_max_secs` comes from a config file, and `Instant::checked_add` is the
-/// only add that reports the overflow instead of aborting the process.
-pub(crate) fn deadline_after(now: Instant, delay: Duration) -> Instant {
-    match now.checked_add(delay) {
-        Some(at) => at,
-        None => now + Duration::from_secs(MIN_RETRY_SECS),
-    }
-}
-
-/// Exponential backoff: 2s, 4s, 8s … capped at `max_secs`.
-///
-/// Both numbers come from a hand-editable config file, so neither the shift nor
-/// the multiply may overflow (`saturating_*`), and the cap is normalised rather
-/// than `clamp`ed: `clamp` panics when `min > max`, which is exactly what an
-/// `initial > MAX_RETRY_SECS` config would hand it.
-pub fn backoff(attempt: u32, initial: u64, max_secs: u64) -> Duration {
-    let initial = initial.clamp(MIN_RETRY_SECS, MAX_RETRY_SECS);
-    let cap = max_secs.clamp(initial, MAX_RETRY_SECS);
-    let shift = attempt.saturating_sub(1).min(20);
-    let secs = initial.saturating_mul(1u64 << shift).min(cap);
-    Duration::from_secs(secs)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::TunnelStatus;
+    use std::time::Duration;
     // Some types moved into submodules; the tests still reach for them by name.
     use crate::model::{FailureInfo, FailureKind, FormField};
 

@@ -35,72 +35,39 @@ impl App {
             return false;
         };
         let shift = modifiers.contains(crossterm::event::KeyModifiers::SHIFT);
+        self.dispatch_click(target, shift)
+    }
+
+    /// Apply one hit target. Split from [`App::on_left_click`] so the hit map
+    /// lookup and the target table can be read (and tested) separately.
+    ///
+    /// Every arm returns `true`: the click was consumed either way. Falling
+    /// through for a modal (`Popup`, `FilterBar`) would mark or select a row
+    /// painted *under* the dialog — invisible, and destructive in selection mode.
+    /// Returning `false` is reserved for "no hit target at all".
+    fn dispatch_click(&mut self, target: HitTarget, shift: bool) -> bool {
         match target {
-            HitTarget::TunnelRow(id) => {
-                self.click_tunnel_row(id, shift);
-                true
-            }
-            HitTarget::TunnelList => true,
-            HitTarget::ImportCheckbox(row) => {
-                self.import_toggle_at(row);
-                true
-            }
-            HitTarget::ImportRow(row) => {
-                self.import_select_at(row);
-                true
-            }
-            HitTarget::ImportColumnHeader(col) => {
-                self.begin_import_filter(col);
-                true
-            }
-            HitTarget::ImportFilterChip(col) => {
-                self.clear_import_filter(col);
-                true
-            }
-            HitTarget::ImportClearFilters => {
-                self.clear_all_import_filters();
-                true
-            }
-            HitTarget::ImportUndoFilter => {
-                self.undo_import_filter();
-                true
-            }
-            HitTarget::ImportCheckAll => {
-                self.import_check_all();
-                true
-            }
-            HitTarget::ImportInvert => {
-                self.import_invert();
-                true
-            }
-            HitTarget::ImportUncheckAll => {
-                self.import_uncheck_all();
-                true
-            }
-            HitTarget::ImportList => true,
-            HitTarget::BatchAction(action) => {
-                self.request_batch(action);
-                true
-            }
-            HitTarget::BatchExit => {
-                self.exit_select_mode();
-                true
-            }
-            HitTarget::BatchSelectAll => {
-                self.mark_all_toggle();
-                true
-            }
-            // A modal swallowed the click: consume it, do nothing. Letting it
-            // fall through would mark/select a row that is painted *under* the
-            // dialog, which is both invisible and destructive in selection mode.
-            HitTarget::Popup => true,
-            HitTarget::FilterBar => true,
+            HitTarget::TunnelRow(id) => self.click_tunnel_row(id, shift),
+            HitTarget::ImportCheckbox(row) => self.import_toggle_at(row),
+            HitTarget::ImportRow(row) => self.import_select_at(row),
+            HitTarget::ImportColumnHeader(col) => self.begin_import_filter(col),
+            HitTarget::ImportFilterChip(col) => self.clear_import_filter(col),
+            HitTarget::ImportClearFilters => self.clear_all_import_filters(),
+            HitTarget::ImportUndoFilter => self.undo_import_filter(),
+            HitTarget::ImportCheckAll => self.import_check_all(),
+            HitTarget::ImportInvert => self.import_invert(),
+            HitTarget::ImportUncheckAll => self.import_uncheck_all(),
+            HitTarget::BatchAction(action) => self.request_batch(action),
+            HitTarget::BatchExit => self.exit_select_mode(),
+            HitTarget::BatchSelectAll => self.mark_all_toggle(),
             HitTarget::FilterClear => {
                 self.filter.clear();
                 self.selected = 0;
-                true
             }
+            // Containers and modal surfaces: consume, do nothing.
+            HitTarget::TunnelList | HitTarget::ImportList | HitTarget::Popup | HitTarget::FilterBar => {}
         }
+        true
     }
 
     /// Click on a main-table row: move the cursor, and in selection mode also

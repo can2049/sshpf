@@ -43,7 +43,7 @@ pub(crate) const DETAIL_LOG_TAIL: usize = 15;
 /// Every label carries both languages (`名称 Name`), which is worth a much wider
 /// column on a normal terminal but would squeeze the values to nothing on a
 /// small one. So the bilingual column is only paid for when the popup can spare
-/// it; below the threshold the labels degrade to Chinese, which [`crate::help::fit`]
+/// it; below the threshold the labels degrade to Chinese, which [`crate::text::fit`]
 /// then renders on one line.
 pub(crate) fn form_label_w(inner_width: u16) -> usize {
     // 20 cells of label + 1 of gap + 25 of value, the narrowest readable form.
@@ -155,6 +155,38 @@ pub fn column_layout(area_width: u16) -> Vec<(Col, u16)> {
     }
 
     cols.into_iter().zip(widths).collect()
+}
+
+/// Spread `spare` cells across `widths` by `weights`, never overflowing.
+///
+/// The one piece of column arithmetic both tables share: once a row of columns
+/// fits, whatever is left over is handed to the *elastic* ones in proportion to
+/// their weights, and the last elastic column absorbs the rounding remainder so
+/// the spare budget is spent exactly.
+///
+/// The two tables differ in *which* columns are elastic and in how they give
+/// space back (the tunnel table shrinks the widest column one cell at a time), so
+/// they keep their own strategies — this function is deliberately only the "add
+/// spare" half, which is identical in both.
+///
+/// All arithmetic runs in `u32`: a pane can be `u16::MAX` cells wide, where
+/// `spare * 4` overflows a `u16` and panics in a debug build (release would wrap
+/// and hand out a nonsensical width). Every share is provably `<= spare`, so
+/// narrowing it back cannot clip.
+pub(crate) fn distribute_spare(widths: &mut [u16], spare: u16, weights: &[u32], elastic: &[usize]) {
+    if elastic.is_empty() {
+        return;
+    }
+    let mut left = u32::from(spare);
+    let total = u32::from(spare);
+    for (k, &i) in elastic.iter().enumerate() {
+        let Some(slot) = widths.get_mut(i) else { continue };
+        let weight = weights.get(k.min(weights.len().saturating_sub(1))).copied().unwrap_or(0);
+        let share = if k + 1 == elastic.len() { left } else { (total * weight / 10).min(left) };
+        let share = u16::try_from(share).unwrap_or(u16::MAX);
+        *slot = slot.saturating_add(share);
+        left = left.saturating_sub(u32::from(share));
+    }
 }
 
 /// Footprint including the selection gutter and inter-column spacing.

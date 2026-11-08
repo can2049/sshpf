@@ -227,33 +227,17 @@ fn b64_decode(s: &str) -> Result<Vec<u8>, ()> {
     Ok(out)
 }
 
-/// Glob match supporting `*` (any run, including empty) and `?` (one char).
+/// `known_hosts` host-pattern matching: `*` (any run, including empty) and `?`
+/// (one char), **case-sensitive**.
+///
+/// A one-line adapter over [`crate::text::glob_match`]: the matcher used to exist
+/// twice (here and in `ssh/forwards.rs`, which needs it case-*insensitive* for
+/// ssh `Host` patterns) and the copies had begun to drift. Only the case rule
+/// lives here — it is a property of the `known_hosts` file format, not of glob
+/// matching. Folding case would be a security bug: `Web1` and `web1` are
+/// different hosts.
 fn glob_match(pattern: &str, text: &str) -> bool {
-    let p: Vec<char> = pattern.chars().collect();
-    let t: Vec<char> = text.chars().collect();
-    // Iterative backtracking matcher: O(n*m) worst case, no recursion.
-    let (mut pi, mut ti) = (0usize, 0usize);
-    let (mut star, mut mark) = (usize::MAX, 0usize);
-    while ti < t.len() {
-        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
-            pi += 1;
-            ti += 1;
-        } else if pi < p.len() && p[pi] == '*' {
-            star = pi;
-            mark = ti;
-            pi += 1;
-        } else if star != usize::MAX {
-            pi = star + 1;
-            mark += 1;
-            ti = mark;
-        } else {
-            return false;
-        }
-    }
-    while pi < p.len() && p[pi] == '*' {
-        pi += 1;
-    }
-    pi == p.len()
+    crate::text::glob_match(pattern, text, false)
 }
 
 /// Verify `server_key` for `host:port` against `known_hosts`.

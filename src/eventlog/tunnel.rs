@@ -1,24 +1,17 @@
-//! Glue between the app's state machine and [`crate::logging`].
+//! Tunnel-scoped event vocabulary: start/ready/retry/exit/failed/stop, plus the
+//! per-connection events the forwarding drivers emit (`forward.*`, `socks5.*`).
 //!
-//! Kept as one module so the event vocabulary lives in a single place: which
-//! events exist, what fields they carry, and which severity each gets is a
-//! contract with whoever reads the file later (`docs/logging.md`). Call sites in
-//! `app`/`app::runtime`/`main` therefore call a named function here instead of
-//! formatting a record inline — that is what keeps `event=` values stable.
+//! Everything here either takes a [`TunnelConfig`] (so the record carries the
+//! tunnel's identity fields first — see [`tunnel_fields`]) or only a
+//! [`TunnelId`] when the record comes from a tunnel thread that has no access to
+//! the definition any more.
 //!
-//! # Severity policy
-//!
-//! * `error` — the user asked for something and it did not happen, or a tunnel
-//!   died and will not retry on its own. These are the lines to read first.
-//! * `warn` — degraded but self-healing: retry scheduled, host key learned,
-//!   config repaired, permissions tightened, gate refused.
-//! * `info` — the expected lifecycle: start-up, tunnel transitions, user
-//!   actions. Enough to reconstruct a session without the UI.
-//! * `debug` — high-volume detail (per-connection forwards, frame timing).
+//! Add a new tunnel lifecycle event **here**, never inline at a call site: the
+//! `event=` value is a contract with `docs/logging.md` and with whoever greps
+//! the file later.
 
 use crate::logging::{self, Level, Logger};
 use crate::model::{FailureInfo, ForwardKind, TunnelConfig, TunnelId};
-use crate::ssh::known_hosts::HostKeyPolicy;
 
 /// Stable name for a forward kind, used instead of the display label so the log
 /// is not coupled to UI wording.
@@ -69,100 +62,6 @@ pub fn tunnel_event_on(logger: &Logger, level: Level, event: &str, cfg: &TunnelC
     logger.event(level, event, &refs);
 }
 
-// ---------------------------------------------------------------------------
-// lifecycle
-// ---------------------------------------------------------------------------
-
-/// The process started: version and where its state lives.
-pub fn app_start(version: &str, config_path: &str, log_path: &str) {
-    logging::info(
-        "app.start",
-        &[
-            ("version", &version),
-            ("pid", &std::process::id()),
-            ("config", &config_path),
-            ("log", &log_path),
-            ("os", &std::env::consts::OS),
-            ("arch", &std::env::consts::ARCH),
-        ],
-    );
-}
-
-/// The process is exiting, with a reason and how long it ran.
-pub fn app_exit(reason: &str, uptime_ms: u128, tunnels_up: usize) {
-    logging::info("app.exit", &[("reason", &reason), ("uptime_ms", &uptime_ms), ("tunnels_up", &tunnels_up)]);
-}
-
-/// A CLI mode that does not start the TUI (`--check`, `--list-hosts`, …).
-pub fn cli_mode(mode: &str) {
-    logging::debug("app.cli_mode", &[("mode", &mode)]);
-}
-
-/// A command-line or configuration error that made the process exit non-zero.
-pub fn cli_error(event: &str, message: &str) {
-    logging::error(event, &[("msg", &message)]);
-}
-
-// ---------------------------------------------------------------------------
-// config
-// ---------------------------------------------------------------------------
-
-/// Config loaded. `tunnels` is the number of definitions read.
-///
-/// A repair (id/name collision, tightened permissions) is a `warn`: the user's
-/// file was not what it claimed to be, and knowing that explains later surprises.
-pub fn config_loaded(path: &str, tunnels: usize, problems: &[String]) {
-    logging::info("config.loaded", &[("path", &path), ("tunnels", &tunnels), ("problems", &problems.len())]);
-    for problem in problems {
-        logging::warn("config.invalid", &[("path", &path), ("msg", problem)]);
-    }
-}
-
-/// Loading failed and the app fell back to an empty config. `error`: any tunnel
-/// the user thinks they have is about to be invisible.
-pub fn config_load_failed(path: &str, error: &str, fallback: &str) {
-    logging::error("config.load_failed", &[("path", &path), ("msg", &error), ("fallback", &fallback)]);
-}
-
-/// Definitions were repaired on load (duplicate ids, missing timestamps).
-pub fn config_repaired(path: &str, count: usize) {
-    logging::warn("config.repaired", &[("path", &path), ("entries", &count)]);
-}
-
-/// Persisting failed. The change is live but will not survive a restart.
-pub fn config_save_failed(path: &str, error: &str) {
-    logging::error("config.save_failed", &[("path", &path), ("msg", &error)]);
-}
-
-/// The config file was group/world readable and has been tightened to `0600`.
-pub fn config_perms_tightened(path: &str, ok: bool) {
-    let level = if ok { Level::Warn } else { Level::Error };
-    logging::logger().event(level, "config.perms_tightened", &[("path", &path), ("ok", &ok)]);
-}
-
-/// The runtime state file could not be written.
-pub fn state_save_failed(path: &str, error: &str) {
-    logging::warn("state.save_failed", &[("path", &path), ("msg", &error)]);
-}
-
-/// A hand-edited default in `config.toml` was out of range and has been replaced.
-///
-/// `field` is the stable config key (`retry_initial_secs` / `retry_max_secs`),
-/// `original` what the file asked for, `used` what the app will actually do.
-/// A `retry_initial_secs = 0` is the interesting case: it turns the reconnect
-/// loop into a per-frame storm, so it is clamped instead of obeyed.
-pub fn config_defaults_clamped(field: &str, original: u64, used: u64) {
-    config_defaults_clamped_on(logging::logger(), field, original, used);
-}
-
-pub fn config_defaults_clamped_on(logger: &Logger, field: &str, original: u64, used: u64) {
-    logger.event(
-        Level::Warn,
-        "config.defaults_clamped",
-        &[("field", &field), ("original", &original), ("used", &used)],
-    );
-}
-
 /// A retry chain stopped for good: the attempt failed in a way a retry cannot
 /// fix (invalid definition, port still in use, unresolvable host, spawn failure).
 ///
@@ -186,83 +85,6 @@ pub fn tunnel_retry_abandoned_on(logger: &Logger, cfg: &TunnelConfig, attempt: u
         ],
     );
 }
-
-/// The tunnel-id space (`u64`) is exhausted, so no new definition can be given a
-/// unique id. Only reachable from a hand-edited config with a huge id; the
-/// action is refused rather than reusing an id that already exists.
-pub fn id_space_exhausted(max_id: TunnelId) {
-    id_space_exhausted_on(logging::logger(), max_id);
-}
-
-pub fn id_space_exhausted_on(logger: &Logger, max_id: TunnelId) {
-    logger.event(Level::Error, "app.id_space_exhausted", &[("max_id", &max_id)]);
-}
-
-/// A confirmation was armed for a tunnel id that is no longer in the table.
-///
-/// The dialog still opens with a fallback sentence, so the user is not stuck;
-/// the record is what explains why the prompt had no name in it.
-pub fn action_target_missing(action: &str) {
-    action_target_missing_on(logging::logger(), action);
-}
-
-pub fn action_target_missing_on(logger: &Logger, action: &str) {
-    logger.event(Level::Warn, "action.target_missing", &[("action", &action)]);
-}
-
-/// The form's `kind_idx` pointed outside `ForwardKind::all()`.
-///
-/// Only reachable if a caller assigns the index directly; the form falls back to
-/// the default kind so the dialog stays usable, and this line says why the
-/// highlighted kind may look reset.
-pub fn form_kind_index_invalid(index: usize, len: usize) {
-    form_kind_index_invalid_on(logging::logger(), index, len);
-}
-
-pub fn form_kind_index_invalid_on(logger: &Logger, index: usize, len: usize) {
-    logger.event(Level::Warn, "form.kind_index_invalid", &[("index", &index), ("len", &len)]);
-}
-
-/// A mouse click resolved to an import row that is no longer in the filtered view.
-///
-/// The hit map is drawn one frame ahead of the click, so a re-filter or a
-/// re-discovery can invalidate it. The click is dropped (rather than being
-/// applied to whatever row now occupies that slot) and recorded here.
-pub fn import_click_stale(row: usize) {
-    logging::debug("import.click_stale", &[("row", &row)]);
-}
-
-// ---------------------------------------------------------------------------
-// hosts
-// ---------------------------------------------------------------------------
-
-/// `~/.ssh/config` was read (or failed to be read).
-pub fn hosts_loaded(count: usize) {
-    logging::info("sshconfig.loaded", &[("hosts", &count)]);
-}
-
-pub fn hosts_failed(error: &str) {
-    logging::warn("sshconfig.load_failed", &[("msg", &error)]);
-}
-
-/// Stable name for the host-key policy, so the log wording is not the enum's
-/// debug formatting.
-pub fn host_key_policy_name(policy: HostKeyPolicy) -> &'static str {
-    match policy {
-        HostKeyPolicy::Strict => "strict",
-        HostKeyPolicy::AcceptNew => "accept-new",
-        HostKeyPolicy::Ask => "ask",
-    }
-}
-
-/// A configured host could not be resolved; `detail` is the full error chain.
-pub fn host_resolve_failed(cfg: &TunnelConfig, detail: &str) {
-    tunnel_event(Level::Error, "sshconfig.resolve_failed", cfg, &[("msg", detail.to_string())]);
-}
-
-// ---------------------------------------------------------------------------
-// tunnel lifecycle
-// ---------------------------------------------------------------------------
 
 /// User (or restore) asked for this tunnel to be up.
 pub fn tunnel_start_requested(cfg: &TunnelConfig, trigger: &str) {
@@ -414,31 +236,6 @@ pub fn tunnel_line_on(logger: &Logger, cfg: &TunnelConfig, line: &str) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// user actions
-// ---------------------------------------------------------------------------
-
-/// A destructive/consequential action was confirmed and applied.
-pub fn action_applied(action: &str, detail: &str) {
-    logging::info("action.applied", &[("action", &action), ("detail", &detail)]);
-}
-
-/// A risky action was requested and the confirmation gate is now open.
-pub fn action_requested(action: &str, detail: &str) {
-    logging::debug("action.requested", &[("action", &action), ("detail", &detail)]);
-}
-
-/// A risky action was cancelled at the gate.
-pub fn action_cancelled(action: &str) {
-    logging::info("action.cancelled", &[("action", &action)]);
-}
-
-/// A batch operation finished; `changed` is what actually changed (not what was
-/// marked), which is the number the user was shown.
-pub fn action_batch(action: &str, marked: usize, changed: usize) {
-    logging::info("action.batch", &[("action", &action), ("marked", &marked), ("changed", &changed)]);
-}
-
 /// A tunnel definition was created (by the form or by import).
 pub fn tunnel_created(cfg: &TunnelConfig, source: &str) {
     tunnel_event(Level::Info, "tunnel.created", cfg, &[("source", source.to_string())]);
@@ -454,37 +251,6 @@ pub fn tunnel_deleted(cfg: &TunnelConfig) {
     tunnel_event(Level::Info, "tunnel.deleted", cfg, &[]);
 }
 
-/// A batch import from `~/.ssh/config` produced `created` tunnels.
-pub fn import_committed(host: &str, created: usize) {
-    logging::info("import.committed", &[("host", &host), ("created", &created)]);
-}
-
-/// Import validation failed; nothing was created.
-pub fn import_rejected(problems: &[String]) {
-    logging::warn("import.rejected", &[("problems", &problems.len()), ("msg", &problems.join("; "))]);
-}
-
-// ---------------------------------------------------------------------------
-// thread-side events (no `TunnelConfig` available: only the id)
-// ---------------------------------------------------------------------------
-
-/// A server key was learned into `known_hosts` under `accept-new`.
-///
-/// `warn`, not `info`: this is a new trust anchor being created, and it is the
-/// line that explains "why does this host now connect without asking?".
-pub fn host_key_learned(id: TunnelId, host: &str, port: u16, verdict: &str) {
-    logging::warn("knownhosts.learned", &[("tunnel", &id), ("host", &host), ("port", &port), ("verdict", &verdict)]);
-}
-
-/// A server key was refused. `changed`/`revoked` are security events; an
-/// unknown key under `strict` is a policy refusal. All are `error`.
-pub fn host_key_rejected(id: TunnelId, host: &str, port: u16, policy: &str, detail: &str) {
-    logging::error(
-        "knownhosts.rejected",
-        &[("tunnel", &id), ("host", &host), ("port", &port), ("policy", &policy), ("msg", &detail)],
-    );
-}
-
 /// Connecting a through-tunnel connection to the target failed.
 ///
 /// The tunnel itself stays up (`ssh -L` behaves the same), so this is a `warn`:
@@ -496,26 +262,6 @@ pub fn forward_target_failed(id: TunnelId, target: &str, error: &str) {
 /// A SOCKS5 request was rejected or malformed.
 pub fn socks5_rejected(id: TunnelId, detail: &str) {
     logging::debug("socks5.rejected", &[("tunnel", &id), ("msg", &detail)]);
-}
-
-// ---------------------------------------------------------------------------
-// anomalies
-// ---------------------------------------------------------------------------
-
-/// The UI frame took far longer than the 200 ms tick — the first thing to check
-/// when the TUI feels stuck.
-pub fn slow_frame(elapsed_ms: u128) {
-    logging::warn("ui.slow_frame", &[("elapsed_ms", &elapsed_ms)]);
-}
-
-/// A supervisor event arrived for a tunnel that no longer exists.
-pub fn orphan_event(event: &str, id: TunnelId) {
-    logging::debug("app.orphan_event", &[("event", &event), ("tunnel", &id)]);
-}
-
-/// The user's terminal does not support mouse reporting; the UI keeps working.
-pub fn mouse_capture_failed() {
-    logging::debug("ui.no_mouse", &[]);
 }
 
 #[cfg(test)]
@@ -650,23 +396,6 @@ mod tests {
         assert!(text(dir.path()).is_empty(), "at info level a progress line must not be written");
     }
 
-    // -- panic-hardening events -------------------------------------------
-
-    #[test]
-    fn a_clamped_default_names_the_field_and_both_numbers() {
-        // A repaired config must be discoverable: which key was wrong, what it
-        // said, and what sshpf will actually use.
-        let dir = tempfile::tempdir().unwrap();
-        let log = logger(dir.path());
-        config_defaults_clamped_on(&log, "retry_initial_secs", 0, 1);
-        let text = text(dir.path());
-        assert!(text.contains(" WARN "), "{text}");
-        assert!(text.contains("event=config.defaults_clamped"), "{text}");
-        assert!(text.contains("field=retry_initial_secs"), "{text}");
-        assert!(text.contains("original=0"), "{text}");
-        assert!(text.contains("used=1"), "{text}");
-    }
-
     #[test]
     fn an_abandoned_retry_says_which_stage_gave_up() {
         // The row stops flapping; this is the line that explains why, and which
@@ -682,46 +411,5 @@ mod tests {
         assert!(text.contains("stage=preflight_bind"), "{text}");
         assert!(text.contains("kind=port_in_use"), "{text}");
         assert!(text.contains("tunnel=7 name=cloud-pc"), "identity fields still come first: {text}");
-    }
-
-    #[test]
-    fn an_exhausted_id_space_is_an_error_that_names_the_maximum() {
-        let dir = tempfile::tempdir().unwrap();
-        let log = logger(dir.path());
-        id_space_exhausted_on(&log, u64::MAX);
-        let text = text(dir.path());
-        assert!(text.contains(" ERROR "), "{text}");
-        assert!(text.contains("event=app.id_space_exhausted"), "{text}");
-        assert!(text.contains("max_id=18446744073709551615"), "{text}");
-    }
-
-    #[test]
-    fn a_missing_action_target_is_a_warning_not_a_crash() {
-        let dir = tempfile::tempdir().unwrap();
-        let log = logger(dir.path());
-        action_target_missing_on(&log, "delete");
-        let text = text(dir.path());
-        assert!(text.contains(" WARN "), "{text}");
-        assert!(text.contains("event=action.target_missing"), "{text}");
-        assert!(text.contains("action=delete"), "{text}");
-    }
-
-    #[test]
-    fn an_invalid_kind_index_records_both_the_index_and_the_length() {
-        let dir = tempfile::tempdir().unwrap();
-        let log = logger(dir.path());
-        form_kind_index_invalid_on(&log, 99, 3);
-        let text = text(dir.path());
-        assert!(text.contains(" WARN "), "{text}");
-        assert!(text.contains("event=form.kind_index_invalid"), "{text}");
-        assert!(text.contains("index=99"), "{text}");
-        assert!(text.contains("len=3"), "{text}");
-    }
-
-    #[test]
-    fn host_key_names_are_stable() {
-        assert_eq!(host_key_policy_name(crate::ssh::known_hosts::HostKeyPolicy::Strict), "strict");
-        assert_eq!(host_key_policy_name(crate::ssh::known_hosts::HostKeyPolicy::AcceptNew), "accept-new");
-        assert_eq!(host_key_policy_name(crate::ssh::known_hosts::HostKeyPolicy::Ask), "ask");
     }
 }

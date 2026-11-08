@@ -14,8 +14,8 @@
 //! * Batch actions still go through the confirmation gate. Even "enable" opens N
 //!   listeners at once — the same reason single-row enable-all asks.
 
-use crate::app::log as eventlog;
 use crate::app::{App, ConfirmAction, Overlay};
+use crate::eventlog;
 use crate::help;
 use crate::model::{BatchAction, StatusMsg};
 

@@ -13,7 +13,9 @@
 //! ```
 
 pub mod app;
+pub mod cli;
 pub mod config;
+pub mod eventlog;
 pub mod help;
 pub mod keys;
 pub mod logging;

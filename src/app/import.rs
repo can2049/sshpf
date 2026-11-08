@@ -24,276 +24,11 @@
 //!   a state the user never asked for, so everything is validated up front and
 //!   nothing is written unless all of it is valid.
 
-use crate::app::log as eventlog;
 use crate::app::{App, FormMode};
 use crate::config;
 use crate::help;
-use crate::model::{
-    self, ForwardKind, ImportColumn, ImportTable, SshForward, StatusMsg, TunnelConfig, TunnelView, now_unix,
-};
-use crate::{keys, ssh};
-
-impl App {
-    /// Read the forwards declared for `host_alias` and load them into the open
-    /// form's import table.
-    ///
-    /// Called when the SSH HOST field changes (and when the picker accepts a
-    /// host), so the table always describes the host currently in the field.
-    /// Re-running for the same host is a no-op, which keeps typing cheap.
-    pub fn refresh_import_table(&mut self, host_alias: &str) {
-        let alias = host_alias.trim().to_string();
-        let Some(form) = self.form.as_ref() else {
-            return;
-        };
-        // Editing an existing tunnel must not silently rewrite it into a batch:
-        // the import table only exists for new tunnels.
-        if matches!(form.mode, FormMode::Edit(_)) {
-            return;
-        }
-        // Same host: keep the table *and* the user's tick marks / collapsed
-        // state. Re-discovery here would throw away choices they already made.
-        if form.import_host_name() == alias {
-            return;
-        }
-        // Empty field means "no host chosen yet". Do not scan for it: `Host *`
-        // matches the empty string, which would list the global forwards under
-        // an alias the user never picked.
-        if alias.is_empty() {
-            self.install_import_rows(String::new(), Vec::new());
-            self.import_error = None;
-            return;
-        }
-
-        let (forwards, error) = match ssh::forwards::forwards_for_host(&alias) {
-            Ok(rows) => (rows, None),
-            Err(e) => (
-                Vec::new(),
-                Some(help::bi(
-                    &format!("读取 ~/.ssh/config 转发配置失败: {e}"),
-                    &format!("Cannot read the forward rules in ~/.ssh/config: {e}"),
-                )),
-            ),
-        };
-        self.install_import_rows(alias, forwards);
-        self.import_error = error;
-    }
-
-    /// Install the rows discovered for `host` and decide whether the pane shows.
-    ///
-    /// This is the whole "default, not a hidden offer" rule, kept separate from
-    /// discovery so it can be unit-tested without a real `~/.ssh/config`:
-    ///
-    /// * at least one **importable** row → open, every importable row already
-    ///   ticked (`ImportTable::new` does the ticking) and the user unticks what
-    ///   they do not want;
-    /// * no importable row (either nothing at all, or only rows that cannot be
-    ///   mapped onto a `TunnelConfig`) → stay closed, so the form is not covered
-    ///   by a pane with nothing to tick. `space`/`i` still opens it, which is how
-    ///   the un-importable rows explain themselves.
-    ///
-    /// Only a *changed* host reaches this (see `refresh_import_table`), so
-    /// re-committing the same alias cannot undo a deliberate collapse.
-    pub(crate) fn install_import_rows(&mut self, host: impl Into<String>, forwards: Vec<SshForward>) {
-        let table = ImportTable::new(forwards);
-        let importable = table.importable_count();
-        if let Some(form) = self.form.as_mut() {
-            form.set_import_table(host, table);
-            form.import_open = importable > 0;
-        }
-    }
-
-    /// Re-run discovery for whatever is in the SSH HOST field.
-    pub fn refresh_import_for_current_host(&mut self) {
-        let alias = match self.form.as_ref() {
-            Some(f) => f.ssh_host.value().to_string(),
-            None => return,
-        };
-        self.refresh_import_table(&alias);
-    }
-
-    /// `space`/`i` on the SSH HOST field: show or hide the import pane.
-    ///
-    /// Loads the table first if it is stale, so the pane can never display rows
-    /// belonging to a different host.
-    pub fn toggle_import_pane(&mut self) {
-        self.refresh_import_for_current_host();
-        let Some(form) = self.form.as_mut() else {
-            return;
-        };
-        if form.import.is_empty() {
-            self.import_error = self.import_error.clone().or_else(|| {
-                Some(help::bi(
-                    &format!("{} 在 ~/.ssh/config 中没有端口转发配置", form.ssh_host.value()),
-                    &format!("{} has no port forwards in ~/.ssh/config", form.ssh_host.value()),
-                ))
-            });
-            form.import_open = false;
-            let msg = self.import_error.clone().unwrap_or_default();
-            self.set_status(StatusMsg::warn(msg));
-            return;
-        }
-        form.import_open = !form.import_open;
-        form.import.end_filter();
-    }
-
-    pub fn close_import_pane(&mut self) {
-        if let Some(form) = self.form.as_mut() {
-            form.import_open = false;
-            form.import.end_filter();
-        }
-    }
-
-    pub fn import_pane_open(&self) -> bool {
-        self.form.as_ref().is_some_and(|f| f.import_open && !f.import.is_empty())
-    }
-
-    // -- filter editing ----------------------------------------------------
-
-    /// Start typing into one column's filter (bound to the header click /
-    /// `f` cycling, and to mouse clicks on a header).
-    ///
-    /// Leaves the text field's editing stage if it was active. Two cursors cannot
-    /// both own the keyboard, and after this change the loser is decided by
-    /// `is_editing_field()` rather than by draw order — so a mouse click on a
-    /// header while a field was being edited would otherwise show the filter
-    /// cursor in the pane while every keystroke still went into the field.
-    pub fn begin_import_filter(&mut self, col: ImportColumn) {
-        if let Some(form) = self.form.as_mut() {
-            form.end_edit();
-            form.import.begin_filter(col);
-            form.import_open = true;
-        }
-    }
-
-    pub fn end_import_filter(&mut self) {
-        if let Some(form) = self.form.as_mut() {
-            form.import.end_filter();
-        }
-    }
-
-    /// Route a character into the filter of the column being edited.
-    pub fn import_filter_char(&mut self, c: char) {
-        if let Some(form) = self.form.as_mut()
-            && let Some(col) = form.import.editing
-        {
-            form.import.filter_char(col, c);
-        }
-    }
-
-    pub fn import_filter_backspace(&mut self) {
-        if let Some(form) = self.form.as_mut()
-            && let Some(col) = form.import.editing
-        {
-            form.import.filter_backspace(col);
-        }
-    }
-
-    /// Delete the filter on `col` (chip `×`, or `F` on a column).
-    pub fn clear_import_filter(&mut self, col: ImportColumn) {
-        if let Some(form) = self.form.as_mut() {
-            form.import.clear_filter(col);
-        }
-    }
-
-    pub fn clear_all_import_filters(&mut self) {
-        if let Some(form) = self.form.as_mut() {
-            form.import.clear_all_filters();
-        }
-    }
-
-    /// Undo the last filter change. Reports when there is nothing to undo rather
-    /// than appearing to do nothing.
-    pub fn undo_import_filter(&mut self) {
-        let undone = self.form.as_mut().is_some_and(|f| f.import.undo_filter());
-        if undone {
-            self.set_status(StatusMsg::info(help::bi("已撤销筛选", "Filter change undone")));
-        } else {
-            self.set_status(StatusMsg::info(help::bi("没有可撤销的筛选", "No filter change to undo")));
-        }
-    }
-
-    // -- row selection -----------------------------------------------------
-
-    pub fn import_move(&mut self, delta: i32) {
-        let rows = keys::IMPORT_ROWS_VISIBLE;
-        if let Some(form) = self.form.as_mut() {
-            form.import.move_cursor(delta);
-            form.import.ensure_visible(rows);
-        }
-    }
-
-    pub fn import_home(&mut self) {
-        let rows = keys::IMPORT_ROWS_VISIBLE;
-        if let Some(form) = self.form.as_mut() {
-            form.import.home();
-            form.import.ensure_visible(rows);
-        }
-    }
-
-    pub fn import_end(&mut self) {
-        let rows = keys::IMPORT_ROWS_VISIBLE;
-        if let Some(form) = self.form.as_mut() {
-            form.import.end();
-            form.import.ensure_visible(rows);
-        }
-    }
-
-    pub fn import_toggle_cursor(&mut self) {
-        if let Some(form) = self.form.as_mut() {
-            form.import.toggle_cursor();
-        }
-    }
-
-    /// Toggle the row at a raw index (mouse click on a checkbox).
-    ///
-    /// The index comes from the frame's hit map, which can be one frame stale:
-    /// a filter change or a re-discovery between drawing and clicking leaves the
-    /// click pointing at a row that is no longer visible. That must be a no-op —
-    /// moving the cursor to "wherever it happens to be" and ticking *that* row
-    /// would tick a row the user did not click.
-    pub fn import_toggle_at(&mut self, row: usize) {
-        let Some(form) = self.form.as_mut() else {
-            return;
-        };
-        let Some(pos) = form.import.visible().iter().position(|i| *i == row) else {
-            eventlog::import_click_stale(row);
-            return;
-        };
-        // Move the cursor there too: the click both selects and toggles, so the
-        // highlighted row always matches what the user just acted on.
-        form.import.cursor = pos;
-        form.import.toggle_cursor();
-    }
-
-    /// Put the cursor on a raw row index (mouse click elsewhere on a row).
-    pub fn import_select_at(&mut self, row: usize) {
-        let Some(form) = self.form.as_mut() else {
-            return;
-        };
-        match form.import.visible().iter().position(|i| *i == row) {
-            Some(pos) => form.import.cursor = pos,
-            None => eventlog::import_click_stale(row),
-        }
-    }
-
-    pub fn import_check_all(&mut self) {
-        if let Some(form) = self.form.as_mut() {
-            form.import.check_all_visible();
-        }
-    }
-
-    pub fn import_uncheck_all(&mut self) {
-        if let Some(form) = self.form.as_mut() {
-            form.import.uncheck_all_visible();
-        }
-    }
-
-    pub fn import_invert(&mut self) {
-        if let Some(form) = self.form.as_mut() {
-            form.import.invert_visible();
-        }
-    }
-}
+use crate::model::{self, ForwardKind, SshForward, StatusMsg, TunnelConfig, TunnelView, now_unix};
+use crate::ssh;
 
 // ---------------------------------------------------------------------------
 // Creating one tunnel per ticked row
@@ -307,62 +42,20 @@ impl App {
     /// drives the same upward scan the manual form uses — without it, enabling a
     /// batch would fail with "port in use" on a port `sshpf` itself holds.
     pub fn config_from_forward(&self, id: crate::model::TunnelId, forward: &SshForward, taken: &[u16]) -> TunnelConfig {
-        let bind = self.cfg.defaults.bind.clone();
-        let (local_addr, local_port, remote_host, remote_port) = match forward.kind {
-            ForwardKind::Local => (
-                if forward.listen_addr.is_empty() { bind.clone() } else { forward.listen_addr.clone() },
-                forward.listen_port,
-                forward.target_host.clone(),
-                forward.target_port,
-            ),
-            // `-R` listens on the server and lands locally, so the config's
-            // local side is the target and the remote side is the listener.
-            ForwardKind::Remote => (
-                forward.target_host.clone(),
-                forward.target_port,
-                if forward.listen_addr.is_empty() { bind.clone() } else { forward.listen_addr.clone() },
-                forward.listen_port,
-            ),
-            ForwardKind::Dynamic => (
-                if forward.listen_addr.is_empty() { bind.clone() } else { forward.listen_addr.clone() },
-                forward.listen_port,
-                String::new(),
-                0,
-            ),
-        };
-
-        // `-L`/`-D` bind locally, so only those need a collision-free port. The
-        // rules live in `plan_local_port` (shared with the form) — most notably,
-        // a privileged port is never scanned upwards from itself, which would
-        // spend the whole budget inside the range that needs root and land on
-        // another privileged port.
-        let local_port = if forward.kind == ForwardKind::Remote {
-            local_port
-        } else {
-            match model::plan_local_port(local_port, taken, |c| ssh::port_available(&local_addr, c)) {
-                Some((port, _)) => port,
-                // Nothing usable found: keep the requested port so validation
-                // reports the real problem instead of silently using port 0.
-                None => local_port,
-            }
-        };
-
+        let ends = forward_ends(&self.cfg.defaults.bind, forward, taken);
         TunnelConfig {
             id,
             name: self.cfg.unique_name(&forward.suggested_name(), None),
             kind: forward.kind,
             ssh_host: forward.host_alias.clone(),
-            local_addr,
-            local_port,
-            remote_host,
-            remote_port,
+            local_addr: ends.local_addr,
+            local_port: ends.local_port,
+            remote_host: ends.remote_host,
+            remote_port: ends.remote_port,
             enabled: true,
             auto_restart: self.cfg.defaults.auto_restart,
             ssh_options: Vec::new(),
-            note: help::bi(
-                &format!("来自 ~/.ssh/config 第 {} 行", forward.line),
-                &format!("From ~/.ssh/config line {}", forward.line),
-            ),
+            note: import_note(forward.line),
             created_at: now_unix(),
         }
     }
@@ -370,9 +63,30 @@ impl App {
     /// Validate the form and, for a create, the imported rows as a batch.
     ///
     /// Returns the configs to create, or reports the problems into the form and
-    /// creates nothing.
+    /// creates nothing. Three steps, each its own function: [`Self::import_intent`]
+    /// decides *whether* there is a batch at all, [`Self::allocate_import_ids`]
+    /// reserves the id range, and [`Self::build_import_batch`] turns each ticked
+    /// row into a config and collects every problem.
     pub fn validated_import_batch(&mut self) -> Option<Vec<TunnelConfig>> {
+        let (ssh_host, forwards) = self.import_intent()?;
+        let (base_id, last_id) = self.allocate_import_ids(forwards.len())?;
+        let configs = self.build_import_batch(&ssh_host, &forwards, base_id, last_id);
+        match configs {
+            Ok(configs) => Some(configs),
+            Err(errors) => {
+                crate::eventlog::import_rejected(&errors);
+                self.set_form_errors(errors);
+                None
+            }
+        }
+    }
+
+    /// The user's intent, read off the open form: which host, and which rows are
+    /// ticked. `None` means "there is nothing to do", which is not an error.
+    fn import_intent(&mut self) -> Option<(String, Vec<SshForward>)> {
         let form = self.form.clone()?;
+        // Importing is a create-time convenience: silently turning an edit into a
+        // batch create would be a data-loss bug.
         if matches!(form.mode, FormMode::Edit(_)) {
             return None;
         }
@@ -382,12 +96,48 @@ impl App {
         }
         let ssh_host = form.ssh_host.value().trim().to_string();
         if ssh_host.is_empty() {
-            if let Some(f) = self.form.as_mut() {
-                f.errors = vec![help::bi("SSH 主机不能为空", "SSH host must not be empty")];
-            }
+            self.set_form_errors(vec![help::bi("SSH 主机不能为空", "SSH host must not be empty")]);
             return None;
         }
+        Some((ssh_host, forwards))
+    }
 
+    /// Reserve the contiguous id range for `rows` ticked forwards.
+    ///
+    /// Ids are allocated up front and checked, not taken from an unbounded
+    /// `(next_id..)` range: `max_id + 1` overflows for a hand-edited
+    /// `id = u64::MAX`, and wrapping the range would reuse existing ids. Returns
+    /// `(first, last)` inclusive.
+    fn allocate_import_ids(&mut self, rows: usize) -> Option<(crate::model::TunnelId, crate::model::TunnelId)> {
+        let base_id = match self.next_tunnel_id() {
+            Some(id) => id,
+            None => {
+                self.set_form_errors(vec!["无法分配新的转发编号，请检查配置中的 id".to_string()]);
+                return None;
+            }
+        };
+        let span = (rows as u64).saturating_sub(1);
+        let Some(last_id) = base_id.checked_add(span) else {
+            crate::eventlog::id_space_exhausted(self.cfg.max_id());
+            self.set_form_errors(vec!["无法为全部转发分配编号，请减少一次导入的条目数".to_string()]);
+            return None;
+        };
+        Some((base_id, last_id))
+    }
+
+    /// Turn every ticked row into a validated config, or collect *all* the
+    /// problems and create nothing.
+    ///
+    /// All-or-nothing on purpose: a partial write (three tunnels created, then a
+    /// validation error on the fourth) would leave a state the user never asked
+    /// for.
+    fn build_import_batch(
+        &mut self,
+        ssh_host: &str,
+        forwards: &[SshForward],
+        base_id: crate::model::TunnelId,
+        last_id: crate::model::TunnelId,
+    ) -> Result<Vec<TunnelConfig>, Vec<String>> {
         // Ports already claimed by other managed tunnels, so the batch does not
         // fight over one port with the tunnels it is replacing. Grows as we
         // assign, so two rows cannot be handed the same local port.
@@ -395,64 +145,59 @@ impl App {
         let mut out: Vec<TunnelConfig> = Vec::with_capacity(forwards.len());
         let mut errors: Vec<String> = Vec::new();
 
-        // Ids are allocated up front and checked, not taken from an unbounded
-        // `(next_id..)` range: `max_id + 1` overflows for a hand-edited
-        // `id = u64::MAX`, and wrapping the range would reuse existing ids.
-        let base_id = match self.next_tunnel_id() {
-            Some(id) => id,
-            None => {
-                if let Some(f) = self.form.as_mut() {
-                    f.errors = vec!["无法分配新的转发编号，请检查配置中的 id".to_string()];
-                }
-                return None;
-            }
-        };
-        let span = (forwards.len() as u64).saturating_sub(1);
-        let Some(last_id) = base_id.checked_add(span) else {
-            crate::app::log::id_space_exhausted(self.cfg.max_id());
-            if let Some(f) = self.form.as_mut() {
-                f.errors = vec!["无法为全部转发分配编号，请减少一次导入的条目数".to_string()];
-            }
-            return None;
-        };
-
         for (next_id, forward) in (base_id..=last_id).zip(forwards.iter()) {
-            let mut cfg = self.config_from_forward(next_id, forward, &taken);
-            cfg.ssh_host = ssh_host.clone();
-            // Keep names unique within the batch itself, not just against the
-            // already-saved tunnels.
-            cfg.name = unique_within(&cfg.name, out.iter().map(|c| c.name.clone()).collect());
-            if let Err(e) = config::validate_tunnel(&cfg) {
-                // `e` is the Chinese validator message (`src/config.rs`, not our
-                // scope); append the English category so the row is bilingual.
-                errors.push(format!("{}: {e} / Invalid definition", cfg.name));
-            }
-            // Collision against already-saved tunnels, then against the rest of
-            // this batch: two imported rows can describe the same listen port
-            // (e.g. a `Host *` default plus a specific block), and creating both
-            // would make the second one fail at bind time instead of here.
-            let conflict =
-                self.listen_conflict(&cfg).or_else(|| out.iter().find_map(|other| listen_collision(&cfg, other)));
-            if let Some(conflict) = conflict {
-                errors.push(help::bi(
-                    &format!("{}: 监听地址与「{conflict}」冲突", cfg.name),
-                    &format!("{}: listen endpoint collides with \"{conflict}\"", cfg.name),
-                ));
-            }
+            let cfg = self.import_row_config(next_id, forward, ssh_host, &taken, &out, &mut errors);
             if cfg.kind != ForwardKind::Remote {
                 taken.push(cfg.local_port);
             }
             out.push(cfg);
         }
 
-        if !errors.is_empty() {
-            crate::app::log::import_rejected(&errors);
-            if let Some(f) = self.form.as_mut() {
-                f.errors = errors;
-            }
-            return None;
+        if errors.is_empty() { Ok(out) } else { Err(errors) }
+    }
+
+    /// Build one row of the batch and append anything wrong with it to `errors`.
+    ///
+    /// `out` is the batch built so far — needed because two imported rows can
+    /// describe the same listen port (a `Host *` default plus a specific block),
+    /// and creating both would fail at bind time instead of here.
+    fn import_row_config(
+        &self,
+        id: crate::model::TunnelId,
+        forward: &SshForward,
+        ssh_host: &str,
+        taken: &[u16],
+        out: &[TunnelConfig],
+        errors: &mut Vec<String>,
+    ) -> TunnelConfig {
+        let mut cfg = self.config_from_forward(id, forward, taken);
+        cfg.ssh_host = ssh_host.to_string();
+        // Keep names unique within the batch itself, not just against the
+        // already-saved tunnels.
+        cfg.name = unique_within(&cfg.name, out.iter().map(|c| c.name.clone()).collect());
+        if let Err(e) = config::validate_tunnel(&cfg) {
+            // `e` is the Chinese validator message (`src/config.rs`, not our
+            // scope); append the English category so the row is bilingual.
+            errors.push(format!("{}: {e} / Invalid definition", cfg.name));
         }
-        Some(out)
+        // Collision against already-saved tunnels, then against the rest of this
+        // batch.
+        let conflict =
+            self.listen_conflict(&cfg).or_else(|| out.iter().find_map(|other| listen_collision(&cfg, other)));
+        if let Some(conflict) = conflict {
+            errors.push(help::bi(
+                &format!("{}: 监听地址与「{conflict}」冲突", cfg.name),
+                &format!("{}: listen endpoint collides with \"{conflict}\"", cfg.name),
+            ));
+        }
+        cfg
+    }
+
+    /// Report validation problems into the open form (the batch creates nothing).
+    fn set_form_errors(&mut self, errors: Vec<String>) {
+        if let Some(f) = self.form.as_mut() {
+            f.errors = errors;
+        }
     }
 
     /// Create every validated tunnel, persist once, and start them.
@@ -460,9 +205,9 @@ impl App {
         let n = configs.len();
         let first_id = configs.first().map(|c| c.id);
         let host = configs.first().map(|c| c.ssh_host.clone()).unwrap_or_default();
-        crate::app::log::import_committed(&host, n);
+        crate::eventlog::import_committed(&host, n);
         for cfg in &configs {
-            crate::app::log::tunnel_created(cfg, "import");
+            crate::eventlog::tunnel_created(cfg, "import");
             self.cfg.tunnels.push(cfg.clone());
             self.tunnels.push(TunnelView::new(cfg.clone()));
         }
@@ -531,6 +276,64 @@ fn unique_within(base: &str, siblings: Vec<String>) -> String {
     base.to_string()
 }
 
+/// Which side of an imported forward becomes which side of the config.
+struct ForwardEnds {
+    local_addr: String,
+    local_port: u16,
+    remote_host: String,
+    remote_port: u16,
+}
+
+/// Map an imported ssh-config forward onto a config's local/remote sides.
+///
+/// The mapping is not symmetric, which is why it is one function: `-L`/`-D`
+/// listen locally, but `-R` listens *on the server* and lands locally, so the ssh
+/// config's listen side becomes the config's remote side. Getting this backwards
+/// would silently forward the wrong port.
+///
+/// `-L`/`-D` bind locally, so only those need a collision-free port; that scan
+/// uses `plan_local_port` (shared with the form) and `taken` so two rows cannot
+/// be handed the same port.
+fn forward_ends(bind: &str, forward: &SshForward, taken: &[u16]) -> ForwardEnds {
+    let listen_addr = if forward.listen_addr.is_empty() { bind.to_string() } else { forward.listen_addr.clone() };
+    let mut ends = match forward.kind {
+        ForwardKind::Local => ForwardEnds {
+            local_addr: listen_addr,
+            local_port: forward.listen_port,
+            remote_host: forward.target_host.clone(),
+            remote_port: forward.target_port,
+        },
+        ForwardKind::Remote => ForwardEnds {
+            local_addr: forward.target_host.clone(),
+            local_port: forward.target_port,
+            remote_host: listen_addr,
+            remote_port: forward.listen_port,
+        },
+        ForwardKind::Dynamic => ForwardEnds {
+            local_addr: listen_addr,
+            local_port: forward.listen_port,
+            remote_host: String::new(),
+            remote_port: 0,
+        },
+    };
+    if forward.kind != ForwardKind::Remote {
+        // A privileged port is never scanned upwards from itself, which would
+        // spend the whole budget inside the range that needs root.
+        let addr = ends.local_addr.clone();
+        if let Some((port, _)) = model::plan_local_port(ends.local_port, taken, |c| ssh::port_available(&addr, c)) {
+            ends.local_port = port;
+        }
+        // Nothing usable found: keep the requested port so validation reports the
+        // real problem instead of silently using port 0.
+    }
+    ends
+}
+
+/// The `note` that makes an imported tunnel traceable back to its source line.
+fn import_note(line: usize) -> String {
+    help::bi(&format!("来自 ~/.ssh/config 第 {line} 行"), &format!("From ~/.ssh/config line {line}"))
+}
+
 /// Whether two configs would listen on the same endpoint.
 fn listen_collision(a: &TunnelConfig, b: &TunnelConfig) -> Option<String> {
     let (aa, ap) = config::listen_endpoint(a);
@@ -542,6 +345,7 @@ fn listen_collision(a: &TunnelConfig, b: &TunnelConfig) -> Option<String> {
 mod tests {
     use super::*;
     use crate::config::{ConfigFile, Paths};
+    use crate::model::ImportTable;
     use crate::model::TunnelStatus;
 
     fn app_fresh() -> (tempfile::TempDir, App) {
@@ -588,199 +392,7 @@ mod tests {
 
     // -- discovery plumbing ------------------------------------------------
 
-    #[test]
-    fn refresh_loads_the_table_for_the_typed_host_and_opens_the_pane() {
-        // End-to-end through real discovery (a scratch config, so the test does
-        // not depend on the developer's own `~/.ssh/config`): typing an alias
-        // and committing it is enough to get the rows on screen.
-        let dir = tempfile::tempdir().unwrap();
-        let cfg_path = dir.path().join("ssh_config");
-        std::fs::write(&cfg_path, "Host dev-box\n  LocalForward 18001 10.0.0.1:80\n").unwrap();
-        // SAFETY: this is the only test that touches `SSHPF_SSH_CONFIG`, and
-        // discovery only reads it; the variable is restored before asserting.
-        unsafe { std::env::set_var("SSHPF_SSH_CONFIG", &cfg_path) };
-        let (_d, mut app) = app_fresh();
-        app.open_form_create();
-        app.form.as_mut().unwrap().ssh_host.set("dev-box");
-        app.refresh_import_for_current_host();
-        unsafe { std::env::remove_var("SSHPF_SSH_CONFIG") };
-
-        let form = app.form.as_ref().unwrap();
-        assert_eq!(form.import.len(), 1);
-        assert_eq!(form.import.rows[0].forward.listen_port, 18001);
-        assert!(form.import.rows[0].checked, "rows start ticked");
-        assert!(app.import_pane_open(), "a host with importable forwards opens the pane by itself");
-    }
-
-    #[test]
-    fn discovery_is_not_repeated_for_the_same_host() {
-        // Cheap guard: typing one character at a time would otherwise re-parse
-        // the config and discard the user's tick marks on every keystroke.
-        let (_d, mut app) = app_fresh();
-        app.open_form_create();
-        app.form.as_mut().unwrap().ssh_host.set("dev-box");
-        let table = ImportTable::new(vec![show(free_port())]);
-        app.form.as_mut().unwrap().set_import_table("dev-box", table);
-        // Untick it, then refresh for the *same* host: the mark must survive.
-        app.form.as_mut().unwrap().import.rows[0].checked = false;
-        app.refresh_import_for_current_host();
-        assert!(!app.form.as_ref().unwrap().import.rows[0].checked, "tick marks must survive a no-op refresh");
-    }
-
     // -- the default: auto-open, everything ticked -------------------------
-
-    #[test]
-    fn a_host_with_importable_forwards_opens_the_pane_already_ticked() {
-        // The headline behaviour: "the forwards this host declares" is the
-        // *default* offer, not something behind a key press. Every importable
-        // row arrives ticked, so the user's job is to untick the exceptions.
-        let (p1, p2) = (free_port(), free_port());
-        let (_d, mut app) = app_fresh();
-        app.open_form_create();
-        app.install_import_rows("dev-box", vec![show(p1), show(p2)]);
-        let form = app.form.as_ref().unwrap();
-        assert!(form.import_open, "the pane must open on its own");
-        assert!(app.import_pane_open(), "and be actually drawable");
-        assert_eq!(form.import.checked_count(), 2, "all importable rows start ticked");
-        assert_eq!(form.import.checked_forwards().len(), 2);
-    }
-
-    #[test]
-    fn a_host_with_no_forwards_does_not_open_an_empty_pane() {
-        let (_d, mut app) = app_fresh();
-        app.open_form_create();
-        app.install_import_rows("no-forwards", Vec::new());
-        assert!(!app.form.as_ref().unwrap().import_open, "the flag itself must stay down");
-        assert!(!app.import_pane_open(), "an empty pane would only cover the form");
-        assert!(app.form.as_ref().unwrap().import.is_empty());
-    }
-
-    #[test]
-    fn a_host_whose_forwards_are_all_unimportable_does_not_auto_open() {
-        // Unix-socket / target-less directives are listed (silently hiding them
-        // would look like the tool missed the config) but there is nothing to
-        // tick, so auto-opening would be a pane full of `[–]`. `space`/`i` still
-        // opens it to read the reasons.
-        let mut broken = show(0);
-        broken.target_host = String::new();
-        broken.target_port = 0;
-        let (_d, mut app) = app_fresh();
-        app.open_form_create();
-        app.install_import_rows("dev-box", vec![broken]);
-        {
-            let form = app.form.as_ref().unwrap();
-            assert_eq!(form.import.len(), 1, "the row must still be listed");
-            assert_eq!(form.import.importable_count(), 0);
-            assert!(!form.import_open, "nothing can be ticked, so the pane stays closed");
-            assert!(!app.import_pane_open());
-        }
-
-        // ... and the manual escape hatch still works: this is the only way the
-        // user ever sees *why* the row cannot be imported, so it must not have
-        // been closed off along with the auto-open.
-        app.form.as_mut().unwrap().ssh_host.set("dev-box");
-        app.toggle_import_pane();
-        assert!(app.import_pane_open(), "space/i must still open a pane holding only `[–]` rows");
-        assert_eq!(app.form.as_ref().unwrap().import.checked_count(), 0, "and nothing became tickable");
-    }
-
-    #[test]
-    fn switching_hosts_reopens_the_pane_for_a_host_that_has_forwards() {
-        // Host A has forwards (pane auto-open), the user collapses it, then picks
-        // host B which also has forwards: B's rows are the new default, so the
-        // pane comes back. Collapsing is per-host, not a permanent preference.
-        let (p1, p2) = (free_port(), free_port());
-        let (_d, mut app) = app_fresh();
-        app.open_form_create();
-        app.install_import_rows("host-a", vec![show(p1)]);
-        assert!(app.import_pane_open());
-        app.close_import_pane();
-        assert!(!app.import_pane_open());
-
-        app.install_import_rows("host-b", vec![show(p2)]);
-        assert!(app.import_pane_open(), "a different host's forwards are a fresh default");
-        assert_eq!(app.form.as_ref().unwrap().import.rows[0].forward.listen_port, p2, "and B's rows replace A's");
-    }
-
-    #[test]
-    fn collapsing_the_pane_survives_a_refresh_of_the_same_host() {
-        // `enter`/`esc` on the host field refreshes discovery. For an unchanged
-        // alias that must be a no-op, or a deliberate collapse would pop back
-        // open every time the user leaves the field.
-        let (_d, mut app) = app_fresh();
-        app.open_form_create();
-        app.form.as_mut().unwrap().ssh_host.set("dev-box");
-        app.install_import_rows("dev-box", vec![show(free_port())]);
-        app.close_import_pane();
-        app.refresh_import_for_current_host();
-        assert!(!app.import_pane_open(), "refreshing the same host must not undo the collapse");
-        assert_eq!(app.form.as_ref().unwrap().import.len(), 1, "and must not drop the rows either");
-    }
-
-    #[test]
-    fn an_empty_host_field_installs_nothing_instead_of_the_global_forwards() {
-        // `Host *` matches the empty string, so scanning "" would list every
-        // global forward under an alias the user never picked — and `ctrl+s`
-        // would then create them.
-        let (_d, mut app) = app_fresh();
-        app.open_form_create();
-        app.install_import_rows("dev-box", vec![show(free_port())]);
-        app.form.as_mut().unwrap().ssh_host.set("   ");
-        app.refresh_import_for_current_host();
-        let form = app.form.as_ref().unwrap();
-        assert!(form.import.is_empty(), "no host means no rows");
-        assert!(!form.import_open);
-        assert_eq!(app.import_error, None, "not scanning is not a failure to report");
-    }
-
-    #[test]
-    fn editing_an_existing_tunnel_never_imports() {
-        // Importing is a create-time convenience; silently turning an edit into a
-        // batch create would be a data-loss bug.
-        let (_d, mut app) = app_fresh();
-        app.cfg.tunnels.push(TunnelConfig {
-            id: 1,
-            name: "existing".into(),
-            kind: ForwardKind::Local,
-            ssh_host: "dev-box".into(),
-            local_addr: "127.0.0.1".into(),
-            local_port: 18000,
-            remote_host: "10.0.0.1".into(),
-            remote_port: 80,
-            enabled: false,
-            auto_restart: false,
-            ssh_options: vec![],
-            note: String::new(),
-            created_at: 1,
-        });
-        app.tunnels.push(TunnelView::new(app.cfg.tunnels[0].clone()));
-        app.open_form_edit();
-        app.form.as_mut().unwrap().ssh_host.set("dev-box");
-        app.refresh_import_for_current_host();
-        assert!(app.form.as_ref().unwrap().import.is_empty());
-    }
-
-    #[test]
-    fn toggling_the_pane_on_a_host_without_forwards_says_so() {
-        let (_d, mut app) = app_fresh();
-        app.open_form_create();
-        app.form.as_mut().unwrap().ssh_host.set("no-such-host-xyzzy");
-        app.toggle_import_pane();
-        assert!(!app.import_pane_open(), "an empty pane must not open");
-        let msg = app.status.as_ref().map(|s| s.text.clone()).unwrap_or_default();
-        assert!(msg.contains("没有端口转发"), "the user must be told why nothing opened: {msg}");
-    }
-
-    #[test]
-    fn pane_visibility_needs_rows_as_well_as_the_flag() {
-        let (_d, mut app) = app_fresh();
-        app.open_form_create();
-        app.form.as_mut().unwrap().import_open = true;
-        assert!(!app.import_pane_open(), "the flag alone must not show an empty pane");
-        let table = ImportTable::new(vec![show(free_port())]);
-        app.form.as_mut().unwrap().set_import_table("dev-box", table);
-        assert!(app.import_pane_open());
-    }
 
     // -- creating the batch ------------------------------------------------
 
@@ -1048,83 +660,6 @@ mod tests {
     // -- filter plumbing through the App -----------------------------------
 
     #[test]
-    fn starting_a_column_filter_takes_the_keyboard_away_from_the_field() {
-        // With the pane open by default, both the form field and a column filter
-        // can plausibly "have the cursor". `handle_form_key` gives the field
-        // priority while `is_editing_field()`, so a mouse click on a column
-        // header while a field was being edited would draw the filter cursor in
-        // the pane (it renders last) while every keystroke still went into the
-        // field. The click has to end field editing to stay honest.
-        let (_d, mut app) = app_with_import(vec![show(free_port())]);
-        app.form.as_mut().unwrap().field = crate::model::FormField::Name;
-        app.form.as_mut().unwrap().begin_edit();
-        assert!(app.form.as_ref().unwrap().is_editing_field());
-
-        app.begin_import_filter(ImportColumn::Listen);
-        assert!(!app.form.as_ref().unwrap().is_editing_field(), "the filter owns the keyboard now");
-        assert_eq!(app.form.as_ref().unwrap().import.editing, Some(ImportColumn::Listen));
-    }
-
-    #[test]
-    fn filter_keys_reach_the_table() {
-        let (_d, mut app) = app_with_import(vec![show(free_port()), show(free_port())]);
-        let first = app.form.as_ref().unwrap().import.rows[0].forward.listen_port.to_string();
-        app.begin_import_filter(ImportColumn::Listen);
-        for c in first.chars() {
-            app.import_filter_char(c);
-        }
-        assert_eq!(app.form.as_ref().unwrap().import.visible(), vec![0], "only the matching row survives");
-        app.import_filter_backspace();
-        assert_eq!(app.form.as_ref().unwrap().import.filter(ImportColumn::Listen), &first[..first.len() - 1]);
-        app.clear_import_filter(ImportColumn::Listen);
-        assert_eq!(app.form.as_ref().unwrap().import.visible().len(), 2);
-    }
-
-    #[test]
-    fn undo_reports_when_there_is_nothing_to_undo() {
-        let (_d, mut app) = app_with_import(vec![show(free_port())]);
-        app.undo_import_filter();
-        let msg = app.status.as_ref().map(|s| s.text.clone()).unwrap_or_default();
-        assert!(msg.contains("没有可撤销"), "silence would look broken: {msg}");
-        app.begin_import_filter(ImportColumn::Kind);
-        app.import_filter_char('L');
-        app.undo_import_filter();
-        assert!(!app.form.as_ref().unwrap().import.has_filters());
-    }
-
-    #[test]
-    fn a_new_host_does_not_inherit_the_previous_hosts_filters() {
-        // Filters narrow *this* host's rows; carrying them over would silently
-        // hide rows of a different host for no visible reason.
-        let (p1, p2) = (free_port(), free_port());
-        let (_d, mut app) = app_with_import(vec![show(p1)]);
-        app.form.as_mut().unwrap().import.set_filter(ImportColumn::Kind, "R");
-        app.form.as_mut().unwrap().set_import_table("other-host", ImportTable::new(vec![show(p2)]));
-        assert!(!app.form.as_ref().unwrap().import.has_filters());
-    }
-
-    #[test]
-    fn import_interactions_do_not_open_the_pane_for_an_empty_host() {
-        let (_d, mut app) = app_fresh();
-        app.open_form_create();
-        app.form.as_mut().unwrap().ssh_host.set("nope");
-        app.begin_import_filter(ImportColumn::Kind);
-        // `begin_import_filter` flips the open flag; the visibility predicate
-        // still refuses because there are no rows.
-        assert!(!app.import_pane_open());
-    }
-
-    #[test]
-    fn closing_the_pane_also_ends_filter_editing() {
-        let (_d, mut app) = app_with_import(vec![show(free_port())]);
-        app.begin_import_filter(ImportColumn::Listen);
-        assert!(app.form.as_ref().unwrap().import.editing.is_some());
-        app.close_import_pane();
-        assert!(!app.import_pane_open());
-        assert!(app.form.as_ref().unwrap().import.editing.is_none(), "a hidden pane must not keep the keyboard");
-    }
-
-    #[test]
     fn created_tunnels_are_not_immediately_failed_by_a_stale_status() {
         // `commit_import_batch` starts each tunnel; the status must at least move
         // out of Stopped, proving the start path ran.
@@ -1197,6 +732,7 @@ mod hardening_tests {
     use super::*;
     use crate::config::{ConfigFile, Paths};
     use crate::model::TunnelStatus;
+    use crate::model::{ImportColumn, ImportTable};
 
     fn app_fresh() -> (tempfile::TempDir, App) {
         let dir = tempfile::tempdir().unwrap();
