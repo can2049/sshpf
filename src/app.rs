@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use crate::app::log as eventlog;
 use crate::config::{self, ConfigFile, Paths};
+use crate::help;
 use crate::logging;
 use crate::model::{
     BatchAction, FailureInfo, FormMode, ForwardKind, HostPicker, MultiSelect, StatusMsg, TunnelConfig, TunnelId,
@@ -150,7 +151,7 @@ impl App {
                 // The user's definitions are about to be invisible; the log is
                 // the only place that survives to explain it afterwards.
                 eventlog::config_load_failed(&config::display_path(&paths.config), &e.to_string(), "empty_config");
-                eprintln!("警告: {e}; 以空配置启动");
+                eprintln!("警告: {e}; 以空配置启动\nWarning: {e}; starting with an empty config");
                 ConfigFile::default()
             }
         };
@@ -360,7 +361,7 @@ impl App {
             return;
         };
         self.delete_tunnel(id);
-        self.set_status(StatusMsg::info("已删除"));
+        self.set_status(StatusMsg::info(help::bi("已删除", "Deleted")));
     }
 
     /// Remove one tunnel definition and its runtime state.
@@ -384,7 +385,7 @@ impl App {
     /// `x`: stopping everything is a bulk destructive action.
     pub fn request_stop_all(&mut self) {
         if self.counts().off == self.tunnels.len() {
-            self.set_status(StatusMsg::info("没有运行中的转发"));
+            self.set_status(StatusMsg::info(help::bi("没有运行中的转发", "No forward is running")));
             return;
         }
         self.ask_confirm(ConfirmAction::StopAll);
@@ -393,7 +394,7 @@ impl App {
     /// `a`: starting everything opens listeners; confirm once for the batch.
     pub fn request_start_all(&mut self) {
         if self.counts().off == 0 {
-            self.set_status(StatusMsg::info("没有未启用的转发"));
+            self.set_status(StatusMsg::info(help::bi("没有未启用的转发", "No disabled forward")));
             return;
         }
         self.ask_confirm(ConfirmAction::StartAll);
@@ -475,7 +476,10 @@ impl App {
 
     fn persist_quietly(&mut self) {
         if let Err(e) = self.persist() {
-            self.set_status(StatusMsg::error(format!("保存配置失败: {e}")));
+            self.set_status(StatusMsg::error(help::bi(
+                &format!("保存配置失败: {e}"),
+                &format!("Cannot save the config: {e}"),
+            )));
         }
     }
 

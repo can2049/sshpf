@@ -7,6 +7,7 @@
 
 use crate::app::log as eventlog;
 use crate::app::{App, ConfirmAction, Overlay};
+use crate::help;
 use crate::model::StatusMsg;
 
 /// Stable name for a gated action, used as the `action=` field in the log.
@@ -51,24 +52,47 @@ impl App {
             _ => None,
         };
         // Leak-free: keep the name in the overlay so the prompt can borrow it.
+        // Every prompt is bilingual: the Chinese sentence first (the UI and the
+        // tests key off it), then the English translation.
         let prompt = match &name {
             Some(n) => match &action {
-                ConfirmAction::Delete(_) => format!("确认删除「{n}」？此操作不可撤销。"),
-                ConfirmAction::Stop(_) => format!("确认停用「{n}」？将断开其现有连接。"),
-                ConfirmAction::Restart(_) => format!("确认重启「{n}」？连接会短暂中断。"),
-                ConfirmAction::ApplyEdit(_) => format!("确认保存对「{n}」的修改？运行中的连接会重建。"),
+                ConfirmAction::Delete(_) => help::bi(
+                    &format!("确认删除「{n}」？此操作不可撤销。"),
+                    &format!("Delete \"{n}\"? This cannot be undone."),
+                ),
+                ConfirmAction::Stop(_) => help::bi(
+                    &format!("确认停用「{n}」？将断开其现有连接。"),
+                    &format!("Stop \"{n}\"? Its live connection will be dropped."),
+                ),
+                ConfirmAction::Restart(_) => help::bi(
+                    &format!("确认重启「{n}」？连接会短暂中断。"),
+                    &format!("Restart \"{n}\"? The connection will briefly drop."),
+                ),
+                ConfirmAction::ApplyEdit(_) => help::bi(
+                    &format!("确认保存对「{n}」的修改？运行中的连接会重建。"),
+                    &format!("Save the changes to \"{n}\"? A running connection will be rebuilt."),
+                ),
                 _ => unreachable!(),
             },
             None => match &action {
                 ConfirmAction::StopAll => {
                     let n = self.counts().up + self.counts().starting + self.counts().retrying;
-                    format!("确认停用全部 {n} 条运行中的转发？将断开所有连接。")
+                    help::bi(
+                        &format!("确认停用全部 {n} 条运行中的转发？将断开所有连接。"),
+                        &format!("Stop all {n} running forwards? Every connection will be dropped."),
+                    )
                 }
                 ConfirmAction::StartAll => {
                     let n = self.counts().off;
-                    format!("确认启用全部转发？将新开 {n} 个监听端口。")
+                    help::bi(
+                        &format!("确认启用全部转发？将新开 {n} 个监听端口。"),
+                        &format!("Start all forwards? {n} new listening ports will open."),
+                    )
                 }
-                ConfirmAction::DiscardForm => "确认放弃未保存的修改？已输入的内容会丢失。".to_string(),
+                ConfirmAction::DiscardForm => help::bi(
+                    "确认放弃未保存的修改？已输入的内容会丢失。",
+                    "Discard the unsaved changes? What you typed will be lost.",
+                ),
                 // The batch path builds its prompt from the action and the
                 // effective count, so this arm is only reachable if a caller
                 // forgot to do that.
@@ -76,12 +100,15 @@ impl App {
                 ConfirmAction::Quit => {
                     let running = self.supervisor.running_count();
                     if running == 0 {
-                        "确认退出 sshpf？".to_string()
+                        help::bi("确认退出 sshpf？", "Quit sshpf?")
                     } else {
-                        format!("还有 {running} 条转发在运行，退出将全部停止。")
+                        help::bi(
+                            &format!("还有 {running} 条转发在运行，退出将全部停止。"),
+                            &format!("{running} forwards are still running; quitting stops them all."),
+                        )
                     }
                 }
-                _ => "确认执行该操作？".to_string(),
+                _ => help::bi("确认执行该操作？", "Run this action?"),
             },
         };
         eventlog::action_requested(&action_name(&action), &prompt);
@@ -129,7 +156,7 @@ impl App {
             }
             ConfirmAction::Stop(id) => {
                 self.stop_tunnel(id);
-                self.set_status(StatusMsg::info("已停用"));
+                self.set_status(StatusMsg::info(help::bi("已停用", "Stopped")));
             }
             ConfirmAction::StopAll => self.stop_all(),
             ConfirmAction::Restart(id) => {
@@ -141,7 +168,7 @@ impl App {
             ConfirmAction::ApplyEdit(id) => self.commit_form_edit(id),
             ConfirmAction::DiscardForm => {
                 self.close_overlay();
-                self.set_status(StatusMsg::info("已放弃修改"));
+                self.set_status(StatusMsg::info(help::bi("已放弃修改", "Changes discarded")));
             }
             ConfirmAction::Quit => self.should_quit = true,
             ConfirmAction::Batch { action, .. } => self.apply_batch(action),

@@ -32,42 +32,98 @@ fn signal_name(sig: i32) -> String {
 const TICK: Duration = Duration::from_millis(200);
 
 const USAGE: &str = "\
-sshpf — SSH 端口转发 TUI 管理器
+sshpf — SSH 端口转发 TUI 管理器 / SSH port-forward manager for the terminal
 
-用法:
-  sshpf [选项]
+用法 / Usage:
+  sshpf [选项 / options]
 
-选项:
+选项 / Options:
   -c, --config <PATH>   使用指定的配置文件（默认 ~/.config/sshpf/config.toml）
+                        Use this config file (default ~/.config/sshpf/config.toml)
       --no-restore      启动时不自动恢复上次启用的转发
+                        Do not restore the forwards enabled in the last run
       --list-hosts      打印 ~/.ssh/config 中的主机后退出
+                        Print the hosts in ~/.ssh/config, then exit
       --check           校验配置文件后退出（不启动 UI）
-  -h, --help            显示本帮助
-  -V, --version         显示版本
+                        Validate the config file, then exit (no UI)
+  -h, --help            显示本帮助 / Show this help
+  -V, --version         显示版本 / Show the version
 
-日志:
+日志 / Logging:
   每次运行都会向 ~/.local/state/sshpf/logs/sshpf.log 追加结构化日志
   （启动/关闭、隧道启停与重连、异常与失败原因、panic 与致命信号）。
-  SSHPF_LOG_DIR=<目录>    改日志目录
-  SSHPF_LOG_LEVEL=<级别>  off|error|warn|info|debug（默认 info）
+  Every run appends structured logs to ~/.local/state/sshpf/logs/sshpf.log
+  (start/exit, tunnel up/down/reconnect, failures, panics and fatal signals).
+  SSHPF_LOG_DIR=<目录/dir>     改日志目录 / Change the log directory
+  SSHPF_LOG_LEVEL=<级别/level> off|error|warn|info|debug（默认/default info）
   超过 2 MiB 自动轮转，保留 3 个归档（sshpf.log.1 … .3）。
+  Rotates above 2 MiB, keeping 3 archives (sshpf.log.1 … .3).
 
-界面快捷键:
-  j/k ↑↓   移动        space  启用/停用    r  重启
-  n        新建        e      编辑        d  删除（需确认）
-  enter/l  详情+日志    /      过滤        a  全部启用   x  全部停止
-  v        多选模式（标记多条后批量启停/重启/删除）
-  ?        帮助        q      退出（有运行中转发时确认）
+界面快捷键 / Interface keys:
+  j / ↓     下移选择 / Move selection down
+  k / ↑     上移选择 / Move selection up
+  g / home  跳到首行 / Jump to the first row
+  G / end   跳到末行 / Jump to the last row
+  space     启用 / 停用当前转发（运行中的会先确认）
+            Start / stop the current forward (asks first while it is running)
+  r         重启当前转发 / Restart the current forward
+  n         新建转发 / Create a forward
+  e / E     编辑当前转发 / Edit the current forward
+  d         删除当前转发（需确认）/ Delete the current forward (asks first)
+  enter / l 查看详情与日志 / Open the detail + log view
+  /         过滤列表（名称 / 主机）/ Filter the list (name / host)
+  esc       清除过滤 / Clear the filter
+  a         全部启用（需确认）/ Start all forwards (asks first)
+  x         全部停用（需确认）/ Stop all forwards (asks first)
+  v / V     进入 / 退出多选模式（批量启停、重启、删除）
+            Enter / leave selection mode (batch start, restart, delete)
+  ?         打开 / 关闭帮助浮层（全部按键的中英说明）
+            Open / close the help overlay (every key, Chinese + English)
+  q         退出（有运行中转发时确认）/ Quit (asks first while forwards run)
+  ctrl+c    同 q / Same as q
 
-新建转发时选中主机，按 space 或 i 展开「从 ~/.ssh/config 导入转发」面板：
-该主机已声明的 LocalForward/RemoteForward/DynamicForward 会全部列出并默认勾选，
-取消掉不要的再保存。面板内可逐列筛选、撤销筛选。
+导入面板 / Import pane:
+  新建转发时选中主机，按 space 或 i 展开「从 ~/.ssh/config 导入转发」面板：
+  该主机已声明的 LocalForward/RemoteForward/DynamicForward 会全部列出并默认勾选，
+  取消掉不要的再保存。面板内可逐列筛选、撤销筛选。
+  In the create form, pick the SSH host and press space or i to expand the
+  \"import forwards from ~/.ssh/config\" pane: every LocalForward / RemoteForward /
+  DynamicForward that host declares is listed and ticked, so you only untick what
+  you do not want, then save. Columns can be filtered, and filters undone.
+    space 勾选 / Tick a row          a / U / I  全选 / 全不选 / 反选
+                                                   all / none / invert (visible rows)
+    f, ← →  选择 / 切换列            F          清除该列筛选 / Clear this column
+    ctrl+r  清除全部筛选 / Clear all filters
+    z       撤销上次筛选改动 / Undo the last filter change
+    ctrl+z  撤销（筛选输入中）/ Undo (while typing a filter)
+    j / ↓  k / ↑  g / G  pgup / pgdn  移动光标 / Move the cursor
+    enter   结束筛选输入 / Finish typing a filter
+    esc     收起面板（先退出筛选）/ Close the pane (leaves the filter first)
+    i       收起面板 / Close the pane
+    ctrl+s  保存并创建 N 条勾选行对应的隧道 / Save, creating one tunnel per ticked row
+  注意：面板打开后 space 归「勾选」，收起请用 i 或 esc；字面字符 f 不能输入到筛选里。
+  Note: once open, space ticks rows — close the pane with i or esc. A literal
+  \"f\" cannot be typed into a filter, because it always means \"next column\".
 
-鼠标：点击行选中、点击勾选框、点击列头筛选该列、点击筛选 chip 的 × 删除、
-滚轮滚动列表、多选模式下点击动作条按钮、shift 点击扩选范围。
+鼠标 / Mouse:
+  点击行          选中该行（多选模式下为切换勾选）/ Select the row (toggles the mark in selection mode)
+  shift+点击      从锚点扩选 / Extend the selection from the anchor
+  点击勾选框      勾选 / 取消该行 / Tick or untick the row
+  点击列头        筛选该列 / Start filtering that column
+  点击筛选 chip 的 ×  删除该列筛选 / Remove that column's filter
+  点击 全选 / 反选 / 全不选 以及 清除全部筛选 / 撤销筛选
+                  Run the action (disabled ones are dim and not clickable)
+  点击多选动作条  批量启用 / 停用 / 重启 / 删除（均需确认）
+                  Batch start / stop / restart / delete (all ask first)
+  滚轮            滚动列表（移动光标）/ Scroll the list (moves the cursor)
+  点击落空        什么都不做；弹窗会吞掉点击，不会穿透
+                  Does nothing; popups swallow clicks instead of leaking them
 
 配置文件为 TOML，权限 0600；转发定义由本工具管理，
 SSH 连接参数（ProxyJump/IdentityFile/ssh-agent 等）交给 ~/.ssh/config。
+The config file is TOML with mode 0600. Tunnel definitions are owned by sshpf;
+SSH connection parameters (ProxyJump, IdentityFile, ssh-agent, …) stay in
+~/.ssh/config, which this tool reads but never rewrites.
 ";
 
 struct Args {
@@ -92,12 +148,12 @@ fn parse_args() -> Result<Option<Args>, String> {
             }
             "-c" | "--config" => match it.next() {
                 Some(p) => args.config = Some(p),
-                None => return Err("--config 需要一个路径参数".to_string()),
+                None => return Err("--config 需要一个路径参数 / --config needs a path argument".to_string()),
             },
             "--no-restore" => args.no_restore = true,
             "--list-hosts" => args.list_hosts = true,
             "--check" => args.check = true,
-            other => return Err(format!("未知参数: {other}\n\n{USAGE}")),
+            other => return Err(format!("未知参数 / Unknown option: {other}\n\n{USAGE}")),
         }
     }
     Ok(Some(args))
@@ -160,11 +216,11 @@ fn main() -> ExitCode {
 fn list_hosts() -> ExitCode {
     match ssh::list_hosts() {
         Ok(hosts) if hosts.is_empty() => {
-            println!("未在 ~/.ssh/config 中找到任何主机");
+            println!("未在 ~/.ssh/config 中找到任何主机 / No hosts found in ~/.ssh/config");
             ExitCode::SUCCESS
         }
         Ok(hosts) => {
-            println!("{} 个主机:", hosts.len());
+            println!("{} 个主机 / {} host(s):", hosts.len(), hosts.len());
             for h in hosts {
                 println!("  {}", h.display());
             }
@@ -172,7 +228,7 @@ fn list_hosts() -> ExitCode {
         }
         Err(e) => {
             eventlog::cli_error("sshconfig.load_failed", &e.to_string());
-            eprintln!("读取 ~/.ssh/config 失败: {e}");
+            eprintln!("读取 ~/.ssh/config 失败 / Failed to read ~/.ssh/config: {e}");
             ExitCode::FAILURE
         }
     }
@@ -182,13 +238,18 @@ fn check_config(paths: &Paths) -> ExitCode {
     match config::load(&paths.config) {
         Ok(cfg) => {
             let problems = cfg.validate();
-            println!("{}: {} 条转发", config::display_path(&paths.config), cfg.tunnels.len());
+            println!(
+                "{}: {} 条转发 / {} tunnel(s)",
+                config::display_path(&paths.config),
+                cfg.tunnels.len(),
+                cfg.tunnels.len()
+            );
             if problems.is_empty() {
-                println!("校验通过");
+                println!("校验通过 / Config OK");
                 ExitCode::SUCCESS
             } else {
                 for p in &problems {
-                    println!("  警告: {p}");
+                    println!("  警告 / Warning: {p}");
                 }
                 eventlog::config_loaded(&config::display_path(&paths.config), cfg.tunnels.len(), &problems);
                 ExitCode::SUCCESS
@@ -196,7 +257,7 @@ fn check_config(paths: &Paths) -> ExitCode {
         }
         Err(e) => {
             eventlog::cli_error("config.invalid", &e.to_string());
-            eprintln!("配置错误: {e}");
+            eprintln!("配置错误 / Config error: {e}");
             ExitCode::FAILURE
         }
     }

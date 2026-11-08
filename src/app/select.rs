@@ -16,6 +16,7 @@
 
 use crate::app::log as eventlog;
 use crate::app::{App, ConfirmAction, Overlay};
+use crate::help;
 use crate::model::{BatchAction, StatusMsg};
 
 impl App {
@@ -27,16 +28,22 @@ impl App {
             self.select_mode.enter();
             self.select_mode.anchor = Some(self.selected);
             if self.visible_ids().is_empty() {
-                self.set_status(StatusMsg::info("选择模式：没有可选的条目"));
+                self.set_status(StatusMsg::info(help::bi(
+                    "选择模式：没有可选的条目",
+                    "Selection mode: nothing to select",
+                )));
             } else {
-                self.set_status(StatusMsg::info("选择模式：space 勾选 · a 全选 · esc 退出"));
+                self.set_status(StatusMsg::info(help::bi(
+                    "选择模式：space 勾选 · a 全选 · esc 退出",
+                    "Selection mode: space marks · a selects all · esc exits",
+                )));
             }
         }
     }
 
     pub fn exit_select_mode(&mut self) {
         self.select_mode.exit();
-        self.set_status(StatusMsg::info("已退出选择模式"));
+        self.set_status(StatusMsg::info(help::bi("已退出选择模式", "Left selection mode")));
     }
 
     /// `space` in selection mode: toggle the row under the cursor.
@@ -90,7 +97,7 @@ impl App {
 
     fn after_mark_change(&mut self) {
         let n = self.select_mode.len();
-        self.set_status(StatusMsg::info(format!("已选 {n} 条")));
+        self.set_status(StatusMsg::info(help::bi(&format!("已选 {n} 条"), &format!("{n} marked"))));
     }
 
     /// Ask for confirmation before applying `action` to the marked set.
@@ -100,12 +107,15 @@ impl App {
     pub fn request_batch(&mut self, action: BatchAction) {
         let ids = self.marked_ids_in_view_order();
         if ids.is_empty() {
-            self.set_status(StatusMsg::warn("没有选中任何条目"));
+            self.set_status(StatusMsg::warn(help::bi("没有选中任何条目", "Nothing marked")));
             return;
         }
         let effective = ids.iter().filter(|id| self.batch_would_change(action, **id)).count();
         if effective == 0 {
-            self.set_status(StatusMsg::info(format!("选中的 {} 条都无需{}", ids.len(), action.label())));
+            self.set_status(StatusMsg::info(help::bi(
+                &format!("选中的 {} 条都无需{}", ids.len(), action.label()),
+                &format!("None of the {} marked forwards needs {}", ids.len(), action.label_en()),
+            )));
             return;
         }
         // Confirm with the *effective* count: the prompt should describe what
@@ -175,7 +185,10 @@ impl App {
             let existing: Vec<crate::model::TunnelId> = self.tunnels.iter().map(|t| t.cfg.id).collect();
             self.select_mode.retain_existing(|id| existing.contains(&id));
         }
-        self.set_status(StatusMsg::ok(format!("已{} {n} 条", action.label())));
+        self.set_status(StatusMsg::ok(help::bi(
+            &format!("已{} {n} 条", action.label()),
+            &format!("{} done for {n} forwards", action.label_en()),
+        )));
     }
 }
 

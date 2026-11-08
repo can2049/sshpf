@@ -38,6 +38,15 @@ impl ForwardKind {
         }
     }
 
+    /// English half of [`ForwardKind::label`], for the bilingual UI.
+    pub fn label_en(self) -> &'static str {
+        match self {
+            ForwardKind::Local => "Local -L",
+            ForwardKind::Remote => "Remote -R",
+            ForwardKind::Dynamic => "Dynamic -D",
+        }
+    }
+
     pub fn all() -> [ForwardKind; 3] {
         [ForwardKind::Local, ForwardKind::Remote, ForwardKind::Dynamic]
     }
@@ -207,6 +216,21 @@ impl SshForward {
         None
     }
 
+    /// English half of [`SshForward::unsupported_reason`], for the bilingual UI.
+    ///
+    /// Mirrors the same two conditions rather than matching on the Chinese
+    /// string: the reason and its translation then cannot drift apart, and a
+    /// third reason added above becomes a compile-visible edit here too.
+    pub fn unsupported_reason_en(&self) -> Option<&'static str> {
+        if self.listen_port == 0 {
+            return Some("Unparseable port");
+        }
+        if self.kind != ForwardKind::Dynamic && (self.target_host.is_empty() || self.target_port == 0) {
+            return Some("Unparseable target");
+        }
+        None
+    }
+
     /// Suggested tunnel name, e.g. `cloud_pc-L-8080` — unique enough to sort,
     /// short enough for the NAME column.
     pub fn suggested_name(&self) -> String {
@@ -307,6 +331,16 @@ impl ImportColumn {
             ImportColumn::Listen => "监听",
             ImportColumn::Target => "目标",
             ImportColumn::Raw => "原始指令",
+        }
+    }
+
+    /// English half of [`ImportColumn::label`], for the bilingual UI.
+    pub fn label_en(self) -> &'static str {
+        match self {
+            ImportColumn::Kind => "Kind",
+            ImportColumn::Listen => "Listen",
+            ImportColumn::Target => "Target",
+            ImportColumn::Raw => "Directive",
         }
     }
 
@@ -631,6 +665,10 @@ impl ImportTable {
     }
 
     /// The status line: `3/5 条勾选 · 筛选: 类型=R, 监听=8080`.
+    ///
+    /// Chinese only on purpose: §5.2 of the i18n contract keeps the model layer
+    /// language-neutral and lets the UI compose the English half from the
+    /// `*_en()` accessors (`src/ui/import.rs`).
     pub fn summary(&self) -> String {
         let mut s = format!("{}/{} 条勾选", self.checked_count(), self.importable_count());
         if self.has_filters() {
@@ -768,6 +806,16 @@ impl BatchAction {
         }
     }
 
+    /// English half of [`BatchAction::label`], for the bilingual UI.
+    pub fn label_en(self) -> &'static str {
+        match self {
+            BatchAction::Start => "Start",
+            BatchAction::Stop => "Stop",
+            BatchAction::Restart => "Restart",
+            BatchAction::Delete => "Delete",
+        }
+    }
+
     /// ASCII name, used for log fields (and therefore stable across UI wording).
     pub fn name(self) -> &'static str {
         match self {
@@ -781,12 +829,26 @@ impl BatchAction {
     /// Every batch operation goes through the confirmation gate: even "enable"
     /// opens N listeners at once, which is exactly what the single-row flow
     /// already warns about.
+    /// Bilingual: the Chinese sentence stays first and unchanged (tests and the
+    /// UI key off it), the English sentence follows after a space.
     pub fn prompt(self, n: usize) -> String {
         match self {
-            BatchAction::Start => format!("确认启用选中的 {n} 条转发？将新开 {n} 个监听端口。"),
-            BatchAction::Stop => format!("确认停用选中的 {n} 条转发？将断开它们的连接。"),
-            BatchAction::Restart => format!("确认重启选中的 {n} 条转发？连接会短暂中断。"),
-            BatchAction::Delete => format!("确认删除选中的 {n} 条转发？此操作不可撤销。"),
+            BatchAction::Start => crate::help::bi(
+                &format!("确认启用选中的 {n} 条转发？将新开 {n} 个监听端口。"),
+                &format!("Start the {n} selected forwards? {n} new listening ports will open."),
+            ),
+            BatchAction::Stop => crate::help::bi(
+                &format!("确认停用选中的 {n} 条转发？将断开它们的连接。"),
+                &format!("Stop the {n} selected forwards? Their connections will drop."),
+            ),
+            BatchAction::Restart => crate::help::bi(
+                &format!("确认重启选中的 {n} 条转发？连接会短暂中断。"),
+                &format!("Restart the {n} selected forwards? The connections will briefly drop."),
+            ),
+            BatchAction::Delete => crate::help::bi(
+                &format!("确认删除选中的 {n} 条转发？此操作不可撤销。"),
+                &format!("Delete the {n} selected forwards? This cannot be undone."),
+            ),
         }
     }
 }
@@ -839,6 +901,25 @@ impl FailureKind {
             FailureKind::Exited => "ssh 异常退出",
             FailureKind::Unsupported => "该类型暂未支持",
             FailureKind::Unknown => "未知错误",
+        }
+    }
+
+    /// English half of [`FailureKind::short`], for the bilingual UI.
+    pub fn short_en(self) -> &'static str {
+        match self {
+            FailureKind::PortInUse => "Local port in use",
+            FailureKind::PermissionDenied => "Port needs root (<1024)",
+            FailureKind::AuthFailed => "Authentication failed",
+            FailureKind::DnsFailure => "DNS lookup failed",
+            FailureKind::ConnectionRefused => "Connection refused",
+            FailureKind::Timeout => "Connection timed out",
+            FailureKind::HostKeyMismatch => "Host key verification failed",
+            FailureKind::RemoteForwardFailed => "Remote forward rejected",
+            FailureKind::TargetUnreachable => "Target unreachable",
+            FailureKind::SpawnFailed => "Cannot start ssh",
+            FailureKind::Exited => "ssh exited unexpectedly",
+            FailureKind::Unsupported => "Not supported yet",
+            FailureKind::Unknown => "Unknown error",
         }
     }
 
@@ -1112,6 +1193,20 @@ impl FormField {
             FormField::RemoteHost => "远端地址",
             FormField::RemotePort => "远端端口",
             FormField::AutoRestart => "自动重连",
+        }
+    }
+
+    /// English half of [`FormField::label`], for the bilingual UI.
+    pub fn label_en(self) -> &'static str {
+        match self {
+            FormField::Name => "Name",
+            FormField::Kind => "Type",
+            FormField::SshHost => "SSH host",
+            FormField::LocalAddr => "Local addr",
+            FormField::LocalPort => "Local port",
+            FormField::RemoteHost => "Remote host",
+            FormField::RemotePort => "Remote port",
+            FormField::AutoRestart => "Auto-retry",
         }
     }
 

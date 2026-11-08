@@ -120,74 +120,206 @@ sshpf --list-hosts          # 打印 ~/.ssh/config 里的主机后退出
 sshpf --check               # 校验配置文件后退出
 ```
 
-### 快捷键
+### 快捷键 / Key bindings
 
-| 键 | 作用 | 键 | 作用 |
-|---|---|---|---|
-| `j`/`k` `↑`/`↓` | 移动光标 | `space` | 启用 / 停用 |
-| `g`/`G` | 跳到首 / 尾行 | `r` | 重启 |
-| `n` | 新建转发 | `e` | 编辑 |
-| `d` | 删除（需确认） | `enter` / `l` | 详情 + 完整日志 |
-| `/` | 过滤 | `a` / `x` | 全部启用 / 全部停用（需确认） |
-| `v` | 进入 / 退出多选模式 | `?` | 帮助 |
-| `q` | 退出（有运行中转发时确认） | | |
+界面里**任何时刻**按 `?` 都能看到当前上下文的按键说明，中英双语，且与本文一致。
+完整键位参考（按上下文分表）见 [docs/keymap.md](docs/keymap.md)。
 
-多选模式（`v` 进入）下部分键**被重新绑定**，不是叠加：
+Press `?` at **any** moment to see the keys for the current context, in Chinese and
+English, guaranteed to match this page. The full reference is
+[docs/keymap.md](docs/keymap.md).
 
-| 键 | 作用 |
-|---|---|
-| `space` | 勾选 / 取消光标行（不是启停） |
-| `j`/`k` | 移动光标，标记保留 |
-| `J` / `K` | 从锚点扩选到光标（`shift`+`↓`/`↑` 同效） |
-| `a` | 全选**可见**行；再按一次全部取消 |
-| `s` / `x` / `R` / `D` | 批量 启用 / 停用 / 重启 / 删除（均需确认） |
-| `esc` | 退出（清空标记） |
+#### 主界面 / Main screen
+
+| 键 / Key | 中文 | English |
+|---|---|---|
+| `j` / `k`、`↓` / `↑` | 移动光标 | Move the cursor |
+| `g` / `G`、`home` / `end` | 跳到首行 / 末行 | Jump to the first / last row |
+| `space` | 启用 / 停用（运行中先确认） | Enable / disable (asks if running) |
+| `r` | 重启（运行中先确认，未运行直接起） | Restart (asks if running, starts if not) |
+| `n` | 新建转发 | Create a tunnel |
+| `e` / `E` | 编辑（两个键同效） | Edit (`e` and `E` are aliases) |
+| `d` | 删除（需确认） | Delete (asks first) |
+| `enter` / `l` | 详情 + 完整日志 | Detail + full log |
+| `/` | 过滤 | Filter |
+| `a` / `x` | 全部启用 / 全部停用（需确认） | Enable all / disable all (ask first) |
+| `v` / `V` | 进入 / 退出多选模式（两个键同效） | Enter / leave selection mode (aliases) |
+| `esc` | 清除过滤 | Clear the filter |
+| `?` | 打开 / 关闭帮助 | Open / close the help |
+| `q` / `ctrl+c` | 退出（有运行中转发时确认；`ctrl+c` 等同 `q`，不会直接退出） | Quit (asks when tunnels run; `ctrl+c` equals `q` and never quits outright) |
+
+#### 多选模式 / Selection mode
+
+按 `v` 进入。部分键**被重新绑定**，不是叠加：
+
+Entered with `v`. Some keys are **re-bound**, not added:
+
+| 键 / Key | 中文 | English |
+|---|---|---|
+| `space` | 勾选 / 取消光标行（不是启停） | Mark / unmark the row (not start / stop) |
+| `j` / `k`、`↓` / `↑` | 移动光标，标记保留 | Move the cursor; marks stay |
+| `g` / `G`、`home` / `end` | 跳到首行 / 末行 | Jump to the first / last row |
+| `J` / `K`、`shift+↓` / `shift+↑` | 从锚点扩选到光标 | Extend the marks from the anchor |
+| `a` | 全选**可见**行；再按一次全部取消 | Toggle all **visible** rows |
+| `s` / `x` / `R` / `D` | 批量 启用 / 停用 / 重启 / 删除（均需确认） | Batch start / stop / restart / delete (all ask first) |
+| `v` / `V` / `esc` | 退出（清空标记） | Leave (marks are cleared) |
 
 `R`/`D` 用大写是为了不与单行的 `r`/`d` 混淆。多选模式下 `space` 不再启停、`r`/`d`/`n`/`e` 不生效，
 所以底部两行提示会整体换掉——留着旧提示等于广告一批会做别的事或什么都不做的键。
 
-表单内（两阶段编辑）：`↑↓`/`tab` 移动高亮 → `enter` 进入编辑 → `enter`/`esc` 结束编辑；`ctrl+s` 保存。SSH 主机字段按 `enter` 展开下拉，`space` / `i` 展开「从 `~/.ssh/config` 导入转发」面板。
+`R`/`D` are uppercase so they cannot be confused with single-row `r`/`d`. Here `space`
+never starts or stops a tunnel and `r`/`d`/`n`/`e` do nothing, so the footer is replaced
+entirely — leaving the old hints would advertise keys that now do something else or nothing.
 
-#### 导入面板内
+#### 表单 / Form
 
-面板展开后，键位**归面板**：`↑↓`/`g`/`G`/`PageUp`/`PageDown` 移动的是导入行，不再是表单字段；
-`tab` 仍然切表单字段，`ctrl+s` 仍然保存。
+表单采用**两阶段编辑**（详见下文「新增转发：两阶段编辑 + 自动推荐本地端口」）。
+The form has **two editing stages**.
 
-| 键 | 作用 |
-|---|---|
-| `j`/`k` `↑`/`↓` | 移动行（`g`/`G` 首 / 尾） |
-| `space` | 勾选 / 取消当前行 |
-| `a` / `U` / `I` | 全选 / 全不选 / 反选（**只作用于筛选后可见的行**） |
-| `f` / `←` `→` | 切换正在筛选的列（`f` 循环：类型→监听→目标→原始指令→类型） |
-| 直接输入 | 追加到当前列筛选（`backspace` 删字符） |
-| `enter` | 结束筛选输入（面板不收起） |
-| `F` | 清除当前列的筛选（没有筛选时提示「没有筛选可清除」） |
-| `ctrl`+`r` | 清除全部筛选 |
-| `z` | 撤销上一次筛选改动（LIFO） |
-| `esc` | 第一次退出筛选输入；不在输入时收起面板 |
+导航态（默认，方向键只移动高亮，不改值）/ Navigating (the default; arrows only move the highlight):
+
+| 键 / Key | 中文 | English |
+|---|---|---|
+| `tab` / `shift+tab`、`↓` / `↑` | 移动字段高亮 | Move the field highlight |
+| `enter` | 进入编辑（`类型` 循环、`自动重连` 取反、`SSH 主机` 展开下拉） | Start editing (cycle type, toggle auto-restart, open host list) |
+| `←` / `h`、`→` / `l` | `类型` 切上一个 / 下一个（L/R/D）；`自动重连` 取反 | On type: previous / next kind; on auto-restart: toggle |
+| `space` | `类型` / `自动重连` 切换；`SSH 主机` 展开 / 收起导入面板 | Cycle type, toggle auto-restart, toggle the import pane |
+| `i` | `SSH 主机` 字段：展开 / 收起导入面板 | On SSH host: toggle the import pane |
+| `f2` / `ctrl+h` / `ctrl+o` | `SSH 主机` 字段：打开主机下拉（三个键同效） | On SSH host: open the dropdown (three aliases) |
+| `ctrl+s` / `f10` | 保存（新建直接连；编辑先确认，运行中会重建） | Save (create connects at once; edit asks first) |
+| `esc` | 取消（有未保存内容会确认） | Cancel (asks when there are unsaved edits) |
+
+编辑态（某个文本字段正在接收输入）/ Editing (a text field is taking input):
+
+| 键 / Key | 中文 | English |
+|---|---|---|
+| 任意字符 | 插入到光标处 | Type to insert at the cursor |
+| `backspace` / `delete` | 删除光标前 / 后一个字符 | Delete before / after the cursor |
+| `←` / `→` | 光标左移 / 右移 | Move the cursor left / right |
+| `home` / `end` | 光标到行首 / 行尾 | Cursor to the start / end |
+| `enter` / `esc` | 结束编辑，留在本字段 | Stop editing, stay on this field |
+| `tab` / `shift+tab` | 结束编辑并切到下一 / 上一字段 | Stop editing and change field |
+| `ctrl+s` / `f10` | 保存（结束字段编辑后提交，不会把 `s` 打进字段） | Save (ends the field edit, then submits; never types `s`) |
+
+> **修复**：编辑态下 `ctrl+s` / `f10` 现在能保存了。此前 `ctrl+s` 会把字母 `s` 插进正在
+> 编辑的字段（静默的数据损坏），`f10` 完全无反应——而界面提示一直写着「`ctrl+s` 保存」。
+> 现在两个阶段行为一致：先结束字段编辑，再提交表单。
+>
+> **Fix**: `ctrl+s` / `f10` now save while a field is being edited. Previously `ctrl+s`
+> inserted the letter `s` into the field (silent data corruption) and `f10` did nothing at
+> all, while the footer advertised `ctrl+s`. Both stages now behave the same: end the field
+> edit, then submit.
+
+SSH 主机字段按 `enter` 展开下拉，`space` / `i` 展开「从 `~/.ssh/config` 导入转发」面板。
+`enter` on the SSH host field opens the dropdown; `space` / `i` open the import pane.
+
+#### 导入面板 / Import pane
+
+面板展开后，键位**归面板**：`↑`/`↓`、`j`/`k`、`g`/`G`、`home`/`end`、`pgup`/`pgdn` 移动的是导入行，
+不再是表单字段；`tab` 仍然切表单字段，`ctrl+s` 仍然保存。
+
+Once the pane is open its own keys win: `↑`/`↓`, `j`/`k`, `g`/`G`, `home`/`end`,
+`pgup`/`pgdn` move import rows, not form fields. `tab` still changes fields and `ctrl+s`
+still saves.
+
+| 键 / Key | 中文 | English |
+|---|---|---|
+| `j` / `k`、`↓` / `↑` | 移动行 | Move the row |
+| `g` / `G`、`home` / `end` | 首 / 尾行 | First / last row |
+| `pgup` / `pgdn` | 向上 / 向下翻页 | Page up / down |
+| `space` | 勾选 / 取消当前行 | Tick / untick the current row |
+| `a` / `U` / `I` | 全选 / 全不选 / 反选（**只作用于筛选后可见的行**） | Tick all / none / invert (**visible rows only**) |
+| `f` / `←` `→` | 切换正在筛选的列（`f` 循环：类型→监听→目标→原始指令→类型） | Switch filter column (`f` cycles) |
+| 直接输入 | 追加到当前列筛选（`backspace` 删字符） | Append to the current filter (`backspace` deletes) |
+| `enter` | 结束筛选输入（面板不收起） | End filter input (the pane stays open) |
+| `F` | 清除当前列的筛选（没有筛选时提示「没有筛选可清除」） | Clear this column's filter (says so when there is none) |
+| `ctrl+r` | 清除全部筛选 | Clear every filter |
+| `ctrl+z` | 撤销上一次筛选改动 | Undo the last filter change |
+| `z` | 撤销上一次筛选改动（LIFO） | Undo the last filter change (LIFO) |
+| `esc` | 第一次退出筛选输入；不在输入时收起面板 | Leave the filter first; otherwise close the pane |
+| `i` | 收起面板 | Close the pane |
+| `ctrl+s` | 保存：勾选 N 行生成 N 条隧道 | Save: one tunnel per ticked row |
 
 `space` 只能**展开**面板：面板打开后 `space` 已经被「勾选当前行」占用，再按一次会勾行而不是收起。
 收起用 `i` 或 `esc`，与展开它的键对称。代价是字面字符 `f` 无法输入到筛选里（`f` 优先循环列），
 但每列的内容都是端口、主机名或指令名，`←`/`→` 加退格足够覆盖。
 
-### 鼠标
+`space` can only **open** the pane: once open it means "tick this row", so a second press
+ticks instead of collapsing. Close it with `i` or `esc`, symmetric with the key that opened
+it. The cost is that a literal `f` cannot be typed into a filter (`f` always switches
+columns), but every column holds a port, a host or a directive name, so `←`/`→` plus
+backspace cover the rest.
+
+#### 详情 / 过滤 / 帮助浮层 / Detail, filter and help overlay
+
+| 上下文 / Context | 键 / Key | 中文 | English |
+|---|---|---|---|
+| 详情 / 日志 | `j` / `k`、`↓` / `↑`、`pgup` / `pgdn` | 滚动 | Scroll |
+| 详情 / 日志 | `q` / `esc` / `enter` / `l` | 关闭返回 | Close and go back |
+| 过滤输入 | 任意字符 / `backspace` | 即时过滤 / 删字符 | Filter live / delete a character |
+| 过滤输入 | `enter` / `esc` | 保留过滤关闭 / 清除过滤关闭 | Keep the filter / clear it and close |
+| 帮助浮层 | `j` / `k`、`↓` / `↑`、`pgup` / `pgdn` | 滚动 | Scroll |
+| 帮助浮层 | `?` / `esc` / `q` / `enter` | 关闭帮助 | Close the help |
+| 确认框 | `y` / `Y` / `enter` | 执行 | Run the action |
+| 确认框 | `n` / `N` / `esc` | 取消 | Cancel |
+| 主机下拉 | `↑` / `↓`、`j` / `k`、`pgup` / `pgdn`、`home` / `end` | 移动 / 翻页 / 首尾 | Move / page / first-last |
+| 主机下拉 | `enter` / `esc` / `backspace` / 任意字符 | 选定 / 收起 / 删查询字符 / 过滤主机 | Pick / collapse / delete / filter hosts |
+
+### 界面帮助 / In-app help
+
+按 `?` 打开**分区帮助**：主界面、多选模式、表单（导航 / 编辑）、主机下拉、导入面板、
+导入列筛选、确认框、详情、过滤、帮助自身、鼠标、状态图例、安全与诊断——每个上下文一节。
+每一条都是**中文在前、英文在后**，且与真实键位逐一对应。
+
+Press `?` to open the **sectioned help**: main screen, selection mode, form (navigating and
+editing), host dropdown, import pane, import column filter, confirmation, detail, filter,
+the help itself, mouse, status legend, and safety. Every row is Chinese first, English
+second, and matches the real key map.
+
+- 帮助内容不是手写散文，而是 `src/help.rs` 里的**数据**（`SECTIONS`）。浮层渲染它，
+  界面底部提示复用同一套措辞，所以"页脚说的"和"`?` 说的"不可能互相矛盾。
+  The help is **data** (`SECTIONS` in `src/help.rs`), not prose. The overlay renders it and
+  the footer hint lines reuse the same wording, so "what the footer says" and "what `?`
+  says" cannot disagree.
+- 浮层按当前终端宽度折行，滚动上限按**折行后的实际行数**计算，到底不会卡住也不会留白。
+  It wraps to the terminal width and scrolls by the wrapped line count, so it neither sticks
+  nor leaves blank space at the end.
+- 浮层内 `j` / `k` / `pgup` / `pgdn` 滚动，`?` / `esc` / `q` / `enter` 关闭。
+  Scroll with `j` / `k` / `pgup` / `pgdn`, close with `?` / `esc` / `q` / `enter`.
+- 同一份数据还由 `tests/help_coverage.rs` **机器校验**：解析 `src/keys.rs` 里每个 handler
+  真正 dispatch 的键，与帮助目录双向比对。加键忘写帮助会测试失败，写了代码里不存在的键
+  也会失败——见 [docs/keymap.md](docs/keymap.md) 末尾。
+  The same data is checked by `tests/help_coverage.rs`: it parses the keys each handler in
+  `src/keys.rs` really dispatches and compares them **both ways** with the catalog. A key
+  added without help fails the test, and so does a documented key that nothing dispatches.
+
+### 鼠标 / Mouse
 
 终端支持鼠标时（捕获是 best-effort 开启的，失败也不影响键盘）：
 
-| 位置 | 动作 |
-|---|---|
-| 表格行 | 移动光标；多选模式下同时切换该行标记 |
-| 表格行 + `shift` | 从锚点扩选范围 |
-| 导入表复选框 | 勾选 / 取消该行 |
-| 导入表行其它位置 | 移动光标到该行 |
-| 导入表列头 | 开始编辑该列筛选 |
-| 筛选 chip 的 `×` | 删除该列筛选 |
-| `全选` / `反选` / `全不选` | 对应操作（只作用于筛选后可见行） |
-| `清除全部筛选` / `撤销筛选` | 对应操作；无内容时变暗且不可点 |
-| 多选动作条按钮 | 对应批量操作（走确认闸） |
-| 列表上的滚轮 | 滚动（主表移动光标，导入表移动其光标） |
+When the terminal supports it (capture is best-effort; failing only disables the mouse):
 
-点击落空不做任何事——按钮旁边的误点不该启动隧道。
+| 位置 / Where | 中文 | English |
+|---|---|---|
+| 表格行 | 移动光标；多选模式下同时切换该行标记 | Move the cursor; in selection mode also toggle that row's mark |
+| 表格行 + `shift` | 从锚点扩选范围 | Extend the marks from the anchor |
+| 导入表复选框 | 勾选 / 取消该行 | Tick / untick that row |
+| 导入表行其它位置 | 把导入表光标移到该行 | Move the import cursor to that row |
+| 导入表列头 | 开始编辑该列筛选 | Start filtering that column |
+| 筛选 chip 的 `×` | 删除该列筛选 | Drop that column's filter |
+| `全选` / `反选` / `全不选` | 对应操作（只作用于筛选后可见行） | The matching bulk tick (visible rows only) |
+| `清除全部筛选` / `撤销筛选` | 对应操作；无内容时变暗且不可点 | Clear / undo filters; dimmed and not clickable when nothing to act on |
+| 多选动作条按钮 | 对应批量操作（走确认闸） | The batch operation (still behind the confirmation gate) |
+| 列表上的滚轮 | 滚动（主表移动光标，导入表移动其光标） | Scroll (the main table moves the cursor, the import list its own) |
+
+点击落空**不做任何事**——按钮旁边的误点不该启动隧道，也不"透传"给下面的控件。
+A click on empty space does **nothing** — a misclick next to a button must not start a
+tunnel, and it never falls through to the widget below.
+
+弹窗（确认框 / 帮助 / 详情）会**吞掉**点击，不会穿透到下面的表格：确认框是在破坏性动作
+之前拦人的，一次本想点对话框的点击绝不能落到某行上把它标记或启动。
+Popups (confirmation, help, detail) **swallow** clicks instead of letting them reach the
+table underneath: the confirmation gate must never mark or start a row behind it.
 
 ### 风险操作确认
 
@@ -418,25 +550,46 @@ sshpf --check               # 确认配置没写坏
 ## 开发
 
 ```bash
-cargo test                    # 410 单元 + 25 集成（日志 15 个）+ 10 端到端（9 个默认 #[ignore]，需真实 sshd）
-cargo test --test e2e -- --ignored --test-threads=1   # 真实 sshd 端到端
+cargo test                    # 全部：单元测试 + tests/*.rs 集成测试（e2e 默认 #[ignore]，见下一行）
+cargo test --lib              # 只跑单元测试（CI 的 OS 矩阵跑这个）
+cargo test --test help_coverage   # 帮助覆盖的机器校验（代码 ↔ 帮助目录双向断言）
+cargo test --test logging         # 诊断日志集成测试
+cargo test --test e2e -- --ignored --test-threads=1   # 真实 sshd 端到端（默认被 #[ignore])
 cargo clippy --all-targets    # 零警告
 cargo fmt --check             # 格式检查
 ```
 
+`cargo test` 会同时跑 lib 单元测试与 `tests/*.rs` 下的集成测试；端到端那组默认
+`#[ignore]`，必须显式 `--ignored` 才会执行（它需要真实的 `sshd`、`ssh-keygen`）。
+`cargo test` runs the lib unit tests *and* the integration tests in `tests/*.rs`; the
+end-to-end group is `#[ignore]`d by default and needs an explicit `--ignored` (it requires a
+real `sshd` and `ssh-keygen`).
+
 测试分布：
+
+单元测试（`cargo test --lib`）：
 
 | 模块 | 测试数 | 覆盖重点 |
 |---|---|---|
-| `keys` | 63 | 两阶段编辑语义、主机下拉、确认键位、导入面板按键归属、鼠标派发、未知键忽略 |
-| `app` | 94 | 就绪信号、重试退避、确认门控、过滤与选中、导入批量校验、多选标记与批量派发 |
-| `ssh` | 77 | config 解析（含 Match 污染防护）、**转发指令扫描与作用域**、known_hosts 匹配、SOCKS5、错误分类 |
-| `ui` | 57 | 1×1 到 40×12 极端尺寸、超长文本、NO_COLOR、命中图、导入面板列宽降级 |
+| `app` | 102 | 就绪信号、重试退避、确认门控、过滤与选中、导入批量校验、多选标记与批量派发 |
+| `ssh` | 84 | config 解析（含 Match 污染防护）、**转发指令扫描与作用域**、known_hosts 匹配、SOCKS5、错误分类 |
+| `keys` | 65 | 两阶段编辑语义、主机下拉、确认键位、导入面板按键归属、两阶段保存、鼠标派发、未知键忽略 |
+| `ui` | 69 | 1×1 到 40×12 极端尺寸、超长文本、NO_COLOR、命中图、导入面板列宽降级、双语帮助浮层折行 |
 | `model` | 55 | 三种转发 spec、失败码分类、输入缓冲边界、逐列筛选与撤销栈、多选语义 |
 | `config` | 27 | 缺省值、原子写、0600/0700 权限、字段校验、容错 |
+| `logging` | 16 | 记录格式/转义、级别过滤、轮转不切记录、panic 与致命信号真写盘、0600/0700 |
 | `tunnel` | 5 | 启停、事件顺序、重复启动、停止幂等 |
-| `logging` | 24 | 记录格式/转义、级别过滤、轮转不切记录、panic 与致命信号真写盘、0600/0700 |
+| `help` | 5 | 帮助目录不变式：14 个分区齐全、每条中英齐全、`fit` 三级退化 |
 | `sys` / `text` | 8 | 文件权限、退出信号、显示宽度与截断 |
+| **合计** | **436** | `cargo test --lib` |
+
+集成测试（`tests/*.rs`）：
+
+| 文件 | 测试数 | 覆盖重点 |
+|---|---|---|
+| `tests/help_coverage.rs` | 8 | **机器校验帮助覆盖**：解析 `src/keys.rs` 每个 handler 的 `KeyCode`，与帮助目录双向比对（不得遗漏 / 不得撒谎）、`HitTarget` 每个变体都被说明、每个 token 都出现在 [docs/keymap.md](docs/keymap.md) |
+| `tests/logging.rs` | 15 | 真实文件系统上的日志落盘、轮转与权限 |
+| `tests/e2e.rs` | 10（9 个默认 `#[ignore]`） | 真实 `sshd` 上的 `-L` / `-R` / `-D` 端到端 |
 
 模块分层（每层只依赖上层）：
 

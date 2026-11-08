@@ -62,6 +62,21 @@ jobs:
       - name: Unit tests
         run: cargo test --lib
 
+      # Integration tests that need no external service. `cargo test --lib`
+      # above compiles and runs the library's own `#[cfg(test)]` modules only,
+      # so `--tests`-style targets were previously never executed by CI at all —
+      # `tests/logging.rs` had been silently unrun since it was added, and the
+      # help-coverage test would have joined it.
+      #
+      # Both are pure-Rust and platform-guarded where they are not (the logging
+      # suite wraps its permission and signal assertions in `#[cfg(unix)]`), so
+      # they run on every OS in the matrix rather than being Linux-only.
+      # `tests/e2e.rs` is excluded on purpose: it needs a real `sshd` and has its
+      # own job below (it is `#[ignore]`d, so it would otherwise pass trivially
+      # here while covering nothing).
+      - name: Integration tests
+        run: cargo test --test help_coverage --test logging
+
       - name: Build (release)
         run: cargo build --release
 

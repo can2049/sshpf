@@ -12,14 +12,19 @@
 //!   measured with [`display_width`] (CJK counts as 2 columns), never
 //!   `str::len()`.
 //!
+//! Every string the user reads is bilingual, Chinese first and English second
+//! (`中文 English`), so no screen is a dead end for either reader. Narrow cells
+//! degrade through [`crate::help::fit`] rather than overflowing.
+//!
 //! Layout of the main screen (matches `docs/research/prior-art.md` §7):
 //!
 //! ```text
 //! row 0          title bar      sshpf 0.1.0 · ssh-config N hosts · cfg PATH   HH:MM:SS
-//! row 1          counters       ● 4 up  ◐ 2 starting  ◌ 1 retrying  ✗ 3 failed  ○ 5 off
-//! rows 2..h-4    tunnel table   名称 | T | 本地 | 远端 | SSH 主机 | 状态 | 最后错误 | 时长
-//! row h-4        message bar    app.status, or the selected tunnel's full error
-//! rows h-3..h    key hints      two lines
+//! row 1          counters       ● 4 已连通/Up  ◐ 2 连接中/Starting  …
+//! rows 2..h-5    tunnel table   名称/Name | T | 本地/Local | 远端/Remote | …
+//! row h-5        message bar    app.status, or the selected tunnel's full error
+//! row h-4        selection bar  only while selecting (`v`)
+//! rows h-3..h    key hints      three lines, every main-screen key
 //! ```
 
 use std::time::Instant;
@@ -134,7 +139,7 @@ pub mod layout;
 
 use crate::text::{display_width, pad_to_width, truncate_to_width};
 use hit::{HitMap, HitTarget};
-use layout::{COL_SPACING, DETAIL_LOG_TAIL, FORM_LABEL_W, FORM_VALUE_X};
+use layout::{COL_SPACING, DETAIL_LOG_TAIL, form_label_w, form_value_x};
 pub use layout::{Col, column_layout};
 
 /// Human duration used by the 时长 column.
@@ -158,6 +163,93 @@ fn fmt_unix(ts: i64) -> String {
         Some(dt) => dt.format("%Y-%m-%d %H:%M:%S").to_string(),
         None => "—".to_string(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Bilingual text helpers
+// ---------------------------------------------------------------------------
+//
+// Two shapes cover the whole UI:
+//
+// * prose and hint lines: `中文 / English` — the slash keeps the two languages
+//   apart on one line, Chinese first so a truncated line still reads and so the
+//   existing `contains("中文")` assertions keep meaning something;
+// * narrow cells (a column header, a status word, a button): `中文/English`
+//   without the spaces, because a table cell has no room for prose.
+//
+// Neither may overflow: `fit_pair` is the progressive-disclosure ladder that
+// [`crate::help::fit`] implements for the help catalog — both languages, then
+// Chinese only, then a truncation — with the compact `/` join this module uses.
+
+/// `中文 / English`, for hint lines and dialog prose.
+fn pair(zh: &str, en: &str) -> String {
+    format!("{zh} / {en}")
+}
+
+/// `中文/English` fitted to `width` cells; Chinese only when the pair is too
+/// wide, a truncation when even that does not fit.
+fn fit_pair(zh: &str, en: &str, width: usize) -> String {
+    let both = format!("{zh}/{en}");
+    if display_width(&both) <= width {
+        return both;
+    }
+    if display_width(zh) <= width {
+        return zh.to_string();
+    }
+    truncate_to_width(zh, width)
+}
+
+/// `中文 / English` fitted to `width` cells, with the same ladder as
+/// [`fit_pair`].
+fn fit_pair_spaced(zh: &str, en: &str, width: usize) -> String {
+    let both = pair(zh, en);
+    if display_width(&both) <= width {
+        return both;
+    }
+    if display_width(zh) <= width {
+        return zh.to_string();
+    }
+    truncate_to_width(zh, width)
+}
+
+/// Greedy wrap to `width` cells.
+///
+/// A CJK sentence has no spaces to break on, so the fallback is a hard break at
+/// a character boundary; Latin text prefers the last space so words stay whole.
+/// Overflow is impossible in practice because every produced line is truncated
+/// to `width` at render time, and the *count* of lines is what the scroll clamp
+/// measures.
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![text.to_string()];
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut used = 0usize;
+    for ch in text.chars() {
+        let w = crate::text::char_width(ch);
+        if used + w > width && !cur.is_empty() {
+            if let Some(pos) = cur.rfind(' ') {
+                let rest = cur[pos + 1..].to_string();
+                cur.truncate(pos);
+                out.push(std::mem::take(&mut cur));
+                cur = rest;
+                used = display_width(&cur);
+            } else {
+                out.push(std::mem::take(&mut cur));
+                used = 0;
+            }
+        }
+        cur.push(ch);
+        used += w;
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -194,7 +286,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Constraint::Min(1),           // table
         Constraint::Length(1),        // message bar
         Constraint::Length(select_h), // selection-mode action bar
-        Constraint::Length(2),        // key hints
+        Constraint::Length(3),        // key hints (three lines: every key, both languages)
     ])
     .split(area);
 
@@ -221,8 +313,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
 /// Clamp the ratatui scroll offsets to the current content length so that a
 /// resize (or a long list scrolled to the end) never leaves a blank view.
+///
+/// The help overlay's length is *measured*, not assumed: [`help_lines`] is the
+/// very function the renderer uses, so the clamp and the drawing can never
+/// disagree about how many rows the wrapped catalog actually occupies.
 fn clamp_scrolls(app: &mut App, area: Rect) {
-    let help_max = help_line_count().saturating_sub(help_inner_height(area) as usize);
+    let help_max =
+        help_lines(help_inner_width(area) as usize, palette()).len().saturating_sub(help_inner_height(area) as usize);
     app.help_scroll = app.help_scroll.min(help_max.min(u16::MAX as usize) as u16);
 
     if let Overlay::Detail(id) = app.overlay {
@@ -282,16 +379,18 @@ fn draw_counters(frame: &mut Frame, app: &App, area: Rect) {
     let p = palette();
     let c = app.counts();
 
-    // Full labels on a wide terminal, the compact `●2 ◐0 ◌1 ✗1 ○2` form when
-    // narrow — otherwise the counters are clipped mid-word.
-    let compact = area.width < 70;
+    // Full bilingual labels on a wide terminal, the compact `●2 ◐0 ◌1 ✗1 ○2`
+    // form when narrow — otherwise the counters are clipped mid-word. Colour is
+    // never the only signal: every counter keeps its glyph.
+    let compact = area.width < 96;
     let mut spans = vec![Span::raw(" ")];
+    let label = |zh: &str, en: &str| if compact { String::new() } else { format!(" {zh}/{en}") };
     let items: [(Color, String); 5] = [
-        (p.up, format!("● {}{}", c.up, if compact { "" } else { " up" })),
-        (p.pending, format!("◐ {}{}", c.starting, if compact { "" } else { " starting" })),
-        (p.pending, format!("◌ {}{}", c.retrying, if compact { "" } else { " retrying" })),
-        (p.failed, format!("✗ {}{}", c.failed, if compact { "" } else { " failed" })),
-        (p.off, format!("○ {}{}", c.off, if compact { "" } else { " off" })),
+        (p.up, format!("● {}{}", c.up, label("已连通", "Up"))),
+        (p.pending, format!("◐ {}{}", c.starting, label("连接中", "Starting"))),
+        (p.pending, format!("◌ {}{}", c.retrying, label("重试", "Retrying"))),
+        (p.failed, format!("✗ {}{}", c.failed, label("失败", "Failed"))),
+        (p.off, format!("○ {}{}", c.off, label("未启用", "Off"))),
     ];
     let gap = if compact { "  " } else { "   " };
     for (i, (color, text)) in items.iter().enumerate() {
@@ -301,12 +400,12 @@ fn draw_counters(frame: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::styled(text.clone(), p.fg(*color)));
     }
 
-    let right_w = if app.filter.is_empty() { 0 } else { (display_width(&app.filter) as u16 + 10).min(area.width / 2) };
+    let right_w = if app.filter.is_empty() { 0 } else { (display_width(&app.filter) as u16 + 16).min(area.width / 2) };
     let chunks = Layout::horizontal([Constraint::Min(0), Constraint::Length(right_w)]).split(area);
     frame.render_widget(Paragraph::new(Line::from(spans)), chunks[0]);
 
     if right_w > 0 {
-        let text = truncate_to_width(&format!("filter: {} ", app.filter), chunks[1].width as usize);
+        let text = truncate_to_width(&format!("过滤/Filter: {} ", app.filter), chunks[1].width as usize);
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(text, p.fg(p.accent))).alignment(Alignment::Right)),
             chunks[1],
@@ -334,93 +433,146 @@ fn draw_message(frame: &mut Frame, app: &App, area: Rect) {
             p.fg(color).add_modifier(Modifier::BOLD),
         ))
     } else if let Some(reason) = app.selected_tunnel().and_then(|t| t.status.failure()) {
-        let text = truncate_to_width(&format!(" ✗ {}   (enter 查看详情)", reason.detail), area.width as usize);
-        Line::from(Span::styled(text, p.fg(p.failed)))
+        let tail = fit_pair_spaced("enter 查看详情", "enter details", area.width as usize);
+        let text = format!(" ✗ {}   ({tail})", reason.detail);
+        Line::from(Span::styled(truncate_to_width(&text, area.width as usize), p.fg(p.failed)))
     } else {
-        Line::from(Span::styled(" 就绪 · n 新建转发 · ? 帮助 · q 退出", p.fg(p.dim)))
+        let idle = fit_pair_spaced(
+            "就绪 · n 新建转发 · ? 帮助 · q 退出",
+            "Ready · n new · ? help · q quit",
+            area.width as usize,
+        );
+        Line::from(Span::styled(format!(" {idle}"), p.fg(p.dim)))
     };
     frame.render_widget(Paragraph::new(line), area);
 }
 
-/// Two lines of key hints, exactly matching the keys `main` dispatches.
+/// Three lines of key hints, exactly matching the keys `main` dispatches.
 ///
-/// Both lines change in selection mode, because the mode *re-binds* keys rather
+/// The hints change in selection mode, because the mode *re-binds* keys rather
 /// than adding to them: `space` marks instead of starting, and `r`/`d`/`n`/`e`
 /// are not bound at all there. Leaving the normal hints on screen would
 /// advertise keys that do something else or nothing — the exact way a user
 /// discovers "the app is broken" while it is working as designed.
+///
+/// Every main-screen binding appears here, in both languages, and the list is
+/// *flowed* across the three rows rather than sliced into fixed groups: a
+/// footer is the one place where dropping a key silently is the whole bug, so
+/// the layout gives each hint its own width and wraps instead of clipping.
 fn draw_keys(frame: &mut Frame, app: &App, area: Rect) {
     if area.height == 0 || area.width == 0 {
         return;
     }
     let p = palette();
-    let (first, second): (Vec<Hint>, Vec<Hint>) = if app.select_mode.active {
-        (
-            vec![("j/k ↑↓", "移动"), ("space", "勾选"), ("J/K", "扩选"), ("g/G", "首尾")],
-            vec![("a", "全选"), ("s/x/R/D", "批量操作"), ("esc", "退出"), ("?", "帮助")],
-        )
-    } else {
-        (
-            vec![
-                ("j/k ↑↓", "移动"),
-                ("space", "启停"),
-                ("r", "重启"),
-                ("n", "新建"),
-                ("e", "编辑"),
-                ("d", "删除"),
-                ("enter", "详情"),
-                ("l", "日志"),
-            ],
-            vec![
-                ("/", "过滤"),
-                ("a", "全启"),
-                ("x", "全停"),
-                ("g/G", "首尾"),
-                ("v", "多选"),
-                ("?", "帮助"),
-                ("q", "退出"),
-            ],
-        )
-    };
-    let lines = vec![key_line(&first, p), key_line(&second, p)];
+    let hints: &[Hint] = if app.select_mode.active { SELECT_HINTS } else { MAIN_HINTS };
+    let lines = flow_hints(hints, area.width as usize, area.height as usize, p);
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-/// One `(key, description)` pair of the two hint lines.
-type Hint = (&'static str, &'static str);
+/// One `(key, Chinese, English)` triple of the hint lines.
+type Hint = (&'static str, &'static str, &'static str);
 
-fn key_line(items: &[Hint], p: Palette) -> Line<'static> {
-    let mut spans = vec![Span::raw(" ")];
-    for (i, (key, desc)) in items.iter().enumerate() {
-        if i > 0 {
+/// Every binding of the normal main screen, complete: no key is left off.
+///
+/// Order is "how often you reach for it", not "what the match arm order is", so
+/// that when a very narrow terminal cannot fit all three rows the least-used
+/// hints are the ones that fall off the end.
+const MAIN_HINTS: &[Hint] = &[
+    ("j/k ↑↓", "移动", "Move"),
+    ("g/G", "首尾", "First·Last"),
+    ("space", "启停", "Start·Stop"),
+    ("r", "重启", "Restart"),
+    ("n", "新建", "New"),
+    ("e/E", "编辑", "Edit"),
+    ("d", "删除", "Delete"),
+    ("enter/l", "详情", "Detail"),
+    ("/", "过滤", "Filter"),
+    ("a", "全启", "Start all"),
+    ("x", "全停", "Stop all"),
+    ("v/V", "多选", "Select"),
+    ("?", "帮助", "Help"),
+    ("q", "退出", "Quit"),
+    ("esc", "清过滤", "Clear filter"),
+];
+
+/// The selection-mode footer. It must not advertise `r`/`d`/`n`/`e`, which are
+/// unbound there, nor `space` as start/stop, which it re-binds to "mark".
+const SELECT_HINTS: &[Hint] = &[
+    ("j/k ↑↓", "移动", "Move"),
+    ("space", "勾选", "Mark"),
+    ("J/K ⇧↑↓", "扩选", "Extend"),
+    ("g/G", "首尾", "First·Last"),
+    ("a", "全选", "Select all"),
+    ("s/x/R/D", "批量", "Batch"),
+    ("v/esc", "退出", "Exit"),
+    ("?", "帮助", "Help"),
+];
+
+/// Flow `hints` into at most `max_lines` rows of `width` cells.
+///
+/// Greedy and lossless up to `max_lines`: a hint that would cross the right edge
+/// starts a new row, so the only thing that can drop is a hint that does not fit
+/// on the last row of a genuinely tiny terminal.
+fn flow_hints(hints: &[Hint], width: usize, max_lines: usize, p: Palette) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut spans: Vec<Span<'static>> = vec![Span::raw(" ")];
+    let mut used = 1usize;
+
+    for (key, zh, en) in hints {
+        // `key 中文/English`, degrading to Chinese when the pair is too wide.
+        let desc = fit_pair(zh, en, width);
+        let w = display_width(key) + 1 + display_width(&desc);
+        let sep = if used > 1 { 2 } else { 0 };
+        if used + sep + w > width && used > 1 {
+            lines.push(Line::from(std::mem::take(&mut spans)));
+            spans.push(Span::raw(" "));
+            used = 1;
+        }
+        if lines.len() + 1 >= max_lines && used + w > width {
+            // No row left for this hint: stop rather than overflow the frame.
+            break;
+        }
+        if used > 1 {
             spans.push(Span::raw("  "));
+            used += 2;
         }
         spans.push(Span::styled((*key).to_string(), p.fg(p.accent)));
         spans.push(Span::raw(" "));
-        spans.push(Span::styled((*desc).to_string(), p.fg(p.dim)));
+        spans.push(Span::styled(desc, p.fg(p.dim)));
+        used += w;
     }
-    Line::from(spans)
+    if !spans.is_empty() {
+        lines.push(Line::from(spans));
+    }
+    lines.truncate(max_lines);
+    lines
 }
 
 // ---------------------------------------------------------------------------
 // Main table
 // ---------------------------------------------------------------------------
 
-/// `(symbol, word, palette slot)` for a status. Colour is looked up through the
-/// palette so a `NO_COLOR` run keeps the symbol + word intact.
-fn status_parts(status: &TunnelStatus) -> (&'static str, &'static str, fn(&Palette) -> Color) {
+/// `(symbol, Chinese word, English word, palette slot)` for a status.
+///
+/// The symbol *and* both words are returned so a `NO_COLOR` run keeps the whole
+/// meaning; colour is looked up through the palette and is never the only carrier.
+fn status_parts(status: &TunnelStatus) -> (&'static str, &'static str, &'static str, fn(&Palette) -> Color) {
     match status {
-        TunnelStatus::Up { .. } => ("●", "已连通", |p| p.up),
-        TunnelStatus::Starting { .. } => ("◐", "连接中", |p| p.pending),
-        TunnelStatus::Retrying { .. } => ("◌", "重试", |p| p.pending),
-        TunnelStatus::Failed { .. } => ("✗", "失败", |p| p.failed),
-        TunnelStatus::Stopped => ("○", "未启用", |p| p.off),
+        TunnelStatus::Up { .. } => ("●", "已连通", "Up", |p| p.up),
+        TunnelStatus::Starting { .. } => ("◐", "连接中", "Starting", |p| p.pending),
+        TunnelStatus::Retrying { .. } => ("◌", "重试", "Retrying", |p| p.pending),
+        TunnelStatus::Failed { .. } => ("✗", "失败", "Failed", |p| p.failed),
+        TunnelStatus::Stopped => ("○", "未启用", "Off", |p| p.off),
     }
 }
 
-/// Text for the 状态 column: symbol + word (+ retry counter).
-fn status_text(status: &TunnelStatus) -> String {
-    let (sym, word, _) = status_parts(status);
+/// Text for the 状态 column: symbol + `中文/English` (+ retry counter).
+///
+/// `fitting` is the column width, so a squeezed 状态 column keeps the glyph and
+/// the Chinese rather than overflowing into its neighbour.
+fn status_text(status: &TunnelStatus, fitting: usize) -> String {
+    let (sym, zh, en, _) = status_parts(status);
+    let word = fit_pair(zh, en, fitting.saturating_sub(display_width(sym) + 1));
     match status {
         TunnelStatus::Retrying { attempt, .. } => format!("{sym} {word}{attempt}"),
         _ => format!("{sym} {word}"),
@@ -428,13 +580,16 @@ fn status_text(status: &TunnelStatus) -> String {
 }
 
 /// Text for the 时长 column.
-fn uptime_text(status: &TunnelStatus) -> String {
+fn uptime_text(status: &TunnelStatus, fitting: usize) -> String {
     match status {
         TunnelStatus::Up { since } | TunnelStatus::Starting { since } => fmt_uptime(since.elapsed().as_secs()),
         TunnelStatus::Retrying { next_at, .. } => {
             let ms = next_at.saturating_duration_since(Instant::now()).as_millis();
             let secs = ms.div_ceil(1000);
-            format!("重试 in {secs}s")
+            // `重试 5s` on a normal column, `重试/retry 5s` on a very wide one.
+            let tail = format!(" {secs}s");
+            let word = fit_pair("重试", "retry", fitting.saturating_sub(display_width(&tail)));
+            format!("{word}{tail}")
         }
         _ => "—".to_string(),
     }
@@ -473,20 +628,22 @@ fn draw_table(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
         headers.push(cell("✓", header_style));
     }
     headers.extend(layout.iter().map(|(col, w)| {
-        // Short labels keep the header readable once a column is squeezed.
-        let label = match col {
-            Col::Name => "名称",
-            Col::Kind => "T",
-            Col::Local => "本地",
-            Col::Remote => "远端",
-            Col::LocalRemote => "本地→远端",
-            Col::SshHost => "SSH 主机",
-            Col::Status => "状态",
-            Col::LastError if *w >= 8 => "最后错误",
-            Col::LastError => "错误",
-            Col::Uptime => "时长",
+        // `中文/English` where the column is wide enough, Chinese where it is
+        // not: a header that overflowed would push the column boundaries off the
+        // cells they describe, which is worse than losing the English.
+        let (zh, en) = match col {
+            Col::Name => ("名称", "Name"),
+            Col::Kind => ("T", ""),
+            Col::Local => ("本地", "Local"),
+            Col::Remote => ("远端", "Remote"),
+            Col::LocalRemote => ("本地→远端", "Local→Remote"),
+            Col::SshHost => ("SSH 主机", "SSH host"),
+            Col::Status => ("状态", "Status"),
+            Col::LastError if *w >= 8 => ("最后错误", "Error"),
+            Col::LastError => ("错误", "Err"),
+            Col::Uptime => ("时长", "Uptime"),
         };
-        cell(label, header_style)
+        cell(fit_pair(zh, en, *w as usize), header_style)
     }));
     let header = Row::new(headers);
 
@@ -500,9 +657,9 @@ fn draw_table(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
 
     if rows.is_empty() {
         let text = if app.tunnels.is_empty() {
-            "还没有转发条目，按 n 新建"
+            "还没有转发条目，按 n 新建 / No tunnels yet, press n"
         } else {
-            "没有匹配的条目，按 esc 清除过滤"
+            "没有匹配的条目，按 esc 清除过滤 / No match, esc clears the filter"
         };
         let span = layout.len().max(1) as u16 + mark_w;
         rows.push(Row::new(vec![cell(text, p.fg(p.dim)).column_span(span)]));
@@ -573,17 +730,21 @@ fn table_row(view: &TunnelView, layout: &[(Col, u16)], p: Palette, marked: Optio
             }
             Col::SshHost => cell(truncate_to_width(&cfg.ssh_host, w), p.fg(p.text)),
             Col::Status => {
-                let (_, _, color) = status_parts(&view.status);
-                let text = truncate_to_width(&status_text(&view.status), w);
+                let (_, _, _, color) = status_parts(&view.status);
+                let text = truncate_to_width(&status_text(&view.status, w), w);
                 cell(text, p.fg(color(&p)))
             }
-            Col::LastError => match view.last_error() {
-                Some(short) => cell(truncate_to_width(&short, w), p.fg(p.failed)),
+            Col::LastError => match view.status.failure() {
+                // The classified phrase in both languages; the raw stderr stays
+                // in the detail panel, where there is room for it.
+                Some(reason) => {
+                    cell(truncate_to_width(&fit_pair(&reason.short, reason.kind.short_en(), w), w), p.fg(p.failed))
+                }
                 None => cell("—", p.fg(p.dim)),
             },
             Col::Uptime => {
                 let style = if matches!(view.status, TunnelStatus::Up { .. }) { p.fg(p.up) } else { p.fg(p.dim) };
-                cell(truncate_to_width(&uptime_text(&view.status), w), style)
+                cell(truncate_to_width(&uptime_text(&view.status, w), w), style)
             }
         };
         cells.push(c);
@@ -623,25 +784,27 @@ fn draw_selection_bar(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMa
     let right = area.right();
     let mut spans: Vec<Span<'static>> = Vec::new();
 
-    // The count is emphasised because it is the mode's whole state.
-    let count = format!(" 已选 {n} 条 ");
+    // The count is emphasised because it is the mode's whole state. It carries
+    // the English only on a terminal wide enough to keep every action button on
+    // the bar: dropping a button to pay for the translation would be a bad trade
+    // (the buttons are clickable, the number is not).
+    let count = if area.width >= 140 { format!(" 已选 {n} 条 / {n} marked ") } else { format!(" 已选 {n} 条 ") };
     let count_w = display_width(&count) as u16;
     let count_style = if n == 0 { p.fg(p.pending) } else { p.fg(p.up) }.add_modifier(Modifier::BOLD);
     spans.push(Span::styled(count, count_style));
     x = x.saturating_add(count_w);
 
-    // Layout, not content: "已选 0 条" plus the actions still fits narrow
+    // Layout, not content: the count plus the actions still fits narrow
     // terminals because each label is dropped whole once it stops fitting.
-    let buttons: [(BatchAction, &str); 4] = [
-        (BatchAction::Start, "s 启用"),
-        (BatchAction::Stop, "x 停用"),
-        (BatchAction::Restart, "R 重启"),
-        (BatchAction::Delete, "D 删除"),
-    ];
-    for (action, label) in buttons {
-        let sep = "  ·  ";
+    // The label comes from `BatchAction` itself, so the bar and the confirmation
+    // prompt can never drift apart.
+    let buttons: [(BatchAction, &'static str); 4] =
+        [(BatchAction::Start, "s"), (BatchAction::Stop, "x"), (BatchAction::Restart, "R"), (BatchAction::Delete, "D")];
+    for (action, key) in buttons {
+        let label = format!("{key} {}", fit_pair(action.label(), action.label_en(), 20));
+        let sep = " · ";
         let sep_w = display_width(sep) as u16;
-        let label_w = display_width(label) as u16;
+        let label_w = display_width(&label) as u16;
         if x + sep_w + label_w > right {
             break;
         }
@@ -653,10 +816,13 @@ fn draw_selection_bar(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMa
         x += label_w;
     }
 
-    for (label, target) in [("a 全选", HitTarget::BatchSelectAll), ("v/esc 退出", HitTarget::BatchExit)] {
-        let sep = "  ·  ";
+    for (label, target) in [
+        (format!("a {}", fit_pair("全选", "All", 14)), HitTarget::BatchSelectAll),
+        (format!("v/esc {}", fit_pair("退出", "Exit", 12)), HitTarget::BatchExit),
+    ] {
+        let sep = " · ";
         let sep_w = display_width(sep) as u16;
-        let label_w = display_width(label) as u16;
+        let label_w = display_width(&label) as u16;
         if x + sep_w + label_w > right {
             break;
         }
@@ -713,74 +879,196 @@ fn clear_and_block(frame: &mut Frame, area: Rect, block: Block<'static>) {
 // Overlay: Help
 // ---------------------------------------------------------------------------
 
-/// `(key, description)` pairs shown by the help overlay. An empty description
-/// renders `key` as a section header; an empty key renders `description` as
-/// indented prose.
-const HELP_ITEMS: &[(&str, &str)] = &[
-    ("j / ↓", "向下移动选择"),
-    ("k / ↑", "向上移动选择"),
-    ("g / G", "跳到第一行 / 最后一行"),
-    ("space", "启动选中条目（停止需确认）"),
-    ("r", "重启选中条目（需确认）"),
-    ("n", "新建转发（打开表单）"),
-    ("e", "编辑选中条目（保存需确认）"),
-    ("d", "删除选中条目（需确认）"),
-    ("enter", "打开详情面板"),
-    ("l", "打开日志（等同详情）"),
-    ("/", "按名称 / 主机过滤列表"),
-    ("esc", "关闭弹窗 / 清除过滤"),
-    ("a", "启用全部条目（需确认）"),
-    ("x", "停用全部条目（需确认）"),
-    ("?", "打开 / 关闭本帮助"),
-    ("q", "退出（需确认）"),
-    ("", ""),
-    ("表单内：", ""),
-    ("tab / ↑↓", "切换字段"),
-    ("← / →", "切换转发类型 L / R / D"),
-    ("enter/↓", "在 SSH 主机字段展开 ~/.ssh/config 下拉"),
-    ("space / i", "展开 / 收起「从 ~/.ssh/config 导入转发」面板"),
-    ("enter", "校验并保存（保存后立即连接）"),
-    ("esc", "取消编辑（有未保存内容会确认）"),
-    ("", ""),
-    ("导入面板内：", ""),
-    ("j/k ↑↓", "移动行（g/G 首尾）"),
-    ("space", "勾选 / 取消当前行"),
-    ("a / U / I", "全选 / 全不选 / 反选（只作用于筛选后的可见行）"),
-    ("f / ←→", "切到下一 / 上一列的筛选"),
-    ("F", "清除当前列的筛选"),
-    ("ctrl+r", "清除全部筛选"),
-    ("z", "撤销上一次筛选改动"),
-    ("esc", "先退出筛选输入；再按一次收起面板"),
-    ("", ""),
-    ("多选模式（v）：", ""),
-    ("v / esc", "进入 / 退出多选模式"),
-    ("space", "勾选 / 取消光标行"),
-    ("J / K", "扩选：按行范围累加标记"),
-    ("a", "全选（再按一次取消全选，看「已选 N 条」确认）"),
-    ("s / x / R / D", "批量 启用 / 停用 / 重启 / 删除（需确认）"),
-    ("", ""),
-    ("状态含义：", ""),
-    ("● 已连通", "转发已就绪，可开始使用"),
-    ("◐ 连接中", "ssh 已启动，等待就绪标记"),
-    ("◌ 重试N", "网络类失败，退避后自动重连（第 N 次）"),
-    ("✗ 失败", "配置类失败，需修改后手动重启"),
-    ("○ 未启用", "用户意图为关闭"),
-    ("", ""),
-    ("提示：", ""),
-    ("", "所有破坏性操作（删除 / 停用 / 重启 / 批量启停 / 保存修改 / 放弃编辑 / 退出）"),
-    ("", "都会先弹出确认，需按 y 或 enter 才执行，esc 或 n 取消。"),
-    ("", "失败详情（原始 stderr）在详情面板完整保留，表格只放归类短句。"),
-    ("", "设置 NO_COLOR=1 关闭全部颜色，状态仍由符号 + 文字表达。"),
-    ("", "诊断日志（含崩溃记录）在 ~/.local/state/sshpf/logs/sshpf.log，"),
-    ("", "SSHPF_LOG_DIR / SSHPF_LOG_LEVEL 可改目录与级别；详见 docs/logging.md。"),
-];
+/// Narrowest key column: below this the two-cell indent plus a binding no
+/// longer reads as a column, and descriptions are better off full width.
+const HELP_KEY_MIN: usize = 10;
 
-fn help_line_count() -> usize {
-    HELP_ITEMS.len()
+/// Widest key column. The catalog contains long alternatives
+/// (`J / K / shift+↓ / shift+↑`), and a column sized for the worst case would
+/// starve every description on a normal terminal — those few rows are allowed to
+/// put their keys on their own line instead (see [`item_lines`]).
+const HELP_KEY_MAX: usize = 22;
+
+/// Cells of left indent for a prose note.
+const HELP_NOTE_INDENT: usize = 2;
+
+/// Width of the key column, measured from the catalog.
+///
+/// It must be **measured, not guessed**: a hard-coded 12 was narrower than
+/// `g / G / home / end` (18 cells) and `J / K / shift+↓ / shift+↑` (25 cells,
+/// Measured with [`display_width`], never counted by hand: eyeballing a binding
+/// gets it wrong (this doc first claimed the longest one was 21 cells; it is 25,
+/// and every arrow glyph is single width, so the error was pure miscounting, not
+/// a width subtlety). Since `pad_to_width` pads but never truncates, those rows
+/// ran straight into their description with no gap — `g / G / home /
+/// end跳到首行`. Measuring the catalog keeps every row aligned and can never
+/// collide with the next column, and the [`HELP_KEY_MAX`] / half-the-row caps
+/// keep a single long binding from eating the entire line.
+fn help_key_col(width: usize) -> usize {
+    if width < 4 {
+        return 0;
+    }
+    let widest = crate::help::SECTIONS
+        .iter()
+        .flat_map(|s| s.items.iter())
+        .filter(|i| !i.is_note())
+        .map(|i| display_width(i.keys) + 2)
+        .max()
+        .unwrap_or(HELP_KEY_MIN);
+    let want = widest.clamp(HELP_KEY_MIN, HELP_KEY_MAX);
+    // Never let the key column starve the description: at most half the row.
+    let cap = (width / 2).max(HELP_KEY_MIN).min(width - 1);
+    want.min(cap)
+}
+
+fn help_inner_width(area: Rect) -> u16 {
+    // `popup_block` pads one cell on each side and draws a border on each side.
+    centered_pct(area, 78, 84).width.saturating_sub(4)
 }
 
 fn help_inner_height(area: Rect) -> u16 {
     centered_pct(area, 78, 84).height.saturating_sub(2)
+}
+
+/// Lay the whole [`crate::help::SECTIONS`] catalog out into the lines the overlay
+/// draws, wrapped to `width` cells.
+///
+/// This is the single source of truth for *both* the renderer and the scroll
+/// clamp (`clamp_scrolls`): the maximum scroll offset must be the height of the
+/// wrapped result minus the viewport, not the number of catalog entries. Wrapping
+/// is width-dependent — a 40-cell popup needs far more rows than a 120-cell one —
+/// so counting entries would either lie ("more content below" that is not there)
+/// or strand the last rows off screen.
+///
+/// Row shapes:
+///
+/// * section header — `中文 · English`, accent + bold;
+/// * key row — fixed key column, then `中文 English`; when the pair does not fit
+///   on the remainder, the English moves to a continuation row indented past the
+///   key column, so both languages are always readable;
+/// * note row (`keys` empty) — dim prose, indented.
+///
+/// A pure function of `(width, palette)` on purpose: it is unit-tested directly,
+/// including the invariant that every produced line fits `width`.
+fn help_lines(width: usize, p: Palette) -> Vec<Line<'static>> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let mut out: Vec<Line<'static>> = Vec::new();
+
+    for section in crate::help::SECTIONS {
+        // Header. `中文 · English` is the section title format the spec fixes.
+        let title = format!(" {} · {} ", section.title_zh, section.title_en);
+        if !out.is_empty() {
+            out.push(Line::from(""));
+        }
+        out.push(Line::from(Span::styled(
+            truncate_to_width(&title, width),
+            p.fg(p.accent).add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        )));
+
+        for item in section.items {
+            if item.is_note() {
+                // Prose: no key column, wrapped as its own paragraph so a long
+                // safety rule does not get cut to one row.
+                out.extend(note_lines(item.zh, item.en, width, p));
+                continue;
+            }
+            out.extend(item_lines(item.keys, item.zh, item.en, width, p));
+        }
+    }
+    out
+}
+
+/// One binding, as one or more rendered rows.
+///
+/// `key  中文 English` when it fits. When the pair does not fit, the text wraps:
+/// Chinese first, English beneath it, both aligned to the description column —
+/// never truncated, because a half sentence in either language is the failure
+/// this feature exists to avoid.
+///
+/// Two rules make the column safe, and both were bugs before they were rules:
+///
+/// * a row whose key would leave **no gap** before the description (because the
+///   binding is wider than the measured column) puts the key on its own line and
+///   starts the description on the next one, rather than gluing the two together;
+/// * the description is always wrapped, never cut, so no language can be lost to
+///   a narrow popup.
+fn item_lines(keys: &str, zh: &str, en: &str, width: usize, p: Palette) -> Vec<Line<'static>> {
+    let key_col = help_key_col(width);
+    let text_w = width.saturating_sub(key_col).max(1);
+    let key_style = p.fg(p.accent).add_modifier(Modifier::BOLD);
+    let zh_style = p.fg(p.text);
+    let en_style = p.fg(p.dim);
+    let key_text = format!("  {keys}");
+    let indent = " ".repeat(key_col);
+    let mut rows: Vec<Line<'static>> = Vec::new();
+
+    // The binding must be followed by at least one space before the description.
+    if display_width(&key_text) < key_col {
+        let key_span = Span::styled(pad_to_width(&key_text, key_col), key_style);
+        // Both languages on one row?
+        if display_width(zh) + 1 + display_width(en) <= text_w {
+            return vec![Line::from(vec![
+                key_span,
+                Span::styled(zh.to_string(), zh_style),
+                Span::styled(" ", en_style),
+                Span::styled(en.to_string(), en_style),
+            ])];
+        }
+        let mut first = Some(key_span);
+        for part in wrap_text(zh, text_w) {
+            let lead = first.take().unwrap_or_else(|| Span::raw(indent.clone()));
+            rows.push(Line::from(vec![lead, Span::styled(truncate_to_width(&part, text_w), zh_style)]));
+        }
+        for part in wrap_text(en, text_w) {
+            rows.push(Line::from(vec![
+                Span::raw(indent.clone()),
+                Span::styled(truncate_to_width(&part, text_w), en_style),
+            ]));
+        }
+        return rows;
+    }
+
+    // The binding is wider than its column: give it a row of its own so it can
+    // never run into the description, then indent the text to the key column.
+    rows.push(Line::from(Span::styled(truncate_to_width(&key_text, width), key_style)));
+    let indent_n = key_col.min(width.saturating_sub(1));
+    let text_w = width.saturating_sub(indent_n).max(1);
+    let indent = " ".repeat(indent_n);
+    for part in wrap_text(zh, text_w) {
+        rows.push(Line::from(vec![
+            Span::raw(indent.clone()),
+            Span::styled(truncate_to_width(&part, text_w), zh_style),
+        ]));
+    }
+    for part in wrap_text(en, text_w) {
+        rows.push(Line::from(vec![
+            Span::raw(indent.clone()),
+            Span::styled(truncate_to_width(&part, text_w), en_style),
+        ]));
+    }
+    rows
+}
+
+/// A prose note: Chinese, then its English translation beneath it.
+fn note_lines(zh: &str, en: &str, width: usize, p: Palette) -> Vec<Line<'static>> {
+    let indent = HELP_NOTE_INDENT.min(width);
+    let text_w = width.saturating_sub(indent);
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    for part in wrap_text(zh, text_w) {
+        rows.push(Line::from(vec![
+            Span::raw(" ".repeat(indent)),
+            Span::styled(truncate_to_width(&part, text_w), p.fg(p.text)),
+        ]));
+    }
+    for part in wrap_text(en, text_w) {
+        rows.push(Line::from(vec![
+            Span::raw(" ".repeat(indent)),
+            Span::styled(truncate_to_width(&part, text_w), p.fg(p.dim)),
+        ]));
+    }
+    rows
 }
 
 fn draw_help(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
@@ -789,33 +1077,20 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     // Modals are drawn after the table, so they must record themselves: without
     // this, a click on the dialog would still hit the table row behind it.
     hits.push(popup, HitTarget::Popup);
-    let block = popup_block("帮助 · j/k 滚动 · ? 或 esc 关闭", p);
+    // Title and footer both bilingual; the footer is the only place the user
+    // learns how to scroll this thing, so it stays truthful to `handle_help_key`
+    // (`j/k`, `↑↓`, `pgup/pgdn`, and `? / esc / q / enter` all close).
+    let block = popup_block("帮助 · Help", p).title_bottom(Line::from(Span::styled(
+        " j/k ↑↓ 滚动 · pgup/pgdn 翻页 · ? esc 关闭 / Scroll · Page · Close ",
+        p.fg(p.dim),
+    )));
     let inner = block.inner(popup);
     clear_and_block(frame, popup, block);
     if inner.height == 0 || inner.width == 0 {
         return;
     }
-    let width = inner.width as usize;
 
-    let lines: Vec<Line<'static>> = HELP_ITEMS
-        .iter()
-        .map(|(key, desc)| {
-            if desc.is_empty() {
-                Line::from(Span::styled(
-                    truncate_to_width(&format!("  {key}"), width),
-                    p.fg(p.accent).add_modifier(Modifier::BOLD),
-                ))
-            } else if key.is_empty() {
-                Line::from(Span::styled(truncate_to_width(&format!("  {desc}"), width), p.fg(p.dim)))
-            } else {
-                Line::from(vec![
-                    Span::styled(format!("  {}", pad_to_width(key, 10)), p.fg(p.accent)),
-                    Span::styled(truncate_to_width(desc, width.saturating_sub(12)), p.fg(p.text)),
-                ])
-            }
-        })
-        .collect();
-
+    let lines = help_lines(inner.width as usize, p);
     frame.render_widget(Paragraph::new(lines).scroll((app.help_scroll, 0)), inner);
 }
 
@@ -839,8 +1114,13 @@ fn form_field_buf(form: &crate::app::FormState, field: FormField) -> Option<&cra
 fn draw_form(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     let Some(form) = app.form.as_ref() else { return };
     let p = palette();
-    let title =
-        if form.is_modifying() { format!("编辑转发 · {}", form.name.value()) } else { "新建转发".to_string() };
+    // Both languages in the title: this is the first thing that tells a user
+    // which of the two form modes they are in.
+    let title = if form.is_modifying() {
+        format!("编辑转发 · Edit · {}", form.name.value())
+    } else {
+        "新建转发 · New tunnel".to_string()
+    };
     // Tall enough to hold the fields *and* the expanded host dropdown.
     // Rows: title border (2) + one line per field + errors/port hint (2)
     //       + blank (1) + key hint (1) + dropdown frame (2) + dropdown rows.
@@ -873,10 +1153,11 @@ fn draw_form(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
         return;
     }
 
-    let value_w = inner.width.saturating_sub(FORM_VALUE_X as u16) as usize;
+    let label_w = form_label_w(inner.width);
+    let value_w = inner.width.saturating_sub(form_value_x(inner.width) as u16) as usize;
     let current_idx = FormField::ORDER.iter().position(|f| *f == form.field).unwrap_or(0);
 
-    let lines = form_field_lines(app, form, p, value_w, current_idx);
+    let lines = form_field_lines(app, form, p, label_w, value_w, current_idx);
     let extra = form_notes(form, p, inner.width as usize);
 
     // Reserve the pane out of the bottom, but only after the fields and their
@@ -929,6 +1210,7 @@ fn form_field_lines(
     app: &App,
     form: &crate::app::FormState,
     p: Palette,
+    label_w: usize,
     value_w: usize,
     current_idx: usize,
 ) -> Vec<Line<'static>> {
@@ -951,7 +1233,11 @@ fn form_field_lines(
         } else {
             p.fg(p.text)
         };
-        let label = Span::styled(pad_to_width(field.label(), FORM_LABEL_W), label_style);
+        // `名称 Name` on a wide popup, `名称` when the column is narrow: the
+        // ladder is [`crate::help::fit`]'s, with the compact `/` join this file
+        // uses for table cells.
+        let label =
+            Span::styled(pad_to_width(&fit_pair(field.label(), field.label_en(), label_w), label_w), label_style);
 
         if *field == FormField::SshHost {
             lines.push(host_field_line(app, form, p, value_w, editing_here, label));
@@ -959,15 +1245,20 @@ fn form_field_lines(
         }
         let value = match field {
             FormField::Kind => Span::styled(
-                pad_to_width(&format!("< {} >", kind.label()), value_w),
+                pad_to_width(
+                    &format!("< {} >", fit_pair_spaced(kind.label(), kind.label_en(), value_w.saturating_sub(4))),
+                    value_w,
+                ),
                 if editing_here { p.focused() } else { p.fg(p.accent) },
             ),
             FormField::AutoRestart => {
                 let mark = if form.auto_restart { "[x]" } else { "[ ]" };
-                Span::styled(pad_to_width(&format!("{mark} 网络类失败时自动退避重试"), value_w), value_style)
+                let text = fit_pair("网络类失败时自动退避重试", "Retry network failures", value_w.saturating_sub(4));
+                Span::styled(pad_to_width(&format!("{mark} {text}"), value_w), value_style)
             }
             FormField::RemoteHost | FormField::RemotePort if kind == ForwardKind::Dynamic => {
-                Span::styled(pad_to_width("(SOCKS5 不需要)", value_w), p.fg(p.dim))
+                let text = fit_pair("(SOCKS5 不需要)", "(not for SOCKS5)", value_w);
+                Span::styled(pad_to_width(&text, value_w), p.fg(p.dim))
             }
             _ => {
                 let text =
@@ -996,18 +1287,18 @@ fn host_field_line(
     let open = app.picker.as_ref().is_some_and(|pk| pk.open);
     let marker = if open { "▴" } else { "▾" };
     let drop_style = if editing_here { p.focused() } else { p.fg(p.accent) };
+    let marker_w = display_width(marker);
+    let avail = value_w.saturating_sub(marker_w + 1);
     let hint = if !typed.trim().is_empty() {
         String::new()
     } else if !app.hosts.is_empty() {
-        format!(" ({}台可选)", app.hosts.len())
+        fit_pair_spaced(&format!("({}台可选)", app.hosts.len()), &format!("({} available)", app.hosts.len()), avail)
     } else if app.hosts_error.is_some() {
-        " (读取失败)".to_string()
+        fit_pair_spaced("(读取失败)", "(read failed)", avail)
     } else {
-        " (无主机)".to_string()
+        fit_pair_spaced("(无主机)", "(no hosts)", avail)
     };
-    let marker_w = display_width(marker);
-    let avail = value_w.saturating_sub(marker_w + 1);
-    let shown = truncate_to_width(&format!("{typed}{hint}"), avail);
+    let shown = truncate_to_width(&format!(" {typed}{hint}"), avail);
     let value_style = if editing_here { p.focused() } else { p.fg(p.text) };
     Line::from(vec![
         label,
@@ -1018,6 +1309,11 @@ fn host_field_line(
 }
 
 /// Validation errors, the auto-suggested port note, and the key hint.
+///
+/// The hint line is the form's own legend: both stages are spelled out, because
+/// `enter`/`esc` mean different things in them and a table can only show one.
+/// `ctrl+s`/`f10` save from either stage (the handler treats them identically),
+/// so the hint does not have to change with it.
 fn form_notes(form: &crate::app::FormState, p: Palette, width: usize) -> Vec<Line<'static>> {
     let mut extra = Vec::new();
     for err in form.errors.iter().take(3) {
@@ -1025,19 +1321,42 @@ fn form_notes(form: &crate::app::FormState, p: Palette, width: usize) -> Vec<Lin
     }
     if let Some(note) = &form.local_port_note {
         // The auto-derived local port is a *suggestion*; say so plainly.
-        extra.push(Line::from(Span::styled(truncate_to_width(&format!("· {note}（可编辑）"), width), p.fg(p.pending))));
+        let text = format!("· {}（可编辑） / (editable)", note);
+        extra.push(Line::from(Span::styled(truncate_to_width(&text, width), p.fg(p.pending))));
     }
     if let Some(hint) = &form.port_hint {
+        // The Chinese keyword check is deliberate: `port_hint` is built in
+        // `src/app/form.rs` and the Chinese prefix is part of that contract.
         let style = if hint.contains("占用") { p.fg(p.pending) } else { p.fg(p.up) };
         extra.push(Line::from(Span::styled(truncate_to_width(&format!("· {hint}"), width), style)));
     }
     extra.push(Line::from(""));
-    let hint_text = if form.is_editing_field() {
-        "编辑中：直接输入  ·  enter/esc 结束编辑  ·  tab 下一字段"
+    // The legend flows like the main footer instead of being one long string:
+    // the form popup is only ~70 cells wide, and a single line would be cut
+    // mid-token (`esc 取…`), which is worse than useless for the keys that teach
+    // the two-stage editing model. Flowing drops a whole hint instead, and on a
+    // normal terminal every hint fits in both languages.
+    let hints: &[Hint] = if form.is_editing_field() {
+        // Say which stage the form is in, in words: the highlight colour is the
+        // other cue, and colour alone is not allowed to carry meaning.
+        extra.push(Line::from(Span::styled("编辑中 / Editing:", p.fg(p.pending))));
+        &[
+            ("字符", "输入", "Type"),
+            ("enter/esc", "结束编辑", "Done"),
+            ("tab", "下一字段", "Next"),
+            ("ctrl+s", "保存", "Save"),
+        ]
     } else {
-        "↑↓ 选择字段  ·  enter 编辑  ·  ctrl+s 保存  ·  esc 取消"
+        &[
+            ("↑↓", "选字段", "Field"),
+            ("enter", "编辑", "Edit"),
+            ("tab", "切换", "Next"),
+            ("ctrl+s", "保存", "Save"),
+            ("f10", "保存", "Save"),
+            ("esc", "取消", "Cancel"),
+        ]
     };
-    extra.push(Line::from(Span::styled(truncate_to_width(hint_text, width), p.fg(p.dim))));
+    extra.extend(flow_hints(hints, width, 3, p));
     extra
 }
 
@@ -1048,7 +1367,7 @@ fn place_form_cursor(frame: &mut Frame, form: &crate::app::FormState, inner: Rec
     }
     let Some(buf) = form_field_buf(form, form.field) else { return };
     let prefix: String = buf.text.chars().take(buf.cursor).collect();
-    let x = inner.x + FORM_VALUE_X as u16 + display_width(&prefix) as u16;
+    let x = inner.x + form_value_x(inner.width) as u16 + display_width(&prefix) as u16;
     let y = inner.y + current_idx as u16;
     if x < popup.right().saturating_sub(1) && y < inner.bottom() {
         frame.set_cursor_position((x, y));
@@ -1083,7 +1402,10 @@ fn draw_host_dropdown(frame: &mut Frame, app: &App, picker: &HostPicker, inner: 
     frame.render_widget(Clear, area);
     let block =
         Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).border_style(p.fg(p.accent)).title(
-            Line::from(Span::styled(" 从 ~/.ssh/config 选择主机 ", p.fg(p.accent).add_modifier(Modifier::BOLD))),
+            Line::from(Span::styled(
+                " 从 ~/.ssh/config 选择主机 / Pick host ",
+                p.fg(p.accent).add_modifier(Modifier::BOLD),
+            )),
         );
     let body = block.inner(area);
     frame.render_widget(block, area);
@@ -1095,7 +1417,10 @@ fn draw_host_dropdown(frame: &mut Frame, app: &App, picker: &HostPicker, inner: 
     let list_h = body.height.saturating_sub(2) as usize;
 
     if app.hosts.is_empty() {
-        let msg = app.hosts_error.clone().unwrap_or_else(|| "未在 ~/.ssh/config 中找到主机".to_string());
+        let msg = app
+            .hosts_error
+            .clone()
+            .unwrap_or_else(|| "未在 ~/.ssh/config 中找到主机 / No hosts in ~/.ssh/config".to_string());
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(truncate_to_width(&msg, width), p.fg(p.failed)))),
             Rect { height: 1, ..body },
@@ -1105,19 +1430,19 @@ fn draw_host_dropdown(frame: &mut Frame, app: &App, picker: &HostPicker, inner: 
 
     // Row 0: filter echo.
     let filter = if picker.query.is_empty() {
-        Span::styled("输入以过滤…", p.fg(p.dim))
+        Span::styled(fit_pair("输入以过滤", "Type to filter", width.saturating_sub(10)), p.fg(p.dim))
     } else {
-        Span::styled(truncate_to_width(&picker.query, width.saturating_sub(8)), p.fg(p.text))
+        Span::styled(truncate_to_width(&picker.query, width.saturating_sub(10)), p.fg(p.text))
     };
     frame.render_widget(
-        Paragraph::new(Line::from(vec![Span::styled("过滤: ", p.fg(p.dim)), filter])),
+        Paragraph::new(Line::from(vec![Span::styled("过滤/Filter: ", p.fg(p.dim)), filter])),
         Rect { y: body.y, height: 1, ..body },
     );
 
     let list_area = Rect { y: body.y + 1, height: list_h as u16, ..body };
     if picker.matches.is_empty() {
         frame.render_widget(
-            Paragraph::new(Line::from(Span::styled("没有匹配的主机", p.fg(p.dim)))),
+            Paragraph::new(Line::from(Span::styled("没有匹配的主机 / No matching host", p.fg(p.dim)))),
             Rect { height: 1, ..list_area },
         );
     } else {
@@ -1145,7 +1470,10 @@ fn draw_host_dropdown(frame: &mut Frame, app: &App, picker: &HostPicker, inner: 
     // Hint on the last row.
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            truncate_to_width("↑↓ 选择   enter 确定   esc 收起   tab 切到下一字段", width),
+            truncate_to_width(
+                "↑↓ k/j 选择 · enter 确定 · esc 收起 · tab 下一字段 / Select · Confirm · Close · Next",
+                width,
+            ),
             p.fg(p.dim),
         ))),
         Rect { y: body.bottom().saturating_sub(1), height: 1, ..body },
@@ -1172,13 +1500,15 @@ fn draw_confirm(frame: &mut Frame, prompt: &str, area: Rect, hits: &mut HitMap) 
     // The riskiest click-through to allow: the dialog asks before a destructive
     // action, so a click meant for the dialog must never reach a table row.
     hits.push(popup, HitTarget::Popup);
-    let block = popup_block("确认", p);
+    let block = popup_block("确认 · Confirm", p);
     let inner = block.inner(popup);
     clear_and_block(frame, popup, block);
     if inner.height == 0 {
         return;
     }
 
+    // `y`/`Y`/`enter` accept and `n`/`N`/`esc` cancel in the real handler; both
+    // spellings are advertised so nobody has to guess whether shift matters.
     let lines = vec![
         Line::from(vec![
             Span::styled("⚠ ", p.fg(p.failed).add_modifier(Modifier::BOLD)),
@@ -1186,10 +1516,10 @@ fn draw_confirm(frame: &mut Frame, prompt: &str, area: Rect, hits: &mut HitMap) 
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled(" y / enter ", p.fg(p.accent).add_modifier(Modifier::BOLD)),
-            Span::styled("确认    ", p.fg(p.text)),
-            Span::styled("n / esc ", p.fg(p.accent).add_modifier(Modifier::BOLD)),
-            Span::styled("取消", p.fg(p.text)),
+            Span::styled(" y/Y / enter ", p.fg(p.accent).add_modifier(Modifier::BOLD)),
+            Span::styled("确认 / Confirm    ", p.fg(p.text)),
+            Span::styled("n/N / esc ", p.fg(p.accent).add_modifier(Modifier::BOLD)),
+            Span::styled("取消 / Cancel", p.fg(p.text)),
         ]),
     ];
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
@@ -1232,7 +1562,7 @@ fn detail_inner_height(area: Rect) -> u16 {
 }
 
 fn yes_no(v: bool) -> &'static str {
-    if v { "是" } else { "否" }
+    if v { "是/Yes" } else { "否/No" }
 }
 
 /// Build the scrollable body of the detail overlay: fields, the full failure
@@ -1241,56 +1571,68 @@ fn detail_lines(view: &TunnelView, id: TunnelId, p: Palette) -> Vec<Line<'static
     let cfg = &view.cfg;
     let mut lines: Vec<Line<'static>> = Vec::new();
 
-    // 16 = widest label ("启用 / 自动重连" = 15 cells) rounded up, so every
-    // value in the detail panel starts at the same column.
+    // 26 = widest bilingual label (`启用/自动重连 Enabled/Auto-retry` = 24 cells)
+    // rounded up, so every value in the detail panel starts at the same column.
     let kv = |k: &str, v: String| {
-        Line::from(vec![Span::styled(pad_to_width(&format!("{k}:"), 17), p.fg(p.dim)), Span::styled(v, p.fg(p.text))])
+        Line::from(vec![Span::styled(pad_to_width(&format!("{k}:"), 27), p.fg(p.dim)), Span::styled(v, p.fg(p.text))])
     };
 
-    lines.push(kv("名称", cfg.name.clone()));
+    lines.push(kv("名称/Name", cfg.name.clone()));
     lines.push(kv("ID", id.to_string()));
-    lines.push(kv("类型", cfg.kind.label().to_string()));
-    lines.push(kv("SSH 主机", cfg.ssh_host.clone()));
-    lines.push(kv("本地", cfg.local_display()));
-    lines.push(kv("远端", cfg.remote_display()));
-    lines.push(kv("转发参数", cfg.forward_spec()));
-    lines.push(kv("启用 / 自动重连", format!("{} / {}", yes_no(cfg.enabled), yes_no(cfg.auto_restart))));
-    lines.push(kv("创建时间", fmt_unix(cfg.created_at)));
-    lines.push(kv("状态", format!("{}（重试次数 {}）", view.status.key(), view.retries)));
+    lines.push(kv("类型/Kind", fit_pair(cfg.kind.label(), cfg.kind.label_en(), 40)));
+    lines.push(kv("SSH 主机/Host", cfg.ssh_host.clone()));
+    lines.push(kv("本地/Local", cfg.local_display()));
+    lines.push(kv("远端/Remote", cfg.remote_display()));
+    lines.push(kv("转发参数/Spec", cfg.forward_spec()));
+    lines.push(kv(
+        "启用/自动重连 Enabled/Auto-retry",
+        format!("{} / {}", yes_no(cfg.enabled), yes_no(cfg.auto_restart)),
+    ));
+    lines.push(kv("创建时间/Created", fmt_unix(cfg.created_at)));
+    lines.push(kv(
+        "状态/Status",
+        format!("{}（重试次数 {} / retries {}）", view.status.key(), view.retries, view.retries),
+    ));
     if !cfg.note.is_empty() {
-        lines.push(kv("备注", cfg.note.clone()));
+        lines.push(kv("备注/Note", cfg.note.clone()));
     }
     if !cfg.ssh_options.is_empty() {
-        lines.push(kv("ssh 选项", cfg.ssh_options.join(" ")));
+        lines.push(kv("ssh 选项/Options", cfg.ssh_options.join(" ")));
     }
 
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled("失败原因（原始 stderr，完整保留）", p.fg(p.dim).add_modifier(Modifier::BOLD))));
+    lines.push(Line::from(Span::styled(
+        "失败原因（原始 stderr，完整保留）/ Failure (raw stderr, kept verbatim)",
+        p.fg(p.dim).add_modifier(Modifier::BOLD),
+    )));
     match view.status.failure() {
         Some(reason) => {
             lines.push(Line::from(Span::styled(
-                format!("  {}", reason.short),
+                format!("  {} / {}", reason.short, reason.kind.short_en()),
                 p.fg(p.failed).add_modifier(Modifier::BOLD),
             )));
             for raw in reason.detail.lines() {
                 lines.push(Line::from(Span::styled(format!("  {raw}"), p.fg(p.text))));
             }
         }
-        None => lines.push(Line::from(Span::styled("  无", p.fg(p.dim)))),
+        None => lines.push(Line::from(Span::styled("  无 / None", p.fg(p.dim)))),
     }
 
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled("等价 ssh 命令（可复制）", p.fg(p.dim).add_modifier(Modifier::BOLD))));
+    lines.push(Line::from(Span::styled(
+        "等价 ssh 命令（可复制）/ Equivalent ssh command (copyable)",
+        p.fg(p.dim).add_modifier(Modifier::BOLD),
+    )));
     lines.push(Line::from(Span::styled(format!("  {}", tunnel_command(cfg)), p.fg(p.accent))));
 
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        format!("日志（最近 {DETAIL_LOG_TAIL} 行）"),
+        format!("日志（最近 {DETAIL_LOG_TAIL} 行）/ Log (last {DETAIL_LOG_TAIL} lines)"),
         p.fg(p.dim).add_modifier(Modifier::BOLD),
     )));
     let tail = view.log.tail(DETAIL_LOG_TAIL);
     if tail.is_empty() {
-        lines.push(Line::from(Span::styled("  暂无日志", p.fg(p.dim))));
+        lines.push(Line::from(Span::styled("  暂无日志 / No log yet", p.fg(p.dim))));
     } else {
         for LogLine { time, level, text } in tail {
             lines.push(Line::from(vec![
@@ -1308,7 +1650,7 @@ fn draw_detail(frame: &mut Frame, app: &App, id: TunnelId, area: Rect, hits: &mu
     let Some(view) = app.tunnel(id) else { return };
     let popup = centered_pct(area, 88, 86);
     hits.push(popup, HitTarget::Popup);
-    let title = format!("详情 · {} · j/k 滚动 · esc 返回", view.cfg.name);
+    let title = format!("详情 · Detail · {} · j/k ↑↓ 滚动 · q/esc/enter/l 返回", view.cfg.name);
     let block = popup_block(&title, p);
     let inner = block.inner(popup);
     clear_and_block(frame, popup, block);
@@ -1335,22 +1677,26 @@ fn draw_filter(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     }
     frame.render_widget(Clear, row);
 
-    let prefix = " 过滤: ";
-    let prefix_w = display_width(prefix) as u16;
-    let clear = "  × 清除 ";
-    let clear_w = display_width(clear) as u16;
+    // Both languages where they fit, Chinese only on a narrow terminal: the
+    // affordances on this line are clickable, so they must never be clipped into
+    // a half-word that no longer says what it does.
+    let prefix = fit_pair_spaced(" 过滤:", " Filter:", row.width as usize / 3);
+    let prefix = format!("{prefix} ");
+    let prefix_w = display_width(&prefix) as u16;
+    let clear = format!("  × {} ", fit_pair("清除", "Clear", 12));
+    let clear_w = display_width(&clear) as u16;
     // Keep the clear affordance on screen even when the typed text is long: it
     // sits on the right, the input echoes in whatever is left of it.
-    let hint = "   enter 应用   esc 清除";
-    let hint_w = display_width(hint) as u16;
+    let hint = format!("   {}", fit_pair_spaced("enter 应用 esc 清除", "enter apply · esc clear", 30));
+    let hint_w = display_width(&hint) as u16;
     let value_w = row.width.saturating_sub(prefix_w + clear_w + hint_w);
 
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(prefix, p.fg(p.accent).add_modifier(Modifier::BOLD)),
             Span::styled(truncate_to_width(&app.filter, value_w as usize), p.fg(p.text)),
-            Span::styled(clear, p.fg(p.accent)),
-            Span::styled(hint, p.fg(p.dim)),
+            Span::styled(truncate_to_width(&clear, clear_w as usize), p.fg(p.accent)),
+            Span::styled(truncate_to_width(&hint, hint_w as usize), p.fg(p.dim)),
         ]))
         .style(p.bg(p.selection_bg)),
         row,
@@ -1518,6 +1864,146 @@ mod tests {
         out
     }
 
+    // -- help overlay: rendering completeness ------------------------------
+
+    /// Flatten help lines to text, one row per line.
+    fn help_text(width: usize) -> String {
+        help_lines(width, palette_with(false)).iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn help_overlay_keeps_both_languages_of_every_item() {
+        // The rendering counterpart of `tests/help_coverage.rs`: that test proves
+        // every dispatched key is *documented*, this one proves every documented
+        // row actually *reaches the screen* in both languages. The bug it was
+        // written for: a binding wider than the key column ran into its own
+        // description (`g / G / home / end跳到首行`), and a squeezed description
+        // could lose the English half entirely.
+        //
+        // Only the first few cells of each half are compared: wrapping splits
+        // phrases across rows, so a whole-string `contains` would fail on a
+        // correct render. The prefixes are what a reader needs to recognise the
+        // row.
+        // Whitespace is normalised away on both sides: wrapping legitimately
+        // moves a space to a line break (`等同 q…` -> `等同` / `q…`), and this
+        // test is about *content*, not spacing — the no-glue rule has its own
+        // test below.
+        let squash = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+        for width in [40usize, 60, 78, 110] {
+            let text = squash(&help_text(width));
+            for section in crate::help::SECTIONS {
+                // Section titles are bilingual too.
+                assert!(
+                    text.contains(&squash(section.title_zh)),
+                    "width {width}: section title {:?} missing",
+                    section.title_zh
+                );
+                assert!(
+                    text.contains(&squash(section.title_en)),
+                    "width {width}: section title {:?} missing",
+                    section.title_en
+                );
+                for item in section.items {
+                    let zh_prefix: String = item.zh.chars().take(4).collect();
+                    let en_prefix: String = item.en.chars().take(6).collect();
+                    assert!(
+                        text.contains(&squash(&zh_prefix)),
+                        "width {width}: {} item {:?} lost its Chinese ({zh_prefix:?})",
+                        section.id.key(),
+                        item.keys
+                    );
+                    assert!(
+                        text.contains(&squash(&en_prefix)),
+                        "width {width}: {} item {:?} lost its English ({en_prefix:?})",
+                        section.id.key(),
+                        item.keys
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn help_overlay_never_glues_a_binding_to_its_description() {
+        // Regression: `pad_to_width` pads but never truncates, so a key column
+        // narrower than the binding produced `g / G / home / end跳到首行` with no
+        // separating space at all.
+        for width in [40usize, 60, 78, 110] {
+            for line in help_lines(width, palette_with(false)) {
+                let text = line.to_string();
+                // No CJK may directly follow an ASCII word character anywhere in
+                // the key column region: that is exactly the glue signature.
+                let glued = text.chars().collect::<Vec<_>>().windows(2).any(|w| {
+                    let (a, b) = (w[0], w[1]);
+                    a.is_ascii_alphanumeric() && (('\u{4e00}'..='\u{9fff}').contains(&b))
+                });
+                assert!(!glued, "width {width}: binding glued to description: {text:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn help_lines_fit_the_width_at_every_popup_size() {
+        // Every produced row must fit, or the overlay bleeds past its border.
+        for width in [8usize, 12, 20, 24, 30, 40, 50, 60, 78, 110, 200] {
+            for line in help_lines(width, palette_with(false)) {
+                let w = display_width(&line.to_string());
+                assert!(w <= width, "width {width}: row is {w} cells: {line:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn help_key_column_is_measured_from_the_catalog() {
+        // Long alternatives exist in the catalog, so a fixed 12-cell column was
+        // structurally too narrow; it must be derived from the data.
+        let widest = crate::help::SECTIONS
+            .iter()
+            .flat_map(|s| s.items.iter())
+            .filter(|i| !i.is_note())
+            .map(|i| display_width(i.keys) + 2)
+            .max()
+            .unwrap();
+        assert!(
+            help_key_col(120) >= widest.min(HELP_KEY_MAX),
+            "key column {} does not fit the widest binding {widest}",
+            help_key_col(120)
+        );
+        // ... but it may never eat the line on a narrow popup.
+        for width in [10usize, 16, 24, 40] {
+            assert!(help_key_col(width) <= width / 2 + HELP_KEY_MIN, "width {width} key column too wide");
+        }
+    }
+
+    #[test]
+    fn help_scroll_limit_is_measured_from_wrapped_rows() {
+        // The clamp must count wrapped rows, not catalog entries: wrapping makes
+        // the row count width-dependent, and a clamp that used `item_count()`
+        // would either stop short of the end or report content that is not there.
+        let p = palette_with(false);
+        let narrow = help_lines(60, p).len();
+        let wide = help_lines(160, p).len();
+        assert!(narrow > wide, "narrow render must wrap to more rows ({narrow} vs {wide})");
+        assert!(wide >= crate::help::item_count(), "eleven rows per section cannot be fewer than the items");
+
+        let mut app = app_with_tunnels(vec![]);
+        app.open_help();
+        // Tall enough that the whole catalog fits: there must be nothing to scroll.
+        let backend = TestBackend::new(200, 70);
+        let mut term = Terminal::new(backend).unwrap();
+        let _ = term.draw(|f| draw(f, &mut app));
+        assert_eq!(app.help_scroll, 0);
+
+        // Short terminal: the clamp equals rows minus viewport, not a guess.
+        app.help_scroll = 9999;
+        let _ = render_to_text(&mut app, 120, 35);
+        let expected = help_lines(help_inner_width(Rect::new(0, 0, 120, 35)) as usize, palette())
+            .len()
+            .saturating_sub(help_inner_height(Rect::new(0, 0, 120, 35)) as usize);
+        assert_eq!(app.help_scroll as usize, expected, "clamp must be rows - viewport");
+        assert!(app.help_scroll > 0, "the catalog is longer than a 35-row terminal");
+    }
+
     #[test]
     fn renders_empty_state() {
         let mut app = app_with_tunnels(vec![]);
@@ -1525,9 +2011,15 @@ mod tests {
         assert!(text.contains("sshpf"), "title bar missing:\n{text}");
         assert!(text.contains("cfg:"), "config path missing:\n{text}");
         assert!(text.contains("还没有转发条目"), "empty hint missing:\n{text}");
+        assert!(text.contains("No tunnels yet"), "empty hint needs its English half:\n{text}");
         assert!(text.contains("新建"), "key hint missing:\n{text}");
-        assert!(text.contains("0 up"), "counters missing:\n{text}");
-        assert!(text.contains("0 off"), "counters missing:\n{text}");
+        // Counters state every status in both languages on a wide terminal...
+        assert!(text.contains("0 已连通/Up"), "counters missing:\n{text}");
+        assert!(text.contains("0 未启用/Off"), "counters missing:\n{text}");
+        // ...and degrade to glyph + number when narrow, never to a clipped word.
+        let narrow = render_to_text(&mut app, 70, 20);
+        assert!(narrow.contains("● 0"), "compact counters missing:\n{narrow}");
+        assert!(!narrow.contains("Starting"), "narrow counters must drop the words:\n{narrow}");
     }
 
     #[test]
@@ -1550,8 +2042,15 @@ mod tests {
         assert!(text.contains("失败"), "failed status missing:\n{text}");
         assert!(text.contains("本地端口被占用"), "last error missing:\n{text}");
         assert!(text.contains("02:14"), "uptime missing:\n{text}");
-        assert!(text.contains("1 up"), "counters wrong:\n{text}");
-        assert!(text.contains("1 failed"), "counters wrong:\n{text}");
+        assert!(text.contains("1 已连通/Up"), "counters wrong:\n{text}");
+        assert!(text.contains("1 失败/Failed"), "counters wrong:\n{text}");
+        // The status column is bilingual too, glyph included.
+        assert!(text.contains("● 已连通/Up"), "bilingual status missing:\n{text}");
+        // The last-error column pairs the classified phrase with its English
+        // where the column is wide enough, and degrades to Chinese when it is
+        // not — so this is asserted on a terminal that can actually fit both.
+        let wide = render_to_text(&mut app, 200, 30);
+        assert!(wide.contains("本地端口被占用/Local port in use"), "bilingual error missing:\n{wide}");
         // The selected row is highlighted with the ▶ marker.
         assert!(text.contains("▶"), "selection marker missing:\n{text}");
     }
@@ -1710,17 +2209,23 @@ mod tests {
         let mut app = app_with_tunnels(vec![]);
         app.open_form_create();
 
-        // Navigating: arrows pick a field, enter starts editing.
+        // Navigating: arrows pick a field, enter starts editing. The legend names
+        // both stages' keys, and it must not claim to be editing.
         let text = render_to_text(&mut app, 120, 40);
-        assert!(text.contains("enter 编辑"), "navigating hint missing:\n{text}");
+        assert!(text.contains("enter"), "navigating hint missing:\n{text}");
+        assert!(text.contains("编辑"), "navigating hint must mention editing:\n{text}");
+        assert!(text.contains("ctrl+s"), "save key must be advertised:\n{text}");
         assert!(!text.contains("编辑中"), "must not look like it is editing:\n{text}");
 
-        // Editing: the hint switches and the field is highlighted for input.
+        // Editing: an explicit worded stage marker appears (never colour alone),
+        // and the legend switches to the editing-stage keys.
         app.form.as_mut().unwrap().field = FormField::Name;
         app.form.as_mut().unwrap().begin_edit();
         let text = render_to_text(&mut app, 120, 40);
         assert!(text.contains("编辑中"), "editing hint missing:\n{text}");
-        assert!(text.contains("enter/esc 结束编辑"), "exit-editing hint missing:\n{text}");
+        assert!(text.contains("Editing"), "editing hint needs its English:\n{text}");
+        assert!(text.contains("结束编辑"), "exit-editing hint missing:\n{text}");
+        assert!(text.contains("enter/esc"), "the exit-editing binding must be spelled out:\n{text}");
     }
 
     #[test]
@@ -1796,16 +2301,35 @@ mod tests {
         let mut app = app_with_tunnels(vec![]);
         app.open_help();
         let top = render_to_text(&mut app, 120, 35);
-        assert!(top.contains("帮助"), "help title missing:\n{top}");
-        assert!(top.contains("向下移动选择"), "first help row missing:\n{top}");
+        assert!(top.contains("帮助 · Help"), "bilingual help title missing:\n{top}");
+        // The overlay is sectioned now, and each section title is bilingual.
+        assert!(top.contains("主界面 · Main screen"), "first section header missing:\n{top}");
+        // The first rows of that section, in both languages on the same row.
+        assert!(top.contains("向下移动光标"), "first help row missing:\n{top}");
+        assert!(top.contains("Move the cursor down"), "first help row needs its English:\n{top}");
+        // The footer teaches this overlay's own keys, also bilingual.
+        assert!(top.contains("滚动"), "scroll hint missing:\n{top}");
+        assert!(top.contains("Scroll"), "scroll hint needs its English:\n{top}");
 
-        // Scrolling hides earlier rows: the very first item must be gone while
-        // a mid-list section stays visible. The offset is clamped, not dropped.
-        app.help_scroll = 2;
+        // Scrolling hides the top of the catalog and lets later content in. The
+        // offset is clamped against the *wrapped* row count, not the item count.
+        let first_row = "Move the cursor down";
+        assert!(top.contains(first_row), "precondition: first row is visible before scrolling");
+        app.help_scroll = 40;
         let scrolled = render_to_text(&mut app, 120, 35);
         assert!(app.help_scroll > 0, "help_scroll must survive the clamp");
-        assert!(!scrolled.contains("向下移动选择"), "scroll had no effect:\n{scrolled}");
-        assert!(scrolled.contains("新建转发"), "scrolled body missing:\n{scrolled}");
+        assert!(!scrolled.contains(first_row), "scroll had no effect:\n{scrolled}");
+        assert_ne!(top, scrolled, "scrolling must change what is on screen");
+
+        // And the clamp is exact: rows minus viewport, both measured by the same
+        // function the renderer uses.
+        app.help_scroll = u16::MAX;
+        let _ = render_to_text(&mut app, 120, 35);
+        let area = Rect::new(0, 0, 120, 35);
+        let expected = help_lines(help_inner_width(area) as usize, palette())
+            .len()
+            .saturating_sub(help_inner_height(area) as usize);
+        assert_eq!(app.help_scroll as usize, expected, "clamp must be wrapped rows - viewport");
     }
 
     #[test]
@@ -1946,8 +2470,17 @@ mod tests {
         let selecting = render_to_text(&mut app, 140, 24);
         assert!(!selecting.contains("启停"), "space does not start/stop in selection mode:\n{selecting}");
         assert!(selecting.contains("勾选"), "selection hints must describe space:\n{selecting}");
-        assert!(selecting.contains("批量操作"), "selection hints must point at the batch keys:\n{selecting}");
+        // The batch keys are advertised as the concrete bindings, not as a vague
+        // "batch operations" label: the mode is where they actually work.
+        assert!(selecting.contains("s/x/R/D"), "selection hints must list the batch keys:\n{selecting}");
+        assert!(selecting.contains("批量"), "selection hints must say what those keys do:\n{selecting}");
         assert!(selecting.contains("已选"), "the marked count must be on screen:\n{selecting}");
+        // Selection mode must not advertise the normal-mode-only bindings. (The
+        // action bar legitimately offers `R 重启`, the *batch* restart — what
+        // must not appear is the single-row `n 新建` and the `r` spelling that
+        // would suggest lowercase still restarts one tunnel.)
+        assert!(!selecting.contains("新建/New"), "n is unbound in selection mode:\n{selecting}");
+        assert!(!selecting.contains("r 重启"), "lowercase r is unbound in selection mode:\n{selecting}");
     }
 
     #[test]

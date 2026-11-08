@@ -120,11 +120,10 @@ impl App {
             self.select_mode.toggle(id);
             self.select_mode.anchor = Some(pos);
             let n = self.select_mode.len();
-            self.set_status(crate::model::StatusMsg::info(if n == 0 {
-                "已选 0 条".to_string()
-            } else {
-                format!("已选 {n} 条")
-            }));
+            self.set_status(crate::model::StatusMsg::info(crate::help::bi(
+                &format!("已选 {n} 条"),
+                &format!("{n} marked"),
+            )));
         }
     }
 

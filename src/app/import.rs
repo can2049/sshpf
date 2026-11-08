@@ -18,6 +18,7 @@
 
 use crate::app::{App, FormMode};
 use crate::config;
+use crate::help;
 use crate::model::{
     self, ForwardKind, ImportColumn, ImportTable, SshForward, StatusMsg, TunnelConfig, TunnelView, now_unix,
 };
@@ -46,7 +47,13 @@ impl App {
 
         let (forwards, error) = match ssh::forwards::forwards_for_host(&alias) {
             Ok(rows) => (rows, None),
-            Err(e) => (Vec::new(), Some(format!("读取 ~/.ssh/config 转发配置失败: {e}"))),
+            Err(e) => (
+                Vec::new(),
+                Some(help::bi(
+                    &format!("读取 ~/.ssh/config 转发配置失败: {e}"),
+                    &format!("Cannot read the forward rules in ~/.ssh/config: {e}"),
+                )),
+            ),
         };
         let n = forwards.len();
         let table = ImportTable::new(forwards);
@@ -83,10 +90,12 @@ impl App {
             return;
         };
         if form.import.is_empty() {
-            self.import_error = self
-                .import_error
-                .clone()
-                .or_else(|| Some(format!("{} 在 ~/.ssh/config 中没有端口转发配置", form.ssh_host.value())));
+            self.import_error = self.import_error.clone().or_else(|| {
+                Some(help::bi(
+                    &format!("{} 在 ~/.ssh/config 中没有端口转发配置", form.ssh_host.value()),
+                    &format!("{} has no port forwards in ~/.ssh/config", form.ssh_host.value()),
+                ))
+            });
             form.import_open = false;
             let msg = self.import_error.clone().unwrap_or_default();
             self.set_status(StatusMsg::warn(msg));
@@ -159,9 +168,9 @@ impl App {
     pub fn undo_import_filter(&mut self) {
         let undone = self.form.as_mut().is_some_and(|f| f.import.undo_filter());
         if undone {
-            self.set_status(StatusMsg::info("已撤销筛选"));
+            self.set_status(StatusMsg::info(help::bi("已撤销筛选", "Filter change undone")));
         } else {
-            self.set_status(StatusMsg::info("没有可撤销的筛选"));
+            self.set_status(StatusMsg::info(help::bi("没有可撤销的筛选", "No filter change to undo")));
         }
     }
 
@@ -299,7 +308,10 @@ impl App {
             enabled: true,
             auto_restart: self.cfg.defaults.auto_restart,
             ssh_options: Vec::new(),
-            note: format!("来自 ~/.ssh/config 第 {} 行", forward.line),
+            note: help::bi(
+                &format!("来自 ~/.ssh/config 第 {} 行", forward.line),
+                &format!("From ~/.ssh/config line {}", forward.line),
+            ),
             created_at: now_unix(),
         }
     }
@@ -320,7 +332,7 @@ impl App {
         let ssh_host = form.ssh_host.value().trim().to_string();
         if ssh_host.is_empty() {
             if let Some(f) = self.form.as_mut() {
-                f.errors = vec!["SSH 主机不能为空".to_string()];
+                f.errors = vec![help::bi("SSH 主机不能为空", "SSH host must not be empty")];
             }
             return None;
         }
@@ -339,7 +351,9 @@ impl App {
             // already-saved tunnels.
             cfg.name = unique_within(&cfg.name, out.iter().map(|c| c.name.clone()).collect());
             if let Err(e) = config::validate_tunnel(&cfg) {
-                errors.push(format!("{}: {e}", cfg.name));
+                // `e` is the Chinese validator message (`src/config.rs`, not our
+                // scope); append the English category so the row is bilingual.
+                errors.push(format!("{}: {e} / Invalid definition", cfg.name));
             }
             // Collision against already-saved tunnels, then against the rest of
             // this batch: two imported rows can describe the same listen port
@@ -348,7 +362,10 @@ impl App {
             let conflict =
                 self.listen_conflict(&cfg).or_else(|| out.iter().find_map(|other| listen_collision(&cfg, other)));
             if let Some(conflict) = conflict {
-                errors.push(format!("{}: 监听地址与「{conflict}」冲突", cfg.name));
+                errors.push(help::bi(
+                    &format!("{}: 监听地址与「{conflict}」冲突", cfg.name),
+                    &format!("{}: listen endpoint collides with \"{conflict}\"", cfg.name),
+                ));
             }
             if cfg.kind != ForwardKind::Remote {
                 taken.push(cfg.local_port);
@@ -393,9 +410,15 @@ impl App {
         self.clamp_selection();
         if n == 1 {
             let name = configs.first().map(|c| c.name.clone()).unwrap_or_default();
-            self.set_status(StatusMsg::ok(format!("已创建 1 条转发：{name}")));
+            self.set_status(StatusMsg::ok(help::bi(
+                &format!("已创建 1 条转发：{name}"),
+                &format!("Created 1 forward: {name}"),
+            )));
         } else {
-            self.set_status(StatusMsg::ok(format!("已创建 {n} 条转发（来自 ~/.ssh/config）")));
+            self.set_status(StatusMsg::ok(help::bi(
+                &format!("已创建 {n} 条转发（来自 ~/.ssh/config）"),
+                &format!("Created {n} forwards (from ~/.ssh/config)"),
+            )));
         }
     }
 
@@ -415,7 +438,7 @@ impl App {
                 if self.form.as_ref().is_some_and(|f| f.errors.is_empty())
                     && let Some(f) = self.form.as_mut()
                 {
-                    f.errors = vec!["没有勾选任何转发".to_string()];
+                    f.errors = vec![help::bi("没有勾选任何转发", "No forward is ticked")];
                 }
             }
         }
