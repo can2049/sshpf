@@ -172,8 +172,13 @@ fn handle_form_key(app: &mut App, key: KeyEvent) {
     if app.host_picker_open() && handle_dropdown_key(app, key) {
         return;
     }
-    // The import pane, when open, owns its own navigation and filter keys.
-    if app.import_pane_open() && handle_import_key(app, key) {
+    // The import pane owns its row/filter keys, but *not* while a text field is
+    // being edited: the pane is open by default as soon as a host is committed,
+    // and `j`/`a`/`i` are ordinary letters in a tunnel name. Without this guard,
+    // typing `api` into 名称 would tick every row (`a`), leave the letters that
+    // are not bindings, and close the pane (`i`).
+    if !app.form.as_ref().is_some_and(|f| f.is_editing_field()) && app.import_pane_open() && handle_import_key(app, key)
+    {
         return;
     }
 
@@ -535,7 +540,7 @@ fn handle_dropdown_key(app: &mut App, key: KeyEvent) -> bool {
         }
         KeyCode::End => {
             if let Some(p) = app.picker.as_mut() {
-                p.end();
+                p.end(crate::app::HOST_DROPDOWN_ROWS);
             }
             true
         }
@@ -1171,6 +1176,66 @@ mod tests {
         assert!(app.form.as_ref().unwrap().import.rows[0].checked);
     }
 
+    // -- the pane is open by default, so typing must still win --------------
+
+    /// A create form with a host and a *default-open* pane holding three rows.
+    fn default_open_import_app() -> (tempfile::TempDir, App) {
+        let (d, mut app) = form_app();
+        let forwards = (0..3)
+            .map(|i| crate::model::SshForward {
+                kind: crate::model::ForwardKind::Local,
+                listen_addr: "127.0.0.1".into(),
+                listen_port: 19001 + i,
+                target_host: "10.0.0.1".into(),
+                target_port: 80,
+                host_alias: "testhost".into(),
+                line: (i as usize) + 1,
+                raw: format!("LocalForward {} 10.0.0.1:80", 19001 + i),
+            })
+            .collect();
+        {
+            let f = app.form.as_mut().unwrap();
+            f.ssh_host.set("testhost");
+            f.set_import_table("testhost", crate::model::ImportTable::new(forwards));
+            f.import_open = true;
+        }
+        (d, app)
+    }
+
+    #[test]
+    fn typing_a_name_is_not_swallowed_by_the_default_open_pane() {
+        // The pane now opens itself, so it must not steal `j`/`a`/`i`/`k` while a
+        // text field is being edited: those are ordinary letters in a tunnel name
+        // (`api-db`, `jenkins`). Without the guard, ticking a whole batch and
+        // closing the pane would happen behind the user as they type.
+        let (_d, mut app) = default_open_import_app();
+        assert!(app.import_pane_open(), "precondition: the pane is open by default");
+        app.form.as_mut().unwrap().field = FormField::Name;
+        handle_key(&mut app, key(KeyCode::Enter)); // start editing 名称
+        for c in "api-db".chars() {
+            handle_key(&mut app, ch(c));
+        }
+        assert_eq!(app.form.as_ref().unwrap().name.value(), "api-db", "letters must reach the field");
+        assert_eq!(app.form.as_ref().unwrap().import.checked_count(), 3, "`a` must not tick everything");
+        assert!(app.import_pane_open(), "`i` must not close the pane either");
+    }
+
+    #[test]
+    fn the_pane_takes_the_keys_back_once_editing_ends() {
+        // The guard is scoped to the editing stage, not "forever after the pane
+        // opened": `esc` out of the field and `j` walks the rows again.
+        let (_d, mut app) = default_open_import_app();
+        app.form.as_mut().unwrap().field = FormField::Name;
+        handle_key(&mut app, key(KeyCode::Enter));
+        handle_key(&mut app, ch('j'));
+        assert_eq!(app.form.as_ref().unwrap().name.value(), "j");
+        handle_key(&mut app, key(KeyCode::Esc)); // leave editing
+        assert!(!app.form.as_ref().unwrap().is_editing_field());
+        handle_key(&mut app, ch('j'));
+        assert_eq!(app.form.as_ref().unwrap().import.cursor, 1, "once not editing, j is the row cursor again");
+        assert_eq!(app.form.as_ref().unwrap().name.value(), "j", "and the field did not grow a second j");
+    }
+
     #[test]
     fn select_all_and_none_keys_work_in_the_pane() {
         let (_d, mut app) = import_app();
@@ -1562,5 +1627,202 @@ mod tests {
         assert!(!app.form.as_ref().unwrap().is_editing_field());
         assert_eq!(app.form.as_ref().unwrap().name.value(), "z");
         assert_ne!(app.form.as_ref().unwrap().field, FormField::Name);
+    }
+
+    // -- panic hardening: scroll windows and bogus indices ------------------
+
+    #[test]
+    fn the_import_pane_scrolls_its_window_with_the_cursor() {
+        // `IMPORT_ROWS_VISIBLE` is shared by the key handler (this window) and
+        // the renderer (pane height). Walking past the window must move `scroll`
+        // with the cursor, or `import_end` leaves the last row out of sight.
+        let (_d, mut app) = import_app();
+        for _ in 0..(IMPORT_ROWS_VISIBLE + 2) {
+            handle_key(&mut app, ch('j'));
+        }
+        let import = &app.form.as_ref().unwrap().import;
+        assert!(import.scroll as usize <= import.cursor, "scroll must follow the cursor down");
+        assert!(
+            import.cursor < import.scroll as usize + IMPORT_ROWS_VISIBLE,
+            "the cursor must stay inside the window: cursor={} scroll={}",
+            import.cursor,
+            import.scroll
+        );
+    }
+
+    #[test]
+    fn import_end_brings_the_last_row_into_view() {
+        // `G` set the cursor without scrolling, so the pane kept showing the top
+        // of the list while the highlight was off-screen.
+        let (_d, mut app) = import_app();
+        handle_key(&mut app, ch('G'));
+        let import = &app.form.as_ref().unwrap().import;
+        assert!(import.cursor < import.scroll as usize + IMPORT_ROWS_VISIBLE, "the last row must be visible");
+    }
+
+    #[test]
+    fn import_home_scrolls_back_to_the_top() {
+        let (_d, mut app) = import_app();
+        handle_key(&mut app, ch('G'));
+        handle_key(&mut app, ch('g'));
+        let import = &app.form.as_ref().unwrap().import;
+        assert_eq!(import.cursor, 0);
+        assert_eq!(import.scroll, 0, "home must reset the window");
+    }
+
+    #[test]
+    fn paging_in_the_pane_clamps_at_both_ends() {
+        let (_d, mut app) = import_app();
+        for _ in 0..10 {
+            handle_key(&mut app, key(KeyCode::PageDown));
+        }
+        let last = app.form.as_ref().unwrap().import.visible().len().saturating_sub(1);
+        assert_eq!(app.form.as_ref().unwrap().import.cursor, last);
+        for _ in 0..10 {
+            handle_key(&mut app, key(KeyCode::PageUp));
+        }
+        assert_eq!(app.form.as_ref().unwrap().import.cursor, 0);
+    }
+
+    #[test]
+    fn the_host_dropdown_end_key_scrolls_the_last_row_into_view() {
+        let (_d, mut app) = app_with(vec![]);
+        app.hosts = (0..40)
+            .map(|i| crate::ssh::SshHost {
+                alias: format!("h{i:02}"),
+                hostname: "1.1.1.1".into(),
+                user: None,
+                port: 22,
+                proxy_jump: Vec::new(),
+                identity_file: None,
+            })
+            .collect();
+        app.open_form_create();
+        app.open_host_picker();
+        handle_key(&mut app, key(KeyCode::End));
+        let p = app.picker.as_ref().unwrap();
+        assert_eq!(p.selected, 39);
+        assert!(p.selected < p.scroll as usize + crate::app::HOST_DROPDOWN_ROWS, "the last host must be visible");
+    }
+
+    #[test]
+    fn paging_the_dropdown_stays_inside_the_list() {
+        let (_d, mut app) = app_with(vec![]);
+        app.hosts = (0..3)
+            .map(|i| crate::ssh::SshHost {
+                alias: format!("h{i}"),
+                hostname: "1.1.1.1".into(),
+                user: None,
+                port: 22,
+                proxy_jump: Vec::new(),
+                identity_file: None,
+            })
+            .collect();
+        app.open_form_create();
+        app.open_host_picker();
+        for _ in 0..5 {
+            handle_key(&mut app, key(KeyCode::PageDown));
+        }
+        assert_eq!(app.picker.as_ref().unwrap().selected, 2);
+        for _ in 0..5 {
+            handle_key(&mut app, key(KeyCode::PageUp));
+        }
+        assert_eq!(app.picker.as_ref().unwrap().selected, 0);
+    }
+
+    #[test]
+    fn keys_on_an_empty_table_do_not_panic() {
+        // Every main-screen key against zero rows: navigation, toggles, detail,
+        // delete and the batch keys must all be no-ops.
+        let (_d, mut app) = app_with(vec![]);
+        for code in [
+            KeyCode::Char('j'),
+            KeyCode::Char('k'),
+            KeyCode::Char('g'),
+            KeyCode::Char('G'),
+            KeyCode::Char(' '),
+            KeyCode::Char('r'),
+            KeyCode::Char('e'),
+            KeyCode::Char('d'),
+            KeyCode::Enter,
+            KeyCode::Char('l'),
+            KeyCode::Char('v'),
+            KeyCode::Down,
+            KeyCode::Up,
+            KeyCode::Home,
+            KeyCode::End,
+        ] {
+            handle_key(&mut app, key(code));
+            // Dismiss whatever overlay the key opened, so the next key is routed
+            // to the main screen again.
+            app.overlay = Overlay::None;
+            app.form = None;
+        }
+        assert!(app.tunnels.is_empty());
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn selection_navigation_on_an_empty_table_is_a_no_op() {
+        let (_d, mut app) = app_with(vec![]);
+        handle_key(&mut app, ch('v'));
+        assert!(app.select_mode.active);
+        for code in [
+            KeyCode::Char('j'),
+            KeyCode::Char('k'),
+            KeyCode::Char('J'),
+            KeyCode::Char('K'),
+            KeyCode::Char(' '),
+            KeyCode::Char('a'),
+            KeyCode::Char('s'),
+            KeyCode::Char('x'),
+            KeyCode::Char('R'),
+            KeyCode::Char('D'),
+        ] {
+            handle_key(&mut app, key(code));
+            app.overlay = Overlay::None;
+        }
+        assert!(app.tunnels.is_empty());
+        assert!(app.select_mode.is_empty());
+    }
+
+    #[test]
+    fn a_bogus_kind_index_survives_the_kind_keys() {
+        // `kind_idx` is public; a caller writing past the end must not turn the
+        // next `l`/`h`/enter into a slice panic.
+        let (_d, mut app) = form_app();
+        app.form.as_mut().unwrap().kind_idx = 99;
+        app.form.as_mut().unwrap().field = FormField::Kind;
+        for code in [KeyCode::Char('l'), KeyCode::Char('h'), KeyCode::Enter, KeyCode::Right, KeyCode::Left] {
+            handle_key(&mut app, key(code));
+            let f = app.form.as_ref().unwrap();
+            assert!(
+                f.kind_idx < crate::model::ForwardKind::all().len(),
+                "{code:?} left kind_idx at {}, past the kind list",
+                f.kind_idx
+            );
+        }
+        assert!(app.form.is_some(), "the form must survive");
+        // And the resulting kind is one of the real variants, not a panic.
+        let kind = app.form.as_ref().unwrap().kind();
+        assert!(crate::model::ForwardKind::all().contains(&kind));
+    }
+
+    #[test]
+    fn a_failed_submit_with_no_free_id_reports_instead_of_panicking() {
+        // The id space is exhausted by a hand-edited config; ctrl+s must report
+        // it into the form.
+        let (_d, mut app) = app_with(vec![tunnel(u64::MAX, "huge", 18001)]);
+        app.open_form_create();
+        {
+            let f = app.form.as_mut().unwrap();
+            f.ssh_host.set("host");
+            f.name.set("fresh");
+            f.remote_port.set("22");
+            f.local_port.set("18002");
+        }
+        handle_key(&mut app, ctrl('s'));
+        assert_eq!(app.tunnels.len(), 1, "nothing may be created");
+        assert!(app.form.is_some(), "the form stays open with the error");
     }
 }

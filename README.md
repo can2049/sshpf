@@ -525,6 +525,7 @@ grep 'tunnel=3 ' ~/.local/state/sshpf/logs/sshpf.log   # 一条隧道的完整�
 … ERROR seq=42 event=crash.panic thread=sshpf-tunnel-3 location=src/app.rs:112:9 msg="index out of bounds" backtrace=yes
 … ERROR seq=43 event=crash.panic.trace msg="  | panic backtrace\n  |    0: sshpf::tunnel::run\n  | …"
 ts=1794000000 ERROR seq=0 event=crash.signal signal=11 name=SIGSEGV pid=4242
+ts=1794000000 ERROR seq=0 event=crash.log_reentrant cause=crash.panic msg="日志写入重入，记录被跳过以避免死锁"
 ```
 
 - 目录 `0700`、文件 `0600`；单文件 2 MiB 轮转，保留 3 个归档（上限约 8 MiB）。
@@ -532,6 +533,22 @@ ts=1794000000 ERROR seq=0 event=crash.signal signal=11 name=SIGSEGV pid=4242
   `off` 只关常规记录，**崩溃记录照写**。
 - 不记私钥、passphrase、`known_hosts` 内容。
 - **提 issue 请附整个 `logs/` 目录**（含 `.1`~`.3`），重连风暴、配置被改的证据都在更早的位置。
+
+**崩溃不再是裸 panic。** 输入不合法时程序正常退出并在 stderr 说一句人话，原因写进日志，
+而不是甩一段 Rust 栈给用户、再以 101 退出：
+
+| 以前 | 现在 |
+|---|---|
+| `~/.ssh/config` 第一行是中文注释 → panic | 正常解析，主机照常列出 |
+| 无终端（CI / `ssh host sshpf` 不带 `-t`）→ panic | 退出 1 + `app.fatal stage=tui` |
+| 参数里有非 UTF-8 字节 → panic | 路径按字节接受；参数名则退出 2 |
+| `--list-hosts > /dev/full` → panic | 退出 0 + `cli.stdout_failed` |
+| `id = 18446744073709551615` 后新建转发 → 溢出 panic | 回落到空闲 id |
+| 窄终端 / 超长值 → 除零、`u16` 溢出 panic | 降级渲染 + `ui.render_degraded` |
+| panic 时日志锁被持有 → 进程永久僵住 | `crash.log_reentrant`，照常退出 |
+| 隧道线程 panic → 该行永远"启动中" | `tunnel.thread_panic`，转失败态，UI 继续 |
+
+降级不是静默的：每一处都有一条可 `grep` 的记录（`docs/logging.md` 的「防御与降级」）。
 
 完整事件目录、字段说明与排查配方见 [docs/logging.md](docs/logging.md)。
 
@@ -550,46 +567,35 @@ sshpf --check               # 确认配置没写坏
 ## 开发
 
 ```bash
-cargo test                    # 全部：单元测试 + tests/*.rs 集成测试（e2e 默认 #[ignore]，见下一行）
-cargo test --lib              # 只跑单元测试（CI 的 OS 矩阵跑这个）
-cargo test --test help_coverage   # 帮助覆盖的机器校验（代码 ↔ 帮助目录双向断言）
-cargo test --test logging         # 诊断日志集成测试
-cargo test --test e2e -- --ignored --test-threads=1   # 真实 sshd 端到端（默认被 #[ignore])
+cargo test                    # 569 单元 + 51 集成（帮助覆盖 8 + 日志 21 + panic 加固 13 + 主程序 9） + 10 端到端（9 个默认 #[ignore]，需真实 sshd）
+cargo test --test e2e -- --ignored --test-threads=1   # 真实 sshd 端到端
 cargo clippy --all-targets    # 零警告
 cargo fmt --check             # 格式检查
 ```
 
-`cargo test` 会同时跑 lib 单元测试与 `tests/*.rs` 下的集成测试；端到端那组默认
-`#[ignore]`，必须显式 `--ignored` 才会执行（它需要真实的 `sshd`、`ssh-keygen`）。
-`cargo test` runs the lib unit tests *and* the integration tests in `tests/*.rs`; the
-end-to-end group is `#[ignore]`d by default and needs an explicit `--ignored` (it requires a
-real `sshd` and `ssh-keygen`).
-
 测试分布：
-
-单元测试（`cargo test --lib`）：
 
 | 模块 | 测试数 | 覆盖重点 |
 |---|---|---|
-| `app` | 102 | 就绪信号、重试退避、确认门控、过滤与选中、导入批量校验、多选标记与批量派发 |
-| `ssh` | 84 | config 解析（含 Match 污染防护）、**转发指令扫描与作用域**、known_hosts 匹配、SOCKS5、错误分类 |
-| `keys` | 65 | 两阶段编辑语义、主机下拉、确认键位、导入面板按键归属、两阶段保存、鼠标派发、未知键忽略 |
-| `ui` | 69 | 1×1 到 40×12 极端尺寸、超长文本、NO_COLOR、命中图、导入面板列宽降级、双语帮助浮层折行 |
-| `model` | 55 | 三种转发 spec、失败码分类、输入缓冲边界、逐列筛选与撤销栈、多选语义 |
-| `config` | 27 | 缺省值、原子写、0600/0700 权限、字段校验、容错 |
-| `logging` | 16 | 记录格式/转义、级别过滤、轮转不切记录、panic 与致命信号真写盘、0600/0700 |
-| `tunnel` | 5 | 启停、事件顺序、重复启动、停止幂等 |
+| `keys` | 77 | 两阶段编辑语义、主机下拉、确认键位、导入面板按键归属（默认展开与编辑态）、鼠标派发、未知键忽略 |
+| `app` | 180 | 就绪信号、重试退避、确认门控、过滤与选中、自动展开判定与提交归属、导入批量校验、多选标记与批量派发、畸形配置钳制与重试收敛 |
+| `ssh` | 89 | config 解析（含 Match 污染防护、**多字节边界**）、**转发指令扫描与作用域**、ProxyJump 全链展开、known_hosts 匹配、SOCKS5、错误分类 |
+| `ui` | 79 | 1×1 到 140×45 尺寸矩阵、超长文本、NO_COLOR、命中图、导入面板列宽降级、面板画不下时的提示、**双语帮助浮层折行与键列布局** |
+| `model` | 70 | 三种转发 spec、失败码分类、输入缓冲边界、逐列筛选与撤销栈、多选语义、u16 边界 |
+| `config` | 29 | 缺省值、原子写、0600/0700 权限、字段校验、容错、id 空间边界 |
+| `logging` | 23 | 记录格式/转义、级别过滤、轮转不切记录、panic 与致命信号真写盘、**重入不死锁**、0600/0700 |
 | `help` | 5 | 帮助目录不变式：14 个分区齐全、每条中英齐全、`fit` 三级退化 |
-| `sys` / `text` | 8 | 文件权限、退出信号、显示宽度与截断 |
-| **合计** | **436** | `cargo test --lib` |
+| `sys / text` | 8 | 文件权限、退出信号、显示宽度与截断 |
+| **合计** | **569** | `cargo test --lib` |
 
-集成测试（`tests/*.rs`）：
+集成测试（`tests/`）：
 
 | 文件 | 测试数 | 覆盖重点 |
 |---|---|---|
-| `tests/help_coverage.rs` | 8 | **机器校验帮助覆盖**：解析 `src/keys.rs` 每个 handler 的 `KeyCode`，与帮助目录双向比对（不得遗漏 / 不得撒谎）、`HitTarget` 每个变体都被说明、每个 token 都出现在 [docs/keymap.md](docs/keymap.md) |
-| `tests/logging.rs` | 15 | 真实文件系统上的日志落盘、轮转与权限 |
-| `tests/e2e.rs` | 10（9 个默认 `#[ignore]`） | 真实 `sshd` 上的 `-L` / `-R` / `-D` 端到端 |
+| `tests/help_coverage.rs` | 8 | **机器校验帮助覆盖**：解析 `src/keys.rs` 每个 handler 的 `KeyCode`，与 [src/help.rs](src/help.rs) 的帮助目录双向比对（不得遗漏 / 不得撒谎）、`HitTarget` 每个变体都被说明、每个 token 都出现在 [docs/keymap.md](docs/keymap.md) |
+| `tests/logging.rs` | 21 | 真二进制跑出日志全链路：格式、轮转、无 TTY、非 UTF-8 参数、stdout 写失败、panic 重入不死锁 |
+| `tests/panic_hardening.rs` | 13 | 恶意 `~/.ssh/config` 与 `config.toml`、异常环境变量：断言**不是被信号杀死**且日志里有对应事件 |
+| `tests/e2e.rs` | 10 | 真实 sshd 端到端（默认 `#[ignore]`） |
 
 模块分层（每层只依赖上层）：
 

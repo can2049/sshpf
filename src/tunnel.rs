@@ -86,49 +86,7 @@ impl Supervisor {
         let stop_thread = stop.clone();
 
         let handle = std::thread::Builder::new().name(format!("sshpf-tunnel-{id}")).spawn(move || {
-            let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-                Ok(rt) => rt,
-                Err(e) => {
-                    let _ = tx.send(TunnelEvent::SpawnFailed { id, error: format!("创建 runtime 失败: {e}") });
-                    let _ = tx.send(TunnelEvent::StderrClosed { id });
-                    return;
-                }
-            };
-
-            let tx_ready = tx.clone();
-            let ready = move || {
-                let _ = tx_ready.send(TunnelEvent::Ready { id });
-            };
-
-            let result = rt.block_on(async {
-                let opts = crate::ssh::client::Options { host_key_policy };
-                let run = crate::ssh::client::run(&cfg, &opts, id, tx.clone(), ready);
-                tokio::pin!(run);
-                // Race the driver against the shutdown flag. `select!` already
-                // loops internally until one branch completes, so both branches
-                // are terminal and no outer loop is needed.
-                tokio::select! {
-                    biased;
-                    _ = wait_for_stop(&stop_thread) => Ok::<(), anyhow::Error>(()),
-                    res = &mut run => res,
-                }
-            });
-
-            match result {
-                Ok(()) => {
-                    let _ = tx.send(TunnelEvent::Exited { id, code: Some(0), reason: None });
-                }
-                Err(e) => {
-                    let info = crate::ssh::client::classify(&e);
-                    // Keep the detail in the log *and* on the event: the event is
-                    // what selects the status message, the log is what the user
-                    // reads in the detail panel.
-                    let _ = tx.send(TunnelEvent::Line { id, line: info.detail.clone() });
-                    let _ = tx.send(TunnelEvent::Exited { id, code: Some(1), reason: Some(info) });
-                }
-            }
-            // Always last: lets the app classify with the complete log.
-            let _ = tx.send(TunnelEvent::StderrClosed { id });
+            contain(id, &tx, || drive(id, cfg, host_key_policy, &tx, stop_thread));
         })?;
 
         self.running.insert(id, Running { stop, handle });
@@ -171,8 +129,20 @@ impl Supervisor {
         while !running.handle.is_finished() && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
-        // The thread owns its runtime; dropping it aborts remaining tasks and
-        // closes the sockets.
+        // A thread that outlived the grace period is a wedged driver, not a slow
+        // one: say so once instead of silently detaching it (which is also what
+        // makes "the UI says stopped but the port is still bound" a diagnosable
+        // report instead of a mystery).
+        if !running.handle.is_finished() {
+            crate::logging::warn(
+                "tunnel.stop_timeout",
+                &[("tunnel", &id), ("grace_ms", &grace.as_millis()), ("msg", &"隧道线程未在宽限期内退出")],
+            );
+        }
+        // The thread owns its runtime; dropping the `JoinHandle` detaches it, and
+        // dropping the runtime (inside the thread) closes the sockets. We
+        // deliberately never `join()`: joining here would reintroduce the freeze
+        // this bound exists to prevent.
     }
 
     /// Stop everything (used on quit and in `Drop`).
@@ -192,6 +162,103 @@ impl Supervisor {
 impl Drop for Supervisor {
     fn drop(&mut self) {
         self.stop_all();
+    }
+}
+
+/// Run one tunnel thread's body and turn its outcome into the event sequence.
+///
+/// A panic on a tunnel thread must not take the process (or the UI) down:
+/// `std::thread` unwinds only the panicking thread and the UI thread keeps
+/// running. What it *must* do is leave the app with a truthful verdict instead of
+/// a tunnel that silently never reports again — hence the `catch_unwind` here.
+///
+/// This is **not** `catch_unwind` used to hide a bug: every reachable panic in
+/// this crate is fixed at its root (see the rest of this change). This is
+/// last-ditch containment for what we cannot reach — third-party code inside
+/// `russh`/tokio, and allocation failure — and its whole job is to keep the
+/// process alive and record the failure.
+fn contain(id: TunnelId, tx: &Sender<TunnelEvent>, body: impl FnOnce() -> anyhow::Result<()>) {
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+    match outcome {
+        Ok(Ok(())) => {
+            let _ = tx.send(TunnelEvent::Exited { id, code: Some(0), reason: None });
+        }
+        Ok(Err(e)) => {
+            let info = crate::ssh::client::classify(&e);
+            // Keep the detail in the log *and* on the event: the event is what
+            // selects the status message, the log is what the user reads in the
+            // detail panel.
+            let _ = tx.send(TunnelEvent::Line { id, line: info.detail.clone() });
+            let _ = tx.send(TunnelEvent::Exited { id, code: Some(1), reason: Some(info) });
+        }
+        Err(payload) => {
+            // The panic hook already wrote `crash.panic`. Tell the state machine
+            // too, so the row goes to `Failed` instead of staying `Starting`
+            // forever.
+            let message = panic_message(&payload);
+            crate::logging::error("tunnel.thread_panic", &[("tunnel", &id), ("msg", &message)]);
+            let info =
+                crate::model::FailureInfo::with_short(crate::model::FailureKind::Unknown, "隧道线程崩溃", message);
+            let _ = tx.send(TunnelEvent::Line { id, line: info.detail.clone() });
+            let _ = tx.send(TunnelEvent::Exited { id, code: Some(101), reason: Some(info) });
+        }
+    }
+    // Always last: lets the app classify with the complete log.
+    let _ = tx.send(TunnelEvent::StderrClosed { id });
+}
+
+/// Run one tunnel thread's body: build the runtime and race the driver against
+/// the shutdown flag.
+///
+/// Split out of [`Supervisor::spawn`] so the panic containment around it stays
+/// readable, and so a runtime-build failure is a plain `Err` the caller reports
+/// rather than an early `return` that skips the event sequence.
+fn drive(
+    id: TunnelId,
+    cfg: crate::model::TunnelConfig,
+    host_key_policy: crate::ssh::known_hosts::HostKeyPolicy,
+    tx: &Sender<TunnelEvent>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> anyhow::Result<()> {
+    let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        Ok(rt) => rt,
+        Err(e) => {
+            let message = format!("创建 runtime 失败: {e}");
+            let _ = tx.send(TunnelEvent::SpawnFailed { id, error: message.clone() });
+            // Reported as an error return too, so the app's normal exit
+            // classification runs and the row does not stay `Starting`.
+            anyhow::bail!(message);
+        }
+    };
+
+    let tx_ready = tx.clone();
+    let ready = move || {
+        let _ = tx_ready.send(TunnelEvent::Ready { id });
+    };
+
+    rt.block_on(async {
+        let opts = crate::ssh::client::Options { host_key_policy };
+        let run = crate::ssh::client::run(&cfg, &opts, id, tx.clone(), ready);
+        tokio::pin!(run);
+        // Race the driver against the shutdown flag. `select!` already loops
+        // internally until one branch completes, so both branches are terminal and
+        // no outer loop is needed.
+        tokio::select! {
+            biased;
+            _ = wait_for_stop(&stop) => Ok::<(), anyhow::Error>(()),
+            res = &mut run => res,
+        }
+    })
+}
+
+/// Best-effort text of a caught panic payload, for the log and the status table.
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<非字符串 panic>".to_string()
     }
 }
 
@@ -306,5 +373,128 @@ mod tests {
             flag.store(true, std::sync::atomic::Ordering::SeqCst);
             tokio::time::timeout(Duration::from_secs(2), &mut fut).await.expect("did not resolve after flag set");
         });
+    }
+
+    // -----------------------------------------------------------------------
+    // panic containment
+    // -----------------------------------------------------------------------
+
+    /// Drain events until `StderrClosed`, returning what arrived (in order).
+    ///
+    /// A timeout is a hard failure: the contract is that a dead tunnel thread
+    /// always completes the event sequence, so a missing one would leave the app
+    /// with a row stuck in `Starting` forever.
+    fn collect_until_closed(rx: &mpsc::Receiver<TunnelEvent>) -> Vec<TunnelEvent> {
+        let mut seen = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(ev) => {
+                    let last = matches!(ev, TunnelEvent::StderrClosed { .. });
+                    seen.push(ev);
+                    if last {
+                        return seen;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        panic!("no StderrClosed: the tunnel thread hung; events so far: {seen:?}");
+    }
+
+    /// A panic on a tunnel thread must keep the process alive and still report a
+    /// terminal `Exited`, so the UI leaves the row in `Failed` instead of
+    /// `Starting`. This is the "does a thread panic infect the process?" answer.
+    #[test]
+    fn a_panicking_tunnel_thread_reports_exit_instead_of_hanging() {
+        let (tx, rx) = mpsc::channel();
+        // Deliberately *not* silencing the global panic hook here: the hook is
+        // process-wide and `cargo test` runs tests in parallel, so swapping it
+        // would suppress crash records other tests are asserting on. The
+        // backtrace this prints is captured with the test's stderr.
+        contain(7, &tx, || panic!("tunnel driver exploded"));
+
+        let events = collect_until_closed(&rx);
+        let exited = events
+            .iter()
+            .find_map(|e| match e {
+                TunnelEvent::Exited { id, code, reason } => Some((*id, *code, reason.clone())),
+                _ => None,
+            })
+            .expect("a panicking driver must still produce Exited");
+        assert_eq!(exited.0, 7);
+        assert_eq!(exited.1, Some(101), "101 is the conventional Rust panic exit code");
+        let reason = exited.2.expect("the panic text must travel with the event");
+        assert!(reason.detail.contains("tunnel driver exploded"), "{reason:?}");
+        assert!(events.last().is_some_and(|e| matches!(e, TunnelEvent::StderrClosed { .. })));
+
+        // The process is still alive: this assertion runs after the panic.
+        assert!(std::process::id() > 0, "the test process must have survived the tunnel panic");
+    }
+
+    /// The containment holds on a **real** thread, not just a direct call: the
+    /// thread really panics and unwinds, the process survives, and a second
+    /// tunnel still starts and reports normally afterwards. This is the
+    /// "does a tunnel-thread panic infect the process / the UI?" answer.
+    #[test]
+    fn a_real_panicking_thread_does_not_infect_the_process_or_other_tunnels() {
+        let (tx, rx) = mpsc::channel();
+        let doomed = {
+            let tx = tx.clone();
+            std::thread::Builder::new()
+                .name("sshpf-tunnel-doomed".to_string())
+                .spawn(move || contain(11, &tx, || panic!("real thread panic")))
+                .unwrap()
+        };
+        doomed.join().expect("the thread must finish, not abort the process");
+
+        let events = collect_until_closed(&rx);
+        assert!(
+            events.iter().any(|e| matches!(e, TunnelEvent::Exited { code: Some(101), .. })),
+            "the panic must be reported as an exit: {events:?}"
+        );
+
+        // The process is alive, so a *different* tunnel can still be supervised.
+        let (tx2, _rx2) = mpsc::channel();
+        let mut sup = Supervisor::new();
+        sup.spawn(cfg(12, 0), crate::ssh::known_hosts::HostKeyPolicy::AcceptNew, tx2)
+            .expect("spawning after a thread panic must still work");
+        assert_eq!(sup.running_count(), 1);
+        sup.stop(12);
+        assert_eq!(sup.running_count(), 0);
+    }
+
+    /// A clean driver produces `Exited { code: Some(0) }` with no reason.
+    #[test]
+    fn a_clean_driver_reports_a_zero_exit() {
+        let (tx, rx) = mpsc::channel();
+        contain(8, &tx, || Ok(()));
+        let events = collect_until_closed(&rx);
+        let exited = events.iter().find_map(|e| match e {
+            TunnelEvent::Exited { code, reason, .. } => Some((*code, reason.clone())),
+            _ => None,
+        });
+        assert_eq!(exited, Some((Some(0), None)));
+    }
+
+    /// An `Err` driver is classified, and the detail reaches the log/panel line.
+    #[test]
+    fn a_failing_driver_is_classified_and_reported() {
+        let (tx, rx) = mpsc::channel();
+        contain(9, &tx, || Err(anyhow::anyhow!("failed to lookup address information: nonsense")));
+        let events = collect_until_closed(&rx);
+        assert!(
+            events.iter().any(|e| matches!(e, TunnelEvent::Line { line, .. } if line.contains("lookup address"))),
+            "the classified detail must be delivered as a line: {events:?}"
+        );
+        let reason = events
+            .iter()
+            .find_map(|e| match e {
+                TunnelEvent::Exited { reason, .. } => reason.clone(),
+                _ => None,
+            })
+            .expect("a failure must carry its classification");
+        assert_eq!(reason.kind, crate::model::FailureKind::DnsFailure);
     }
 }

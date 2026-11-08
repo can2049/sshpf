@@ -290,14 +290,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     ])
     .split(area);
 
-    draw_title(frame, app_ref, rows[0]);
-    draw_counters(frame, app_ref, rows[1]);
-    draw_table(frame, app_ref, rows[2], &mut hits);
-    draw_message(frame, app_ref, rows[3]);
+    draw_title(frame, app_ref, band(&rows, 0, "title"));
+    draw_counters(frame, app_ref, band(&rows, 1, "counters"));
+    draw_table(frame, app_ref, band(&rows, 2, "table"), &mut hits);
+    draw_message(frame, app_ref, band(&rows, 3, "message"));
     if select_h > 0 {
-        draw_selection_bar(frame, app_ref, rows[4], &mut hits);
+        draw_selection_bar(frame, app_ref, band(&rows, 4, "selection_bar"), &mut hits);
     }
-    draw_keys(frame, app_ref, rows[5]);
+    draw_keys(frame, app_ref, band(&rows, 5, "keys"));
 
     match &app_ref.overlay {
         Overlay::None => {}
@@ -331,6 +331,47 @@ fn clamp_scrolls(app: &mut App, area: Rect) {
     }
 }
 
+/// Log a degradation once per process.
+///
+/// The renderer runs at ~30 frames/s, so a condition that survives a resize
+/// would otherwise write a log line per frame until the 2 MiB rotation kicks in
+/// and pushes the *interesting* history out. One line per process is the useful
+/// amount: it says "this happened", and the frame that triggered it is the only
+/// one that differed.
+///
+/// Returns `true` the first time it fires (so callers can log inline in tests).
+fn warn_once(seen: &std::sync::atomic::AtomicBool, event: &str, fields: &[(&str, &dyn std::fmt::Display)]) -> bool {
+    use std::sync::atomic::Ordering;
+    if seen.swap(true, Ordering::Relaxed) {
+        return false;
+    }
+    crate::logging::warn(event, fields);
+    true
+}
+
+/// One band of a `Layout::split` result, degrading to an empty rect.
+///
+/// ratatui hands back exactly one rect per constraint, so the index is an
+/// invariant of the solver rather than user data. It is still fetched instead of
+/// indexed: a violated contract would otherwise take the whole TUI down
+/// mid-frame (the terminal is left in raw mode with no UI), whereas a blank band
+/// renders, logs, and recovers on the next frame. Every `draw_*` below treats a
+/// zero-sized area as "nothing to draw".
+fn band(rows: &[Rect], index: usize, what: &'static str) -> Rect {
+    match rows.get(index) {
+        Some(rect) => *rect,
+        None => {
+            static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            warn_once(
+                &SEEN,
+                "ui.render_degraded",
+                &[("what", &what), ("reason", &"layout_band_missing"), ("index", &index), ("bands", &rows.len())],
+            );
+            Rect::default()
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Chrome: title / counters / message / keys
 // ---------------------------------------------------------------------------
@@ -342,6 +383,7 @@ fn draw_title(frame: &mut Frame, app: &App, area: Rect) {
     let p = palette();
     let right_w = 9u16.min(area.width);
     let chunks = Layout::horizontal([Constraint::Min(0), Constraint::Length(right_w)]).split(area);
+    let (left_area, clock_area) = (band(&chunks, 0, "title_left"), band(&chunks, 1, "title_clock"));
 
     let ssh_hosts = if app.hosts.is_empty() && app.hosts_error.is_none() {
         "ssh-config: -".to_string()
@@ -362,14 +404,14 @@ fn draw_title(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         format!(" sshpf {} ", env!("CARGO_PKG_VERSION"))
     };
-    let left = truncate_to_width(&left, chunks[0].width as usize);
+    let left = truncate_to_width(&left, left_area.width as usize);
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(left, p.fg(p.text).add_modifier(Modifier::BOLD)))),
-        chunks[0],
+        left_area,
     );
 
-    let clock = truncate_to_width(&now_hms(), chunks[1].width as usize);
-    frame.render_widget(Paragraph::new(Line::from(Span::styled(clock, p.fg(p.dim)))), chunks[1]);
+    let clock = truncate_to_width(&now_hms(), clock_area.width as usize);
+    frame.render_widget(Paragraph::new(Line::from(Span::styled(clock, p.fg(p.dim)))), clock_area);
 }
 
 fn draw_counters(frame: &mut Frame, app: &App, area: Rect) {
@@ -400,15 +442,35 @@ fn draw_counters(frame: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::styled(text.clone(), p.fg(*color)));
     }
 
-    let right_w = if app.filter.is_empty() { 0 } else { (display_width(&app.filter) as u16 + 16).min(area.width / 2) };
+    // The filter is typed text with no length cap, so its display width can
+    // exceed `u16::MAX`; the sum is taken wide and clamped, never cast first.
+    let right_w = if app.filter.is_empty() {
+        0
+    } else {
+        // Enough for the bilingual prefix (`过滤/Filter: ` is 13 cells) plus the
+        // trailing space, so a short filter is never squeezed into an ellipsis.
+        let wanted = (display_width(&app.filter) as u32).saturating_add(FILTER_CHIP_OVERHEAD);
+        if wanted > u32::from(u16::MAX) {
+            // Reported before the clamp: the chip is then pinned to the frame's
+            // half-width, which is the only thing the layout can guarantee.
+            static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            warn_once(
+                &SEEN,
+                "ui.render_degraded",
+                &[("what", &"counters_filter"), ("reason", &"width_overflow"), ("need", &wanted)],
+            );
+        }
+        wanted.min(u32::from(area.width / 2)) as u16
+    };
     let chunks = Layout::horizontal([Constraint::Min(0), Constraint::Length(right_w)]).split(area);
-    frame.render_widget(Paragraph::new(Line::from(spans)), chunks[0]);
+    frame.render_widget(Paragraph::new(Line::from(spans)), band(&chunks, 0, "counters"));
 
     if right_w > 0 {
-        let text = truncate_to_width(&format!("过滤/Filter: {} ", app.filter), chunks[1].width as usize);
+        let area = band(&chunks, 1, "counters_filter");
+        let text = truncate_to_width(&format!("过滤/Filter: {} ", app.filter), area.width as usize);
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(text, p.fg(p.accent))).alignment(Alignment::Right)),
-            chunks[1],
+            area,
         );
     }
 }
@@ -599,6 +661,14 @@ fn uptime_text(status: &TunnelStatus, fitting: usize) -> String {
 /// single-width, and the table's own `▶ ` highlight symbol sits next to it.
 const MARK_W: u16 = 1;
 
+/// Cells the filter chip spends on everything except the typed text: the
+/// bilingual `过滤/Filter: ` prefix (13 cells) plus the trailing space, rounded up.
+///
+/// Named rather than inlined so the budget in `draw_counters` and the label
+/// drawn below it cannot drift apart — a prefix longer than the budget would
+/// truncate the user's own filter text into an ellipsis.
+const FILTER_CHIP_OVERHEAD: u32 = 16;
+
 fn cell(text: impl Into<String>, style: Style) -> Cell<'static> {
     Cell::new(Text::from(Line::from(text.into()))).style(style)
 }
@@ -690,7 +760,19 @@ fn draw_table(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     // skipped so a click below the last row cannot resolve to a hidden one.
     for (i, idx) in visible.iter().enumerate() {
         let Some(view) = app.tunnels.get(*idx) else { continue };
-        let y = area.y + 2 + i as u16;
+        // `i` counts visible rows and is bounded by the terminal height in
+        // practice, but `as u16` would wrap (and then re-enter the area) for a
+        // table taller than 65535 rows. Widening first makes the overflow a
+        // plain "off screen", which is what `y >= bottom` already handles.
+        let Some(y) = u16::try_from(usize::from(area.y) + 2 + i).ok() else {
+            static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            warn_once(
+                &SEEN,
+                "ui.render_degraded",
+                &[("what", &"table_row"), ("reason", &"row_overflow"), ("row", &i), ("top", &area.y)],
+            );
+            break;
+        };
         if y >= area.bottom() {
             break;
         }
@@ -844,9 +926,13 @@ fn draw_selection_bar(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMa
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
     let w = width.min(area.width);
     let h = height.min(area.height);
+    // Both axes are derived from the frame itself (`area.x + (area.width - w)/2`
+    // fits in a u16 by construction), but the offsets are added saturating so a
+    // nested area with a non-zero origin could never turn centring into an
+    // overflow panic.
     Rect {
-        x: area.x + area.width.saturating_sub(w) / 2,
-        y: area.y + area.height.saturating_sub(h) / 2,
+        x: area.x.saturating_add(area.width.saturating_sub(w) / 2),
+        y: area.y.saturating_add(area.height.saturating_sub(h) / 2),
         width: w,
         height: h,
     }
@@ -1162,7 +1248,7 @@ fn draw_form(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     let current_idx = FormField::ORDER.iter().position(|f| *f == form.field).unwrap_or(0);
 
     let lines = form_field_lines(app, form, p, label_w, value_w, current_idx);
-    let extra = form_notes(form, p, inner.width as usize);
+    let mut extra = form_notes(form, p, inner.width as usize);
 
     // Reserve the pane out of the bottom, but only after the fields and their
     // notes have their rows: on a short terminal the pane is what shrinks (and
@@ -1176,6 +1262,19 @@ fn draw_form(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
                 let pane = Rect { x: inner.x, y: inner.y + body.height, width: inner.width, height: room };
                 (body, Some(pane))
             } else {
+                // The pane does not fit, but `import_open` is still true and the
+                // submit path keys off it: `ctrl+s` would create the ticked rows
+                // while the user cannot see a single one of them. Say so instead
+                // of silently acting on an invisible table — and point at the key
+                // that gets them out of that state.
+                if form.import_open && !form.import.is_empty() {
+                    let msg = format!(
+                        "⚠ 终端太矮，导入面板未显示；ctrl+s 仍会按已勾选的 {} 条创建。i 收起面板可改用手填",
+                        form.import.checked_count()
+                    );
+                    extra
+                        .push(Line::from(Span::styled(truncate_to_width(&msg, inner.width as usize), p.fg(p.pending))));
+                }
                 (inner, None)
             }
         }
@@ -1371,10 +1470,23 @@ fn place_form_cursor(frame: &mut Frame, form: &crate::app::FormState, inner: Rec
     }
     let Some(buf) = form_field_buf(form, form.field) else { return };
     let prefix: String = buf.text.chars().take(buf.cursor).collect();
-    let x = inner.x + form_value_x(inner.width) as u16 + display_width(&prefix) as u16;
-    let y = inner.y + current_idx as u16;
-    if x < popup.right().saturating_sub(1) && y < inner.bottom() {
-        frame.set_cursor_position((x, y));
+    // A field value is unbounded typed text (or a config file someone edited by
+    // hand), so the cell offset is added in `usize`: a `u16` sum wraps around
+    // and would park the cursor in the middle of the popup.
+    let x = usize::from(inner.x) + form_value_x(inner.width) + display_width(&prefix);
+    let y = usize::from(inner.y) + current_idx;
+    if x < usize::from(popup.right().saturating_sub(1)) && y < usize::from(inner.bottom()) {
+        match (u16::try_from(x), u16::try_from(y)) {
+            (Ok(x), Ok(y)) => frame.set_cursor_position((x, y)),
+            _ => {
+                static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                warn_once(
+                    &SEEN,
+                    "ui.render_degraded",
+                    &[("what", &"form_cursor"), ("reason", &"cursor_overflow"), ("x", &x), ("y", &y)],
+                );
+            }
+        }
     }
 }
 
@@ -1494,12 +1606,22 @@ fn draw_host_dropdown(frame: &mut Frame, app: &App, picker: &HostPicker, inner: 
 
 fn draw_confirm(frame: &mut Frame, prompt: &str, area: Rect, hits: &mut HitMap) {
     let p = palette();
+    // Width of the prompt in cells, kept wide: a pasted name is unbounded, so
+    // `as u16` on the raw width could wrap a huge prompt into a tiny dialog.
+    let prompt_w = display_width(prompt) as u32;
     let min = 40u16.min(area.width);
     let max = 90u16.min(area.width);
-    let wanted = (display_width(prompt) as u16 + 8).clamp(min, max.max(min));
+    let wanted = prompt_w.saturating_add(8).min(u32::from(u16::MAX)) as u16;
+    let wanted = wanted.clamp(min, max.max(min));
     // Fit the dialog to its content: prompt may wrap onto two lines, plus a
     // blank line and the key row, plus the two border rows.
-    let prompt_rows = display_width(prompt).div_ceil(wanted.saturating_sub(4) as usize) as u16;
+    //
+    // The wrap budget drops below 1 on a terminal narrower than 5 columns
+    // (`wanted` is then `area.width` itself, and 4 cells go to the borders and
+    // the `⚠ ` marker) — `div_ceil` by that is a divide-by-zero panic, so it is
+    // floored to one cell and the row count is capped instead.
+    let wrap_w = wanted.saturating_sub(4).max(1) as u32;
+    let prompt_rows = prompt_w.div_ceil(wrap_w).min(u32::from(u16::MAX)) as u16;
     let popup = centered(area, wanted, (prompt_rows.max(1) + 4).min(area.height));
     // The riskiest click-through to allow: the dialog asks before a destructive
     // action, so a click meant for the dialog must never reach a table row.
@@ -1718,9 +1840,22 @@ fn draw_filter(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
         );
     }
 
-    let x = row.x + prefix_w + display_width(&app.filter) as u16;
-    if x < row.x + bar_w {
-        frame.set_cursor_position((x, row.y));
+    // The filter has no length cap, so its cell width is not bounded by u16:
+    // compute wide and let an off-screen cursor simply be skipped.
+    let x = usize::from(row.x) + usize::from(prefix_w) + display_width(&app.filter);
+    let bar_right = usize::from(row.x) + usize::from(bar_w);
+    if x < bar_right {
+        match u16::try_from(x) {
+            Ok(x) => frame.set_cursor_position((x, row.y)),
+            Err(_) => {
+                static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                warn_once(
+                    &SEEN,
+                    "ui.render_degraded",
+                    &[("what", &"filter_cursor"), ("reason", &"cursor_overflow"), ("x", &x)],
+                );
+            }
+        }
     }
 }
 
@@ -2090,6 +2225,137 @@ mod tests {
         assert!(text.contains("space"), "space hint missing:\n{text}");
         assert!(text.contains("启停"), "space description missing:\n{text}");
         assert!(!text.contains("spc"), "abbreviation should be gone:\n{text}");
+    }
+
+    /// Every overlay at a width the dialog cannot fit into.
+    ///
+    /// `draw_confirm` sized its content area from `wanted - 4`, and on a terminal
+    /// narrower than 5 columns `wanted == area.width` makes that budget 0 — so
+    /// the row count divided by zero and the TUI died mid-frame, leaving the
+    /// terminal in raw mode. Widths 1..=10 cover the whole broken band plus the
+    /// first widths that merely clip.
+    #[test]
+    fn confirm_overlay_renders_when_the_terminal_is_narrower_than_the_dialog() {
+        // One `App` for the whole matrix: building it loads a config file and
+        // allocates a temp dir, which dominates the runtime otherwise. Drawing
+        // only touches `hits` and the scroll offsets.
+        let mut app = app_with_tunnels(vec![sample(1, "api-dev", 8080)]);
+        app.overlay =
+            Overlay::Confirm { action: ConfirmAction::Delete(1), prompt: "确认删除「api-dev」？(y/N)".into() };
+        for w in 1u16..=10 {
+            for h in [1u16, 2, 3, 4, 5, 6, 7, 9, 12, 20, 45] {
+                let backend = TestBackend::new(w, h);
+                let mut term = Terminal::new(backend).unwrap();
+                term.draw(|f| draw(f, &mut app)).unwrap_or_else(|e| panic!("confirm at {w}x{h}: {e}"));
+            }
+        }
+    }
+
+    /// One frame per overlay across a sampled matrix of terminal sizes.
+    ///
+    /// The matrix is what turns "no size may panic" from a claim into a check:
+    /// every overlay is a different composition of `Layout::split`, cell
+    /// arithmetic and wrapping, and each has its own small-size cliff (a popup
+    /// taller than the frame, a zero-width inner area, a one-row body). Widths
+    /// 1..=12 are exhaustive because that is where the popups collapse, and the
+    /// wider samples straddle every column-selection threshold (64/88/110) plus
+    /// the title's progressive-disclosure cuts (46/84).
+    #[test]
+    fn every_overlay_renders_across_a_sampled_size_matrix() {
+        let widths: Vec<u16> =
+            (1u16..=12).chain([16, 20, 24, 30, 40, 46, 50, 60, 64, 70, 80, 84, 88, 100, 110, 120, 130, 140]).collect();
+        let heights = [1u16, 2, 3, 4, 5, 6, 7, 8, 10, 12, 16, 20, 24, 30, 36, 45];
+        let overlays = [
+            Overlay::None,
+            Overlay::Help,
+            Overlay::Form,
+            Overlay::Confirm { action: ConfirmAction::Delete(1), prompt: "确认删除「api-dev」？".into() },
+            Overlay::Detail(1),
+            Overlay::Filter,
+        ];
+        for ov in overlays {
+            let mut app = app_with_tunnels(vec![sample(1, "api-dev", 8080), sample(2, "db", 5432)]);
+            app.tunnels[0].status = TunnelStatus::Up { since: Instant::now() };
+            app.open_form_create(); // `Form` needs a state, and Detail needs a tunnel
+            for &w in &widths {
+                for &h in &heights {
+                    // Re-assigned every frame: drawing clamps scrolls and may
+                    // close nothing, but the overlay must be the one under test.
+                    app.overlay = ov.clone();
+                    let backend = TestBackend::new(w, h);
+                    let mut term = Terminal::new(backend).unwrap();
+                    term.draw(|f| draw(f, &mut app)).unwrap_or_else(|e| panic!("{ov:?} at {w}x{h}: {e}"));
+                }
+            }
+        }
+    }
+
+    /// A cell offset built from typed text must not wrap a `u16`.
+    ///
+    /// `name`/`ssh_host`/ports come straight out of `config.toml`, so a corrupt
+    /// or generated file can carry a 64K-character value. Editing such a field
+    /// put the cursor at `inner.x + FORM_VALUE_X + display_width(prefix)`, which
+    /// overflows u16 and panics in a debug build. The field value itself renders
+    /// truncated; only the cursor arithmetic was unguarded.
+    #[test]
+    fn a_huge_field_value_cannot_overflow_the_form_cursor() {
+        let mut app = app_with_tunnels(vec![sample(1, &"n".repeat(65_530), 8080)]);
+        app.open_form_edit();
+        if let Some(form) = app.form.as_mut() {
+            form.field = FormField::Name;
+            form.begin_edit();
+        }
+        let backend = TestBackend::new(120, 40);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw(f, &mut app)).expect("editing a 64K-character name must not panic");
+    }
+
+    /// Same class of failure on the filter line, whose text is typed and has no
+    /// length cap. The echo is truncated, but the cursor and the counters chip
+    /// both added the full display width in `u16`.
+    #[test]
+    fn a_huge_filter_cannot_overflow_the_counters_or_the_cursor() {
+        let mut app = app_with_tunnels(vec![sample(1, "api-dev", 8080)]);
+        app.filter = "x".repeat(65_530);
+        for overlay in [Overlay::None, Overlay::Filter] {
+            app.overlay = overlay.clone();
+            let backend = TestBackend::new(120, 30);
+            let mut term = Terminal::new(backend).unwrap();
+            term.draw(|f| draw(f, &mut app)).unwrap_or_else(|e| panic!("{overlay:?} with a long filter: {e}"));
+        }
+    }
+
+    /// `warn_once` must fire exactly once per process, not once per frame.
+    ///
+    /// The renderer runs at ~30 fps; a degradation that survives a resize would
+    /// otherwise fill the 2 MiB log and rotate the interesting history out. The
+    /// log call itself goes through `crate::logging::warn` (already covered by
+    /// the logging tests) — what is new here is the latch.
+    #[test]
+    fn warn_once_latches_so_a_per_frame_degradation_logs_once() {
+        let seen = std::sync::atomic::AtomicBool::new(false);
+        assert!(warn_once(&seen, "ui.render_degraded", &[("what", &"test")]), "first call must report");
+        for _ in 0..100 {
+            assert!(!warn_once(&seen, "ui.render_degraded", &[("what", &"test")]), "later calls must stay quiet");
+        }
+        // A fresh latch is per-site, so a second site still gets its own line.
+        let other = std::sync::atomic::AtomicBool::new(false);
+        assert!(warn_once(&other, "ui.render_degraded", &[("what", &"other")]));
+    }
+
+    /// `band` is the degradation path for a layout band that is not there.
+    ///
+    /// The renderer takes six bands out of one `Layout::split`; indexing them
+    /// directly would make a violated solver contract a mid-frame panic. A
+    /// missing band must instead come back as an empty rect (every `draw_*`
+    /// treats that as "nothing to draw").
+    #[test]
+    fn a_missing_layout_band_degrades_instead_of_panicking() {
+        let bands = [Rect { x: 0, y: 0, width: 10, height: 1 }];
+        assert_eq!(band(&bands, 0, "test"), Rect { x: 0, y: 0, width: 10, height: 1 });
+        for i in 1..=6 {
+            assert_eq!(band(&bands, i, "test"), Rect::default(), "band {i} must degrade to an empty rect");
+        }
     }
 
     #[test]
@@ -2634,6 +2900,25 @@ mod tests {
         }
         let text = render_to_text(&mut app, 120, 45);
         assert!(text.contains("监听:8"), "the column being typed into must echo the input:\n{text}");
+    }
+
+    #[test]
+    fn a_terminal_too_short_for_the_pane_says_the_batch_will_still_be_created() {
+        // The pane shrinks away on a short terminal, but `import_open` stays true
+        // and `submit_form` keys off it: `ctrl+s` creates the ticked rows even
+        // though not one of them is on screen. Silence there means creating
+        // tunnels the user cannot see, so the form has to say it.
+        let mut app = app_with_import(sample_forwards());
+        let text = render_to_text(&mut app, 100, 14);
+        assert!(!text.contains("从 ~/.ssh/config 导入转发"), "precondition: the pane does not fit:\n{text}");
+        assert!(text.contains("导入面板未显示"), "the invisible-batch state must be announced:\n{text}");
+        assert!(text.contains("ctrl+s"), "and it must say what ctrl+s will do:\n{text}");
+
+        // Collapsing the pane (which is what the message suggests) makes the
+        // warning moot: the form is back in charge and nothing is hidden.
+        app.close_import_pane();
+        let text = render_to_text(&mut app, 100, 14);
+        assert!(!text.contains("导入面板未显示"), "a collapsed pane has nothing hidden:\n{text}");
     }
 
     #[test]

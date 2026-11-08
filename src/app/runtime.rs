@@ -10,7 +10,7 @@
 use std::time::{Duration, Instant};
 
 use crate::app::log as eventlog;
-use crate::app::{App, ConfirmAction, RetryState, backoff};
+use crate::app::{App, ConfirmAction, MAX_EVENTS_PER_FRAME, RetryState, backoff, deadline_after};
 use crate::config;
 use crate::help;
 use crate::logging;
@@ -81,6 +81,7 @@ impl App {
         if let Err(e) = config::validate_tunnel(&cfg) {
             let info = FailureInfo::with_short(FailureKind::Unknown, "配置无效", e.to_string());
             eventlog::tunnel_start_rejected(&cfg, "validate", &info);
+            self.abandon_retry(&cfg, "validate", &info);
             self.set_state(id, TunnelStatus::Failed { reason: info });
             self.log(id, LogLevel::Error, help::bi(&format!("配置无效: {e}"), &format!("Invalid config: {e}")));
             // `e` comes from the config validator and is already bilingual-safe
@@ -101,6 +102,7 @@ impl App {
                 };
                 let info = FailureInfo::with_short(FailureKind::PortInUse, "本地端口被占用", detail.clone());
                 eventlog::tunnel_start_rejected(&cfg, "preflight_bind", &info);
+                self.abandon_retry(&cfg, "preflight_bind", &info);
                 self.set_state(id, TunnelStatus::Failed { reason: info });
                 self.log(id, LogLevel::Error, detail.clone());
                 self.set_status(StatusMsg::error(help::bi(
@@ -148,6 +150,7 @@ impl App {
                 let info = FailureInfo::with_short(FailureKind::AuthFailed, "无法解析 SSH 主机", format!("{e:#}"));
                 eventlog::host_resolve_failed(&cfg, &format!("{e:#}"));
                 eventlog::tunnel_start_rejected(&cfg, "resolve_endpoint", &info);
+                self.abandon_retry(&cfg, "resolve_endpoint", &info);
                 self.set_state(id, TunnelStatus::Failed { reason: info });
                 self.log(
                     id,
@@ -178,6 +181,7 @@ impl App {
                 let short: String = e.to_string().chars().take(28).collect();
                 let info = FailureInfo::with_short(FailureKind::SpawnFailed, short, format!("启动隧道失败: {e}"));
                 eventlog::tunnel_spawn_failed(&cfg, &e.to_string());
+                self.abandon_retry(&cfg, "spawn", &info);
                 self.set_state(id, TunnelStatus::Failed { reason: info });
                 self.log(
                     id,
@@ -191,6 +195,24 @@ impl App {
             }
         }
         self.persist_quietly();
+    }
+
+    /// Stop the automatic retry chain for a tunnel whose *retry* failed in a way
+    /// another attempt cannot fix.
+    ///
+    /// Without this the backoff loop keeps resurrecting the tunnel forever: each
+    /// `tick_retries` fires the due entry, `start_tunnel_with` refuses it at
+    /// validation/bind/resolve/spawn, and the next tick fires again — a reconnect
+    /// storm that writes a log line per attempt and never settles into `Failed`.
+    /// A first manual start has `attempt == 0`, so it does not count as giving up
+    /// and nothing is logged for it.
+    pub(crate) fn abandon_retry(&mut self, cfg: &crate::model::TunnelConfig, stage: &str, reason: &FailureInfo) {
+        let Some(attempt) = self.retry_state.remove(&cfg.id).map(|r| r.attempt) else {
+            return;
+        };
+        if attempt >= 1 {
+            eventlog::tunnel_retry_abandoned(cfg, attempt, stage, reason);
+        }
     }
 
     /// Stop one tunnel and clear its `enabled` flag (user intent).
@@ -242,9 +264,20 @@ impl App {
         }
     }
 
-    /// Drain supervisor events. Called once per UI frame — never blocks.
+    /// Drain supervisor events. Called once per UI frame — never blocks, and
+    /// never drains without a bound.
+    ///
+    /// The per-frame budget matters: the channel is fed by one reader thread per
+    /// tunnel, and a verbose one (a reconnect loop writing a line per attempt, a
+    /// `-v` ssh option the user added) can keep the queue non-empty forever. An
+    /// unbounded `while let` would then never return, so the frame would never
+    /// render, no key would be read, and the TUI would look frozen while it was
+    /// actually busy. Whatever is left stays queued for the next frame.
     pub fn drain_events(&mut self) {
-        while let Ok(ev) = self.event_rx.try_recv() {
+        for _ in 0..MAX_EVENTS_PER_FRAME {
+            let Ok(ev) = self.event_rx.try_recv() else {
+                break;
+            };
             match ev {
                 TunnelEvent::Ready { id } => self.on_ready(id),
                 TunnelEvent::Line { id, line } => self.on_line(id, line),
@@ -394,9 +427,12 @@ impl App {
             && retryable
             && let Some(entry) = self.retry_state.get_mut(&id)
         {
-            entry.attempt += 1;
+            entry.attempt = entry.attempt.saturating_add(1);
             let delay = backoff(entry.attempt, self.cfg.defaults.retry_initial_secs, self.cfg.defaults.retry_max_secs);
-            entry.next_at = Instant::now() + delay;
+            // `Instant + Duration` panics on overflow; the delay is capped by
+            // `backoff`, but the addition is still done through `checked_add` so
+            // an extreme `retry_max_secs` cannot abort the process.
+            entry.next_at = deadline_after(Instant::now(), delay);
             let (attempt, next_at) = (entry.attempt, entry.next_at);
             // The classified cause of a *drop* is not a failure the user must
             // act on: recording it at warn with the scheduled delay is what tells
@@ -429,7 +465,7 @@ impl App {
             let attempt = self.retry_state.get(&id).map(|r| r.attempt).unwrap_or(1);
             let delay = backoff(attempt, self.cfg.defaults.retry_initial_secs, self.cfg.defaults.retry_max_secs);
             if let Some(r) = self.retry_state.get_mut(&id) {
-                r.next_at = now + delay;
+                r.next_at = deadline_after(now, delay);
             }
             self.log(
                 id,
@@ -447,5 +483,173 @@ impl App {
     /// it to `attempt >= 1` with a real backoff deadline.
     pub(crate) fn arm_retry(&mut self, id: TunnelId) {
         self.retry_state.entry(id).or_insert(RetryState { attempt: 0, next_at: Instant::now() });
+    }
+}
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+    use crate::config::{ConfigFile, Paths};
+    use crate::model::TunnelConfig;
+
+    fn tunnel(id: TunnelId, name: &str, port: u16) -> TunnelConfig {
+        TunnelConfig {
+            id,
+            name: name.into(),
+            kind: ForwardKind::Local,
+            ssh_host: "testhost".into(),
+            local_addr: "127.0.0.1".into(),
+            local_port: port,
+            remote_host: "127.0.0.1".into(),
+            remote_port: 22,
+            enabled: false,
+            auto_restart: false,
+            ssh_options: vec![],
+            note: String::new(),
+            created_at: 1,
+        }
+    }
+
+    fn app_with(tunnels: Vec<TunnelConfig>) -> (tempfile::TempDir, App) {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths { config: dir.path().join("config.toml"), state: dir.path().join("state.toml") };
+        let cfg = ConfigFile { tunnels, ..ConfigFile::default() };
+        crate::config::save(&paths.config, &cfg).unwrap();
+        (dir, App::new(paths))
+    }
+
+    /// Arm a retry that is already due, as `on_exit` would after a real drop.
+    fn arm_due_retry(app: &mut App, id: TunnelId, attempt: u32) {
+        app.retry_state.insert(id, RetryState { attempt, next_at: Instant::now() - Duration::from_secs(1) });
+    }
+
+    #[test]
+    fn a_retry_chain_stops_when_the_attempt_cannot_succeed() {
+        // The stall this pins: an invalid definition kept being rescheduled.
+        // `tick_retries` fired the due entry, `start_tunnel_with` refused it at
+        // validation, `on_exit` re-armed the retry, and the loop ran forever —
+        // a log line per frame, a permanently `Failed`/`Retrying` row, and no
+        // way for the user to tell it had given up.
+        let (_d, mut app) = app_with(vec![tunnel(1, "broken", 18001)]);
+        app.cfg.defaults.auto_restart = true;
+        {
+            // A definition that can never validate: no listen port.
+            let v = app.tunnels.iter_mut().find(|t| t.cfg.id == 1).unwrap();
+            v.cfg.local_port = 0;
+            v.cfg.ssh_host = String::new();
+        }
+        app.set_state(1, TunnelStatus::Starting { since: Instant::now() });
+        arm_due_retry(&mut app, 1, 3);
+
+        app.tick_retries();
+
+        assert!(matches!(app.tunnels[0].status, TunnelStatus::Failed { .. }), "{:?}", app.tunnels[0].status);
+        assert_eq!(app.retry_state.get(&1).map(|r| r.attempt), None, "the retry chain must be dropped");
+        // A second tick must not resurrect it.
+        app.tick_retries();
+        assert!(matches!(app.tunnels[0].status, TunnelStatus::Failed { .. }));
+        assert!(app.retry_state.is_empty());
+    }
+
+    #[test]
+    fn a_manual_start_that_cannot_succeed_does_not_create_a_retry_entry() {
+        // `attempt == 0` is a first attempt, not a giving-up: it must leave no
+        // retry bookkeeping behind either.
+        let (_d, mut app) = app_with(vec![tunnel(1, "broken", 18001)]);
+        {
+            let v = app.tunnels.iter_mut().find(|t| t.cfg.id == 1).unwrap();
+            v.cfg.ssh_host = String::new();
+        }
+        app.start_tunnel(1);
+        assert!(matches!(app.tunnels[0].status, TunnelStatus::Failed { .. }));
+        assert_eq!(app.retry_state.get(&1).map(|r| r.attempt), None);
+    }
+
+    #[test]
+    fn a_retry_that_still_fails_keeps_its_attempt_count_bounded() {
+        // Even while retries *do* reach the spawn stage, the attempt counter is
+        // saturating: `on_exit` increments it once per failure and never resets
+        // it while the tunnel keeps flapping.
+        let (_d, mut app) = app_with(vec![tunnel(1, "flap", 18002)]);
+        app.cfg.defaults.auto_restart = true;
+        app.arm_retry(1);
+        app.set_state(1, TunnelStatus::Starting { since: Instant::now() });
+        app.on_exit(1, Some(255));
+        // Force the counter near the top and make sure the schedule is sane.
+        if let Some(r) = app.retry_state.get_mut(&1) {
+            r.attempt = u32::MAX;
+        }
+        app.set_state(1, TunnelStatus::Starting { since: Instant::now() });
+        app.on_exit(1, Some(255));
+        let attempt = app.retry_state.get(&1).map(|r| r.attempt).unwrap_or(0);
+        assert_eq!(attempt, u32::MAX, "the counter must saturate, not overflow");
+        if let TunnelStatus::Retrying { next_at, .. } = app.tunnels[0].status {
+            assert!(next_at > Instant::now(), "a saturated attempt still schedules a real delay");
+        }
+    }
+
+    #[test]
+    fn drain_events_is_bounded_per_frame() {
+        // A reader thread that never stops producing must not starve the frame
+        // loop. Send more events than the budget and check the rest survive.
+        let (_d, mut app) = app_with(vec![tunnel(1, "chatty", 18003)]);
+        let overflow = 500;
+        for _ in 0..(MAX_EVENTS_PER_FRAME + overflow) {
+            app.event_tx.send(crate::tunnel::TunnelEvent::Line { id: 1, line: "debug1: x".into() }).unwrap();
+        }
+        app.drain_events();
+        let mut left = 0;
+        while app.event_rx.try_recv().is_ok() {
+            left += 1;
+        }
+        assert_eq!(left, overflow, "one frame consumes exactly its budget and queues the rest");
+    }
+
+    #[test]
+    fn tick_retries_is_a_no_op_when_auto_restart_is_off() {
+        let (_d, mut app) = app_with(vec![tunnel(1, "a", 18004)]);
+        app.cfg.defaults.auto_restart = false;
+        arm_due_retry(&mut app, 1, 5);
+        app.tick_retries();
+        assert_eq!(app.retry_state.get(&1).map(|r| r.attempt), Some(5), "the entry must be left untouched");
+        assert!(matches!(app.tunnels[0].status, TunnelStatus::Stopped));
+    }
+
+    #[test]
+    fn events_for_unknown_tunnels_are_ignored() {
+        // A deleted tunnel's reader thread can still deliver; nothing may panic
+        // or create state for it.
+        let (_d, mut app) = app_with(vec![]);
+        for ev in [
+            crate::tunnel::TunnelEvent::Ready { id: 42 },
+            crate::tunnel::TunnelEvent::Line { id: 42, line: "x".into() },
+            crate::tunnel::TunnelEvent::SpawnFailed { id: 42, error: "boom".into() },
+            crate::tunnel::TunnelEvent::StderrClosed { id: 42 },
+        ] {
+            app.event_tx.send(ev).unwrap();
+        }
+        app.drain_events();
+        assert!(app.tunnels.is_empty());
+        assert!(app.retry_state.is_empty());
+    }
+
+    #[test]
+    fn flush_pending_exits_never_drops_the_exit_code() {
+        let (_d, mut app) = app_with(vec![tunnel(1, "a", 18005)]);
+        app.set_state(1, TunnelStatus::Starting { since: Instant::now() });
+        app.pending_exit.insert(1, (Some(7), Instant::now() - Duration::from_secs(2)));
+        app.flush_pending_exits();
+        assert!(app.pending_exit.is_empty(), "the deferred exit must be consumed");
+        assert!(matches!(app.tunnels[0].status, TunnelStatus::Failed { .. }));
+    }
+
+    #[test]
+    fn an_orphan_exit_is_recorded_and_dropped() {
+        // `pending_reason` for an id with no view must not leak into the map.
+        let (_d, mut app) = app_with(vec![]);
+        app.pending_reason.insert(9, Some(FailureInfo::new(FailureKind::Timeout, "t")));
+        app.pending_exit.insert(9, (Some(1), Instant::now() - Duration::from_secs(2)));
+        app.flush_pending_exits();
+        assert!(!app.pending_reason.contains_key(&9), "the reason must be consumed with the exit");
     }
 }

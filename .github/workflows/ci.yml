@@ -68,14 +68,15 @@ jobs:
       # `tests/logging.rs` had been silently unrun since it was added, and the
       # help-coverage test would have joined it.
       #
-      # Both are pure-Rust and platform-guarded where they are not (the logging
-      # suite wraps its permission and signal assertions in `#[cfg(unix)]`), so
-      # they run on every OS in the matrix rather than being Linux-only.
+      # All of these are pure-Rust and platform-guarded where they are not (the
+      # logging and panic-hardening suites wrap their permission/signal/exit-status
+      # assertions in `#[cfg(unix)]`), so they run on every OS in the matrix
+      # rather than being Linux-only.
       # `tests/e2e.rs` is excluded on purpose: it needs a real `sshd` and has its
       # own job below (it is `#[ignore]`d, so it would otherwise pass trivially
       # here while covering nothing).
       - name: Integration tests
-        run: cargo test --test help_coverage --test logging
+        run: cargo test --test help_coverage --test logging --test panic_hardening
 
       - name: Build (release)
         run: cargo build --release
@@ -96,6 +97,32 @@ jobs:
           name: sshpf-linux-x86_64
           path: target/release/sshpf
           if-no-files-found: error
+
+  # The crash-path and input-hardening suites run the **real binary** (and one of
+  # them deliberately kills a child with SIGSEGV), which needs a Unix process
+  # model. They were previously not wired into CI at all — `--lib` skips
+  # `tests/*.rs`, so a regression in the panic hook or in the signal handler
+  # could only be found by hand. User-supplied input (a hand-edited ssh config or
+  # state file) is exactly what these cover, so they are a required check now.
+  hardening:
+    name: Panic hardening (real binary)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+
+      # `--test-threads=1`: the crash tests fork deliberate aborters and assert on
+      # per-process env (`SSHPF_LOG_DIR`), so they must not overlap.
+      - name: Crash-path and log tests
+        run: cargo test --test logging -- --test-threads=1
+
+      - name: Input hardening (hostile ssh config / config.toml)
+        run: cargo test --test panic_hardening -- --test-threads=1
 
   # The end-to-end test starts a throw-away sshd on loopback. It is `#[ignore]`d
   # by default because it needs a working OpenSSH server and a usable key, so it
