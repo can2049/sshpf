@@ -895,15 +895,19 @@ const HELP_NOTE_INDENT: usize = 2;
 /// Width of the key column, measured from the catalog.
 ///
 /// It must be **measured, not guessed**: a hard-coded 12 was narrower than
-/// `g / G / home / end` (18 cells) and `J / K / shift+↓ / shift+↑` (25 cells,
-/// Measured with [`display_width`], never counted by hand: eyeballing a binding
-/// gets it wrong (this doc first claimed the longest one was 21 cells; it is 25,
-/// and every arrow glyph is single width, so the error was pure miscounting, not
-/// a width subtlety). Since `pad_to_width` pads but never truncates, those rows
-/// ran straight into their description with no gap — `g / G / home /
-/// end跳到首行`. Measuring the catalog keeps every row aligned and can never
-/// collide with the next column, and the [`HELP_KEY_MAX`] / half-the-row caps
-/// keep a single long binding from eating the entire line.
+/// `g / G / home / end` (18 cells) and `J / K / shift+↓ / shift+↑` (25 cells).
+/// Since `pad_to_width` pads but never truncates, those rows ran straight into
+/// their description with no gap — `g / G / home / end跳到首行`.
+///
+/// Both widths come from [`display_width`], never from counting by hand: this
+/// doc first claimed the longest binding was 21 cells when it is 25. Every arrow
+/// glyph is single width, so that was pure miscounting rather than a width
+/// subtlety — and a wrong *number* in a comment is harmless once measured, while
+/// a wrong *explanation* passes silently into the next reader's assumptions.
+///
+/// Measuring the catalog keeps every row aligned and can never collide with the
+/// next column, and the [`HELP_KEY_MAX`] / half-the-row caps keep a single long
+/// binding from eating the entire line.
 fn help_key_col(width: usize) -> usize {
     if width < 4 {
         return 0;
