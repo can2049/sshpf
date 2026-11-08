@@ -314,3 +314,222 @@ fn no_record_contains_a_newline_so_the_file_stays_parseable() {
     assert_eq!(log.lines().count(), 1, "one record, escaped: {log}");
     assert!(log.contains("line1\\nline2\\r\\nline3\\tend"), "{log}");
 }
+
+// ---------------------------------------------------------------------------
+// panic hardening: the failures the process used to die from
+// ---------------------------------------------------------------------------
+
+/// Run the real binary with **no terminal at all**: stdout/stderr redirected to
+/// files and stdin from `/dev/null`. `ratatui::init()` used to panic here
+/// ("failed to initialize terminal") and exit 101; `try_init()` reports it as an
+/// `io::Error` instead, so the existing `app.fatal` path runs and the exit code is
+/// a normal failure.
+///
+/// This is a real user scenario, not a synthetic one: `sshpf` inside a CI step,
+/// in `ssh host sshpf` without `-t`, or with stdin redirected all hit it.
+#[cfg(unix)]
+#[test]
+fn starting_without_a_terminal_reports_instead_of_panicking() {
+    use std::process::Stdio;
+
+    let dir = tempfile::tempdir().unwrap();
+    // A regular file standing in for the terminal: not a tty, which is the point.
+    let out_path = dir.path().join("stdout.txt");
+    let err_path = dir.path().join("stderr.txt");
+    let out_file = std::fs::File::create(&out_path).unwrap();
+    let err_file = std::fs::File::create(&err_path).unwrap();
+
+    let status = Command::new(bin())
+        .env("SSHPF_LOG_DIR", dir.path())
+        .env("SSHPF_CONFIG", dir.path().join("config.toml"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(out_file))
+        .stderr(Stdio::from(err_file))
+        .status()
+        .unwrap();
+
+    // 101 is the Rust panic exit code: the bug was exactly that this looked like
+    // a crash instead of an environment problem.
+    assert_ne!(status.code(), Some(101), "must not die from a panic: {status:?}");
+    assert_eq!(status.code(), Some(1), "a missing terminal is a normal failure: {status:?}");
+
+    let log = read(&dir.path().join("sshpf.log"));
+    let fatal = log.lines().find(|l| l.contains("event=app.fatal")).unwrap_or_else(|| panic!("no app.fatal: {log}"));
+    assert!(fatal.contains(" ERROR "), "a failed start is an error: {fatal}");
+    assert!(fatal.contains("stage=tui"), "the stage field says where it failed: {fatal}");
+    assert!(!log.contains("event=crash.panic"), "no panic should have happened: {log}");
+
+    // The user still gets a message, just not the TUI.
+    let stderr = read(&err_path);
+    assert!(stderr.contains("错误"), "the reason must reach stderr: {stderr:?}");
+    // Nothing was drawn, so stdout must not carry escape sequences.
+    let stdout = read(&out_path);
+    assert!(!stdout.contains('\u{1b}'), "no terminal was taken over, so no escapes: {stdout:?}");
+}
+
+/// The non-TUI modes must not touch the terminal at all, with or without a tty —
+/// which is why they keep working in the same headless setting.
+#[cfg(unix)]
+#[test]
+fn headless_check_and_list_hosts_modes_still_work() {
+    use std::process::Stdio;
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    std::fs::write(&config, "").unwrap();
+    // A Chinese value on a *directive* line, so byte 5 of the trimmed line lands
+    // inside `中`: this is the exact shape that panicked `strip_match_blocks`.
+    // ssh2-config accepts the line as an unknown field, so it parses once the
+    // slicing bug is fixed — which is what makes it a real end-to-end case.
+    let ssh_config = dir.path().join("ssh_config");
+    std::fs::write(&ssh_config, "Foo 中文\nHost demo\n  HostName 10.0.0.1\n").unwrap();
+
+    for mode in ["--check", "--list-hosts"] {
+        let out = Command::new(bin())
+            .env("SSHPF_LOG_DIR", dir.path())
+            .env("SSHPF_CONFIG", &config)
+            .env("SSHPF_SSH_CONFIG", &ssh_config)
+            .arg(mode)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "{mode} failed: {out:?}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(!stdout.contains('\u{1b}'), "{mode} must not emit terminal escapes: {stdout:?}");
+    }
+
+    // And the multi-byte host really was listed (the panic fix is end-to-end).
+    let listed = Command::new(bin())
+        .env("SSHPF_LOG_DIR", dir.path())
+        .env("SSHPF_CONFIG", &config)
+        .env("SSHPF_SSH_CONFIG", &ssh_config)
+        .arg("--list-hosts")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&listed.stdout);
+    assert!(stdout.contains("demo"), "the host must be listed: {stdout:?}");
+}
+
+/// A non-UTF-8 command-line argument used to panic inside `std::env::args`.
+#[cfg(unix)]
+#[test]
+fn a_non_utf8_argument_is_a_usage_error_not_a_panic() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+    use std::process::Stdio;
+
+    let dir = tempfile::tempdir().unwrap();
+    let out = Command::new(bin())
+        .env("SSHPF_LOG_DIR", dir.path())
+        .env("SSHPF_CONFIG", dir.path().join("config.toml"))
+        .arg(OsString::from_vec(b"--\xff".to_vec()))
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "a bad flag exits 2, not 101: {out:?}");
+    let log = read(&dir.path().join("sshpf.log"));
+    assert!(log.contains("event=cli.bad_args"), "{log}");
+    assert!(!log.contains("event=crash.panic"), "{log}");
+}
+
+/// `sshpf --list-hosts > /dev/full` used to panic in `println!` ("failed printing
+/// to stdout"), because `print!` and its family abort on a write error. Writing
+/// through an explicit handle turns that into a recorded warning.
+#[cfg(unix)]
+#[test]
+fn a_failing_stdout_does_not_panic_the_cli() {
+    use std::process::Stdio;
+    // `/dev/full` is Linux-specific; other unixes use a closed pipe instead.
+    let sink = "/dev/full";
+    if !std::path::Path::new(sink).exists() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let full = std::fs::OpenOptions::new().write(true).open(sink).unwrap();
+    let out = Command::new(bin())
+        .env("SSHPF_LOG_DIR", dir.path())
+        .env("SSHPF_CONFIG", dir.path().join("config.toml"))
+        .env("SSHPF_SSH_CONFIG", dir.path().join("no-such-config"))
+        .arg("--list-hosts")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(full))
+        .output()
+        .unwrap();
+    assert_ne!(out.status.code(), Some(101), "a full disk must not panic: {out:?}");
+    assert!(out.status.success(), "the listing itself succeeded: {out:?}");
+    let log = read(&dir.path().join("sshpf.log"));
+    assert!(log.contains("event=cli.stdout_failed"), "the write failure must be recorded: {log}");
+}
+
+/// A deliberate panic while the log lock is held must not deadlock the process.
+///
+/// The child installs the real hooks, makes `record` panic mid-write (via a
+/// `Display` that panics), and the hook then tries to record again on the same
+/// thread. Without the re-entrancy guard that second `lock()` never returns:
+/// the child would hang forever, which the parent detects as a timeout.
+#[test]
+fn a_panic_inside_the_log_writer_does_not_deadlock_the_child() {
+    use std::time::{Duration, Instant};
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["reentrant_writer_helper", "--exact", "--nocapture", "--test-threads=1"])
+        .env(REENTRANT_ENV, "1")
+        .env("SSHPF_LOG_DIR", dir.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the child deadlocked on the log mutex instead of unwinding");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(!status.success(), "the child must die from the deliberate panic");
+
+    let log = read(&dir.path().join("sshpf.log"));
+    // The hook's *normal* record is skipped — it could not take the lock — but the
+    // degraded path still leaves one line through the pre-`dup`ed descriptor, so a
+    // user who reports "it hung" also gets "why" in the file.
+    assert!(log.contains("event=test.before_panic"), "records before the panic survive: {log}");
+    assert!(
+        log.contains("event=crash.log_reentrant"),
+        "the re-entrancy fallback must still leave a line in the log: {log}"
+    );
+    assert!(log.contains("cause=crash.panic"), "and say which record was skipped: {log}");
+}
+
+const REENTRANT_ENV: &str = "SSHPF_TEST_REENTRANT_WRITER";
+
+/// Re-executed as a child to make `record` panic while it holds the lock.
+#[test]
+fn reentrant_writer_helper() {
+    if std::env::var_os(REENTRANT_ENV).is_none() {
+        return;
+    }
+    /// A `Display` that panics, i.e. a caller-supplied value formatted under the
+    /// log lock.
+    struct Boom;
+    impl std::fmt::Display for Boom {
+        fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            panic!("display exploded while the log lock was held");
+        }
+    }
+
+    let dir = PathBuf::from(std::env::var("SSHPF_LOG_DIR").unwrap());
+    let _ = logging::init(logging::Config { dir, ..logging::Config::default() });
+    logging::install_crash_hooks();
+    logging::info("test.before_panic", &[]);
+    logging::info("test.boom", &[("v", &Boom)]);
+    // Reached only if the panic above did not propagate (it always does).
+    std::process::exit(0);
+}

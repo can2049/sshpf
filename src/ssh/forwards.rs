@@ -50,17 +50,28 @@ use super::config::{default_config_paths, strip_match_blocks};
 /// the UI thread.
 const MAX_INCLUDE_DEPTH: usize = 8;
 
+/// Cap on queued `Include` targets.
+///
+/// The depth guard stops a *cycle*, but a single file may name thousands of
+/// includes (a generated `config.d`), and every one is pushed before the depth
+/// check runs. The cap bounds the queue instead of the processing: running out
+/// means "we stopped reading this config", which is worth recording, not worth
+/// allocating unboundedly for.
+const MAX_PENDING_INCLUDES: usize = 256;
+
 /// Read every forwarding directive that applies to `alias`.
 ///
 /// The result is in file order (matching block order, then line order inside a
 /// block), de-duplicated by [`SshForward::key`].
 pub fn forwards_for_host(alias: &str) -> Result<Vec<SshForward>> {
-    let paths = default_config_paths();
-    if paths.is_empty() {
+    // `first()` rather than `paths[0]`: the emptiness check makes the index safe
+    // today, but this parses user-supplied files and the index would be a panic if
+    // the check ever moved.
+    let Some(main) = default_config_paths().first().cloned() else {
         return Ok(Vec::new());
-    }
+    };
     let mut found = Vec::new();
-    let mut stack = vec![paths[0].clone()];
+    let mut stack = vec![main];
     let mut depth = 0;
     let mut seen_files: Vec<PathBuf> = Vec::new();
     while let Some(path) = stack.pop() {
@@ -134,6 +145,13 @@ fn scan_config(
             "include" => {
                 for pat in shell_words(rest) {
                     for p in expand_include(&pat, base) {
+                        if stack.len() >= MAX_PENDING_INCLUDES {
+                            crate::logging::warn(
+                                "sshconfig.include_capped",
+                                &[("max", &MAX_PENDING_INCLUDES), ("msg", &"Include 数量超过上限，剩余文件未读取")],
+                            );
+                            continue;
+                        }
                         stack.push(p);
                     }
                 }

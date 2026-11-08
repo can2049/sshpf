@@ -202,7 +202,11 @@ fn b64_decode(s: &str) -> Result<Vec<u8>, ()> {
     for (i, &c) in TABLE.iter().enumerate() {
         rev[c as usize] = i as u8;
     }
-    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    // `saturating_mul`: a base64 field longer than `usize::MAX / 3` would overflow
+    // here, and this parser runs on a user-supplied file. Capacity is only an
+    // optimisation — the decoder itself stops on the first invalid byte — so
+    // capping it also keeps a hostile 100 MB line from pre-allocating 75 MB.
+    let mut out = Vec::with_capacity(s.len().saturating_mul(3) / 4);
     let mut acc: u32 = 0;
     let mut bits = 0u32;
     for c in s.bytes() {

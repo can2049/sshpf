@@ -111,12 +111,47 @@ impl ConfigFile {
                 return candidate;
             }
         }
-        format!("{base}-{}", self.max_id() + 1)
+        // Suffix with a free id rather than `max_id() + 1`: that addition
+        // overflows for a hand-edited `id = 18446744073709551615`, and panics in
+        // the debug/CI profile. `next_id` never overflows, so neither do we.
+        format!("{base}-{}", self.next_id())
     }
 
     /// First identifier not used.
+    ///
+    /// Normally `max_id() + 1`, so ids keep growing and never reuse a deleted
+    /// tunnel's id. The addition is *saturating* and the result is checked for
+    /// collisions: a hand-edited config can legitimately contain `u64::MAX`
+    /// (the config is a text file the user is allowed to edit), and a bare `+ 1`
+    /// there panics with "attempt to add with overflow" the first time a tunnel
+    /// is created. Falling back to the lowest free id keeps allocation total.
     pub fn next_id(&self) -> TunnelId {
-        self.max_id() + 1
+        let next = self.max_id().saturating_add(1);
+        // `next == 0` only happens for the empty config, where `max_id()` is 0
+        // and the answer is 1; the collision check covers the exhausted-counters
+        // case where `max_id() == u64::MAX`.
+        if next != 0 && !self.tunnels.iter().any(|t| t.id == next) {
+            return next;
+        }
+        self.first_free_id()
+    }
+
+    /// Lowest id that no tunnel uses (there is always one: ids are unique).
+    ///
+    /// Bounded by the number of tunnels, so this cannot loop forever.
+    fn first_free_id(&self) -> TunnelId {
+        let taken = |id: TunnelId| self.tunnels.iter().any(|t| t.id == id);
+        // At most `len + 1` candidates and at most `len` of them are taken, so
+        // one always matches; the fallback is unreachable but must not panic.
+        let limit = self.tunnels.len() as u64;
+        let mut id = 1;
+        while id <= limit.saturating_add(1) {
+            if !taken(id) {
+                return id;
+            }
+            id += 1;
+        }
+        1
     }
 
     /// Validate cross-entry invariants. Returns human-readable problems.
@@ -640,6 +675,37 @@ mod tests {
         let cfg = ConfigFile::default();
         assert_eq!(cfg.max_id(), 0);
         assert_eq!(cfg.next_id(), 1, "the first tunnel gets id 1");
+    }
+
+    /// A hand-edited `id = 18446744073709551615` used to make `next_id()` panic
+    /// with "attempt to add with overflow" in the debug/CI profile, i.e. the
+    /// first tunnel the user created crashed the TUI.
+    #[test]
+    fn next_id_saturates_instead_of_panicking_on_max_id() {
+        let mut cfg = cfg_with(vec![tmp_cfg(u64::MAX, "maxed", 9000)]);
+        // Must not panic, and must hand back an id nothing else is using.
+        let id = cfg.next_id();
+        assert_ne!(id, u64::MAX, "the taken id must not be reissued");
+        assert!(cfg.find(id).is_none(), "next_id returned the taken id {id}");
+        // The config is still usable: allocate a few more and let the invariant
+        // (all distinct) carry the weight.
+        cfg.tunnels.push(tmp_cfg(id, "new", 9001));
+        let id2 = cfg.next_id();
+        assert!(id2 != id && cfg.find(id2).is_none(), "second allocation collided: {id2}");
+    }
+
+    /// `unique_name` called `max_id() + 1` directly, so it panicked on the same
+    /// config once a name was exhausted.
+    #[test]
+    fn unique_name_does_not_overflow_on_max_id() {
+        let mut cfg = cfg_with(vec![tmp_cfg(u64::MAX, "web", 9000)]);
+        // Exhaust the `base-2..base-999` candidates so the suffix path is taken.
+        for i in 2..1000u64 {
+            cfg.tunnels.push(tmp_cfg(i, &format!("web-{i}"), 9000 + (i as u16 % 1000)));
+        }
+        let name = cfg.unique_name("web", None);
+        assert!(name.starts_with("web-"), "unexpected fallback name {name:?}");
+        assert!(!cfg.tunnels.iter().any(|t| t.name == name), "fallback name {name:?} already taken");
     }
 
     #[test]

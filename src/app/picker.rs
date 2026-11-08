@@ -60,17 +60,26 @@ impl App {
     }
 
     /// Move the dropdown cursor, `delta` rows.
+    ///
+    /// Two hazards handled here, both from `delta` being a public `i32`:
+    /// `-delta` overflows for `i32::MIN` (panic in a debug build), and
+    /// `unsigned_abs()` of a huge delta is a loop that effectively never ends
+    /// because `down`/`up` are already clamped to the list. So the step count is
+    /// taken from `unsigned_abs` and the loop stops as soon as the cursor stops
+    /// moving — i.e. at either end of the list.
     pub fn picker_move(&mut self, delta: i32) {
         let Some(picker) = self.picker.as_mut() else {
             return;
         };
-        if delta > 0 {
-            for _ in 0..delta {
+        for _ in 0..delta.unsigned_abs() {
+            let before = picker.selected;
+            if delta > 0 {
                 picker.down(HOST_DROPDOWN_ROWS);
-            }
-        } else {
-            for _ in 0..-delta {
+            } else {
                 picker.up(HOST_DROPDOWN_ROWS);
+            }
+            if picker.selected == before {
+                break;
             }
         }
     }
@@ -104,5 +113,115 @@ impl App {
             form.revalidate();
         }
         self.close_host_picker();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{ConfigFile, Paths};
+    use crate::ssh::SshHost;
+
+    fn host(alias: &str) -> SshHost {
+        SshHost {
+            alias: alias.into(),
+            hostname: "1.1.1.1".into(),
+            user: None,
+            port: 22,
+            proxy_jump: Vec::new(),
+            identity_file: None,
+        }
+    }
+
+    fn app_with_picker(hosts: Vec<SshHost>) -> (tempfile::TempDir, App) {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths { config: dir.path().join("config.toml"), state: dir.path().join("state.toml") };
+        crate::config::save(&paths.config, &ConfigFile::default()).unwrap();
+        let mut app = App::new(paths);
+        app.hosts = hosts;
+        (dir, app)
+    }
+
+    #[test]
+    fn a_huge_delta_does_not_overflow_or_hang() {
+        // `picker_move` takes an `i32`; `-delta` overflows for `i32::MIN`
+        // (panic in debug builds), and a huge positive delta used to walk the
+        // cursor `delta` times even though `down` is already clamped.
+        let (_d, mut app) = app_with_picker((0..10).map(|i| host(&format!("h{i}"))).collect());
+        app.open_form_create();
+        app.open_host_picker();
+
+        app.picker_move(i32::MIN);
+        assert_eq!(app.picker.as_ref().unwrap().selected, 0, "moving up past the top clamps");
+
+        app.picker_move(i32::MAX);
+        assert_eq!(app.picker.as_ref().unwrap().selected, 9, "moving down past the end clamps");
+    }
+
+    #[test]
+    fn moving_the_picker_keeps_the_selection_inside_the_window() {
+        let (_d, mut app) = app_with_picker((0..40).map(|i| host(&format!("h{i:02}"))).collect());
+        app.open_form_create();
+        app.open_host_picker();
+        for _ in 0..30 {
+            app.picker_move(1);
+        }
+        let p = app.picker.as_ref().unwrap();
+        assert_eq!(p.selected, 30);
+        assert!(p.selected < p.scroll as usize + HOST_DROPDOWN_ROWS, "the row must be visible");
+        assert!(p.scroll as usize <= p.selected);
+    }
+
+    #[test]
+    fn a_filter_that_empties_the_list_leaves_a_usable_picker() {
+        // Accepting with no matches must close the dropdown, not index `hosts`
+        // with a stale match index.
+        let (_d, mut app) = app_with_picker(vec![host("alpha")]);
+        app.open_form_create();
+        app.open_host_picker();
+        for c in "zzzz-no-match".chars() {
+            app.picker_query_char(c);
+        }
+        assert!(app.picker.as_ref().unwrap().matches.is_empty());
+        app.picker_move(1);
+        app.picker_move(-1);
+        app.picker_accept();
+        assert!(!app.host_picker_open());
+        // The form must be untouched (no host was picked).
+        assert_eq!(app.form.as_ref().unwrap().ssh_host.value(), "");
+    }
+
+    #[test]
+    fn a_stale_match_index_cannot_reach_past_the_host_list() {
+        // `matches` holds indices into `hosts`. If `hosts` is reloaded smaller
+        // while a dropdown is open, the old indices must not index out of
+        // bounds; `picker_accept` must simply close.
+        let (_d, mut app) = app_with_picker((0..5).map(|i| host(&format!("h{i}"))).collect());
+        app.open_form_create();
+        app.open_host_picker();
+        // Reload a shorter list without refreshing the picker's matches.
+        app.hosts.truncate(1);
+        app.picker_accept();
+        assert!(!app.host_picker_open());
+    }
+
+    #[test]
+    fn opening_the_picker_with_no_hosts_is_harmless() {
+        let (_d, mut app) = app_with_picker(vec![]);
+        app.open_form_create();
+        app.open_host_picker();
+        assert!(app.picker.as_ref().unwrap().matches.is_empty());
+        assert_eq!(app.picker.as_ref().unwrap().selected, 0);
+        app.picker_accept();
+        assert!(!app.host_picker_open());
+    }
+
+    #[test]
+    fn refresh_picker_without_a_form_is_a_no_op() {
+        // `refresh_picker` reads `self.hosts` and `self.picker`; neither implies
+        // the other exists.
+        let (_d, mut app) = app_with_picker(vec![host("a")]);
+        app.refresh_picker(); // no picker at all
+        assert!(app.picker.is_none());
     }
 }

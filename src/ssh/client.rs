@@ -502,11 +502,17 @@ async fn connect(
 
     // Resolve every hop, then chain: each hop rides a direct-tcpip channel on
     // the previous connection.
-    let mut hops: Vec<Endpoint> = Vec::with_capacity(endpoint.proxy_jump.len() + 1);
+    //
+    // `proxy_jump` is non-empty here (checked above) and every alias is resolved
+    // with `?`, so the vector cannot be empty — but this is the one place that
+    // depends on two facts being true together, and a `first()` costs nothing.
+    let mut hops: Vec<Endpoint> = Vec::with_capacity(endpoint.proxy_jump.len().saturating_add(1));
     for alias in &endpoint.proxy_jump {
         hops.push(config::jump_endpoint(alias).with_context(|| format!("解析跳板机 {alias} 失败"))?);
     }
-    let first = hops[0].clone();
+    let Some(first) = hops.first().cloned() else {
+        bail!("ProxyJump 为空，无法确定第一跳");
+    };
     let stream = timeout_connect(&first.hostname, first.port, "连接跳板机").await?;
     let mut handle = session(stream, &first, opts, id, tx.clone(), None).await?;
 

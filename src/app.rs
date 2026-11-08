@@ -37,6 +37,28 @@ pub use form::{EditMode, FormState};
 /// (popup height) cannot drift apart.
 pub const HOST_DROPDOWN_ROWS: usize = 8;
 
+/// Shortest reconnect delay the app will honour, in seconds.
+///
+/// A zero backoff turns the retry loop into a per-frame reconnect storm: every
+/// tick sees `next_at <= now`, starts the tunnel again, and logs a retry. The
+/// value comes from a hand-editable `config.toml`, so it is input, not an
+/// invariant.
+pub const MIN_RETRY_SECS: u64 = 1;
+
+/// Longest reconnect delay the app will honour, in seconds (one day).
+///
+/// This is also what keeps `Instant::now() + delay` from overflowing: that
+/// addition panics on overflow, and `retry_max_secs` is user input.
+pub const MAX_RETRY_SECS: u64 = 24 * 60 * 60;
+
+/// How many supervisor events one frame will consume before returning to the UI.
+///
+/// The channel is fed by one reader thread per tunnel. A talkative one can keep
+/// it permanently non-empty, and an unbounded drain would then starve the frame
+/// loop — the UI would stop painting and reading keys while staying "busy".
+/// Events left over are handled on the next frame (~200 ms later).
+pub const MAX_EVENTS_PER_FRAME: usize = 4096;
+
 /// Which overlay (if any) currently captures keys.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Overlay {
@@ -141,7 +163,7 @@ pub struct App {
 
 impl App {
     pub fn new(paths: Paths) -> Self {
-        let cfg = match config::load(&paths.config) {
+        let mut cfg = match config::load(&paths.config) {
             Ok(cfg) => {
                 eventlog::config_loaded(&config::display_path(&paths.config), cfg.tunnels.len(), &[]);
                 cfg
@@ -154,6 +176,10 @@ impl App {
                 ConfigFile::default()
             }
         };
+        // `config.toml` is hand-editable, so its numeric fields are input rather
+        // than invariants. Clamp them once, here, instead of trusting them at
+        // every arithmetic site downstream.
+        sanitize_config(&mut cfg);
         let (event_tx, event_rx) = mpsc::channel();
         let tunnels = build_views(&cfg);
         App {
@@ -310,6 +336,21 @@ impl App {
     }
 
     // -- mutation ----------------------------------------------------------
+
+    /// Allocate the next free tunnel id, or `None` when the space is exhausted.
+    ///
+    /// `ConfigFile::next_id` is `max_id + 1`, which overflows (and panics in
+    /// debug builds) for a hand-edited `id = 18446744073709551615`. Callers get
+    /// `None` and refuse the action instead of reusing an id that already exists.
+    pub(crate) fn next_tunnel_id(&self) -> Option<TunnelId> {
+        match self.cfg.max_id().checked_add(1) {
+            Some(id) => Some(id),
+            None => {
+                eventlog::id_space_exhausted(self.cfg.max_id());
+                None
+            }
+        }
+    }
 
     /// Local ports already claimed by other managed tunnels.
     ///
@@ -513,10 +554,55 @@ fn build_views(cfg: &ConfigFile) -> Vec<TunnelView> {
         .collect()
 }
 
+/// Coerce hand-edited numeric defaults into the range the app can operate in.
+///
+/// Each field is clamped separately and any change is logged, so a config that
+/// was quietly repaired is discoverable afterwards (`retry_initial_secs = 0`
+/// would otherwise look like "sshpf reconnects in a tight loop for no reason").
+fn sanitize_config(cfg: &mut ConfigFile) {
+    let defaults = &mut cfg.defaults;
+    let initial = defaults.retry_initial_secs.clamp(MIN_RETRY_SECS, MAX_RETRY_SECS);
+    if initial != defaults.retry_initial_secs {
+        eventlog::config_defaults_clamped("retry_initial_secs", defaults.retry_initial_secs, initial);
+        defaults.retry_initial_secs = initial;
+    }
+    let max = defaults.retry_max_secs.clamp(MIN_RETRY_SECS, MAX_RETRY_SECS);
+    if max != defaults.retry_max_secs {
+        eventlog::config_defaults_clamped("retry_max_secs", defaults.retry_max_secs, max);
+        defaults.retry_max_secs = max;
+    }
+    // `backoff` takes `max_secs.max(initial)` so an inverted pair is survivable,
+    // but the cap should still be the larger of the two by the time it is used.
+    if defaults.retry_max_secs < defaults.retry_initial_secs {
+        let raised = defaults.retry_initial_secs;
+        eventlog::config_defaults_clamped("retry_max_secs", defaults.retry_max_secs, raised);
+        defaults.retry_max_secs = raised;
+    }
+}
+
+/// Add `delay` to `now` without the panic `Instant + Duration` raises on
+/// overflow.
+///
+/// `retry_max_secs` comes from a config file, and `Instant::checked_add` is the
+/// only add that reports the overflow instead of aborting the process.
+pub(crate) fn deadline_after(now: Instant, delay: Duration) -> Instant {
+    match now.checked_add(delay) {
+        Some(at) => at,
+        None => now + Duration::from_secs(MIN_RETRY_SECS),
+    }
+}
+
 /// Exponential backoff: 2s, 4s, 8s … capped at `max_secs`.
+///
+/// Both numbers come from a hand-editable config file, so neither the shift nor
+/// the multiply may overflow (`saturating_*`), and the cap is normalised rather
+/// than `clamp`ed: `clamp` panics when `min > max`, which is exactly what an
+/// `initial > MAX_RETRY_SECS` config would hand it.
 pub fn backoff(attempt: u32, initial: u64, max_secs: u64) -> Duration {
+    let initial = initial.clamp(MIN_RETRY_SECS, MAX_RETRY_SECS);
+    let cap = max_secs.clamp(initial, MAX_RETRY_SECS);
     let shift = attempt.saturating_sub(1).min(20);
-    let secs = initial.saturating_mul(1u64 << shift).min(max_secs.max(initial));
+    let secs = initial.saturating_mul(1u64 << shift).min(cap);
     Duration::from_secs(secs)
 }
 
@@ -1387,5 +1473,126 @@ mod tests {
         }
         assert_eq!(app.running_count(), 0);
         drop(listener);
+    }
+
+    // -- panic hardening: arithmetic on config-supplied numbers -------------
+
+    #[test]
+    fn a_zero_retry_interval_is_clamped_instead_of_spinning() {
+        // `retry_initial_secs = 0` in a hand-edited config made `backoff` return
+        // `Duration::ZERO`, so every 200 ms tick re-fired the retry — a
+        // reconnect storm with a log line per attempt. The clamp is what stops
+        // it, and it is logged so the user can find out their file was changed.
+        assert_eq!(backoff(0, 0, 30).as_secs(), 1, "a zero interval must not collapse the delay");
+        assert!(backoff(99, 0, 30).as_secs() >= 1);
+        // A zero *ceiling* must not fall below the interval either.
+        assert_eq!(backoff(1, 2, 0).as_secs(), 2);
+        assert_eq!(backoff(10, 2, 0).as_secs(), 2, "the ceiling never undercuts the first delay");
+    }
+
+    #[test]
+    fn backoff_saturates_for_absurd_attempt_counts() {
+        // `attempt` grows once per failed reconnect and is never reset while a
+        // tunnel keeps flapping; the shift is capped, so the multiplication
+        // cannot overflow and the delay stays at the ceiling.
+        for attempt in [u32::MAX, u32::MAX - 1, 1_000_000] {
+            let d = backoff(attempt, 2, 30);
+            assert_eq!(d.as_secs(), 30, "attempt {attempt} must land on the cap");
+        }
+    }
+
+    #[test]
+    fn backoff_never_exceeds_the_configured_ceiling() {
+        for (initial, cap) in [(2u64, 30u64), (1, 1), (5, 3600), (u64::MAX, u64::MAX)] {
+            let d = backoff(20, initial, cap);
+            assert!(d.as_secs() <= cap.max(initial).min(MAX_RETRY_SECS), "initial={initial} cap={cap} -> {d:?}");
+        }
+    }
+
+    #[test]
+    fn an_out_of_range_retry_default_is_repaired_on_load() {
+        // The config file is input: `retry_max_secs` becomes `Instant + delay`
+        // and `retry_initial_secs` decides whether retries spin.
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(dir.path());
+        let mut cfg = ConfigFile::default();
+        cfg.defaults.retry_initial_secs = 0;
+        cfg.defaults.retry_max_secs = 0;
+        crate::config::save(&paths.config, &cfg).unwrap();
+
+        let app = App::new(paths);
+        assert!(app.cfg.defaults.retry_initial_secs >= MIN_RETRY_SECS);
+        assert!(app.cfg.defaults.retry_max_secs >= MIN_RETRY_SECS);
+        assert!(app.cfg.defaults.retry_max_secs >= app.cfg.defaults.retry_initial_secs);
+    }
+
+    #[test]
+    fn an_absurd_retry_ceiling_is_clamped_so_the_deadline_cannot_overflow() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(dir.path());
+        let mut cfg = ConfigFile::default();
+        cfg.defaults.retry_max_secs = u64::MAX;
+        crate::config::save(&paths.config, &cfg).unwrap();
+
+        let app = App::new(paths);
+        assert_eq!(app.cfg.defaults.retry_max_secs, MAX_RETRY_SECS);
+        // And the deadline arithmetic itself must be check-safe.
+        let at = deadline_after(Instant::now(), backoff(30, 2, app.cfg.defaults.retry_max_secs));
+        assert!(at > Instant::now());
+    }
+
+    #[test]
+    fn an_inverted_retry_pair_raises_the_ceiling_to_the_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(dir.path());
+        let mut cfg = ConfigFile::default();
+        cfg.defaults.retry_initial_secs = 60;
+        cfg.defaults.retry_max_secs = 5;
+        crate::config::save(&paths.config, &cfg).unwrap();
+
+        let app = App::new(paths);
+        assert!(app.cfg.defaults.retry_max_secs >= app.cfg.defaults.retry_initial_secs);
+        assert!(backoff(3, app.cfg.defaults.retry_initial_secs, app.cfg.defaults.retry_max_secs).as_secs() >= 60);
+    }
+
+    #[test]
+    fn deadline_arithmetic_never_panics() {
+        // `Instant + Duration` panics on overflow. `checked_add` reports it, and
+        // the fallback is a one-second deadline rather than an abort.
+        let now = Instant::now();
+        let at = deadline_after(now, Duration::from_secs(u64::MAX / 2));
+        assert!(at.saturating_duration_since(now) >= Duration::from_secs(1));
+        let at = deadline_after(now, Duration::from_secs(0));
+        assert!(at >= now);
+    }
+
+    #[test]
+    fn an_exhausted_id_space_is_refused_instead_of_overflowing() {
+        // `next_id()` is `max_id + 1`, which overflows for `id = u64::MAX`.
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_with(dir.path(), vec![sample_tunnel(u64::MAX, "huge", 18099)]);
+
+        assert_eq!(app.next_tunnel_id(), None, "no id can follow u64::MAX");
+
+        // The user-facing paths must report it, not panic.
+        app.open_form_create();
+        {
+            let f = app.form.as_mut().unwrap();
+            f.ssh_host.set("host");
+            f.name.set("fresh");
+            f.remote_port.set("22");
+            f.local_port.set("18098");
+        }
+        app.submit_form();
+        assert!(app.tunnels.len() == 1, "nothing may be created without a free id");
+        let errors = app.form.as_ref().map(|f| f.errors.clone()).unwrap_or_default();
+        assert!(errors.iter().any(|e| e.contains("编号")), "the user must be told why: {errors:?}");
+    }
+
+    #[test]
+    fn next_tunnel_id_is_just_past_the_highest_existing_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = app_with(dir.path(), vec![sample_tunnel(3, "a", 18001), sample_tunnel(7, "b", 18002)]);
+        assert_eq!(app.next_tunnel_id(), Some(8));
     }
 }

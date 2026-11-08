@@ -51,10 +51,12 @@ impl App {
     /// Shift+j / shift+↓: extend the mark range from the anchor to the cursor.
     pub fn extend_mark_to_cursor(&mut self) {
         let ids = self.visible_ids();
-        if ids.is_empty() {
+        // `mark_range` clamps the range, so the only thing to guard here is the
+        // empty view (a negative index would otherwise reach the anchor math).
+        let Some(last) = ids.len().checked_sub(1) else {
             return;
-        }
-        let to = self.selected.min(ids.len() - 1);
+        };
+        let to = self.selected.min(last);
         let from = self.select_mode.anchor.unwrap_or(to);
         self.select_mode.mark_range(&ids, from, to);
         self.select_mode.anchor = Some(to);
@@ -419,6 +421,66 @@ mod tests {
         app.confirm_yes();
         // The same set stays marked, so a follow-up action needs no re-selection.
         assert_eq!(app.select_mode.len(), 3, "marks should remain after starting");
+    }
+
+    #[test]
+    fn extending_a_range_in_an_empty_view_does_not_underflow() {
+        // `extend_mark_to_cursor` used `ids.len() - 1` after checking only that
+        // the app had tunnels; a filter that hides every row makes `ids` empty
+        // while `self.tunnels` is not. That underflowed (panic in debug builds).
+        let (_d, mut app) = three();
+        app.toggle_select_mode();
+        app.filter = "zzz-no-match".into();
+        assert!(app.visible_ids().is_empty());
+        app.extend_mark_to_cursor();
+        assert!(app.select_mode.is_empty(), "nothing visible means nothing to mark");
+    }
+
+    #[test]
+    fn extending_a_range_with_a_stale_anchor_clamps() {
+        // `anchor` is a raw visible-row index and rows move when the filter
+        // changes; a stale anchor must clamp into the current view, not slice
+        // out of bounds.
+        let (_d, mut app) = three();
+        app.toggle_select_mode();
+        app.select_mode.anchor = Some(999);
+        app.selected = 0;
+        app.extend_mark_to_cursor();
+        assert!(!app.select_mode.is_empty());
+        assert!(app.marked_ids_in_view_order().iter().all(|id| app.tunnel(*id).is_some()));
+    }
+
+    #[test]
+    fn marking_all_in_an_empty_view_records_no_anchor() {
+        let (_d, mut app) = app_with(vec![]);
+        app.toggle_select_mode();
+        app.mark_all_visible();
+        assert!(app.select_mode.is_empty());
+        assert_eq!(app.select_mode.anchor, Some(0), "an empty view's anchor saturates to 0, not underflows");
+    }
+
+    #[test]
+    fn a_batch_request_over_stale_marks_does_nothing() {
+        // Marks are ids and ids can go stale (the row was deleted behind the
+        // dialog); the batch must filter them out instead of acting on a ghost.
+        let (_d, mut app) = three();
+        app.toggle_select_mode();
+        app.select_mode.mark_all(&[1, 2, 3, 999]);
+        app.request_batch(BatchAction::Delete);
+        // Only the three real rows show up in the prompt count.
+        match &app.overlay {
+            Overlay::Confirm { action: ConfirmAction::Batch { count, .. }, .. } => assert_eq!(*count, 3),
+            other => panic!("expected a batch confirmation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn toggle_mark_selected_with_no_visible_rows_is_a_no_op() {
+        let (_d, mut app) = three();
+        app.toggle_select_mode();
+        app.filter = "zzz".into();
+        app.toggle_mark_selected();
+        assert!(app.select_mode.is_empty());
     }
 
     #[test]

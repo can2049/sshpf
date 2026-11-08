@@ -145,6 +145,93 @@ pub fn state_save_failed(path: &str, error: &str) {
     logging::warn("state.save_failed", &[("path", &path), ("msg", &error)]);
 }
 
+/// A hand-edited default in `config.toml` was out of range and has been replaced.
+///
+/// `field` is the stable config key (`retry_initial_secs` / `retry_max_secs`),
+/// `original` what the file asked for, `used` what the app will actually do.
+/// A `retry_initial_secs = 0` is the interesting case: it turns the reconnect
+/// loop into a per-frame storm, so it is clamped instead of obeyed.
+pub fn config_defaults_clamped(field: &str, original: u64, used: u64) {
+    config_defaults_clamped_on(logging::logger(), field, original, used);
+}
+
+pub fn config_defaults_clamped_on(logger: &Logger, field: &str, original: u64, used: u64) {
+    logger.event(
+        Level::Warn,
+        "config.defaults_clamped",
+        &[("field", &field), ("original", &original), ("used", &used)],
+    );
+}
+
+/// A retry chain stopped for good: the attempt failed in a way a retry cannot
+/// fix (invalid definition, port still in use, unresolvable host, spawn failure).
+///
+/// `tunnel.failed` covers a session that died; this covers the *backoff loop*
+/// giving up, which is what explains why the row stopped flapping on its own.
+pub fn tunnel_retry_abandoned(cfg: &TunnelConfig, attempt: u32, stage: &str, reason: &FailureInfo) {
+    tunnel_retry_abandoned_on(logging::logger(), cfg, attempt, stage, reason);
+}
+
+pub fn tunnel_retry_abandoned_on(logger: &Logger, cfg: &TunnelConfig, attempt: u32, stage: &str, reason: &FailureInfo) {
+    tunnel_event_on(
+        logger,
+        Level::Warn,
+        "tunnel.retry_abandoned",
+        cfg,
+        &[
+            ("attempt", attempt.to_string()),
+            ("stage", stage.to_string()),
+            ("kind", reason.kind.name().to_string()),
+            ("short", reason.short.clone()),
+        ],
+    );
+}
+
+/// The tunnel-id space (`u64`) is exhausted, so no new definition can be given a
+/// unique id. Only reachable from a hand-edited config with a huge id; the
+/// action is refused rather than reusing an id that already exists.
+pub fn id_space_exhausted(max_id: TunnelId) {
+    id_space_exhausted_on(logging::logger(), max_id);
+}
+
+pub fn id_space_exhausted_on(logger: &Logger, max_id: TunnelId) {
+    logger.event(Level::Error, "app.id_space_exhausted", &[("max_id", &max_id)]);
+}
+
+/// A confirmation was armed for a tunnel id that is no longer in the table.
+///
+/// The dialog still opens with a fallback sentence, so the user is not stuck;
+/// the record is what explains why the prompt had no name in it.
+pub fn action_target_missing(action: &str) {
+    action_target_missing_on(logging::logger(), action);
+}
+
+pub fn action_target_missing_on(logger: &Logger, action: &str) {
+    logger.event(Level::Warn, "action.target_missing", &[("action", &action)]);
+}
+
+/// The form's `kind_idx` pointed outside `ForwardKind::all()`.
+///
+/// Only reachable if a caller assigns the index directly; the form falls back to
+/// the default kind so the dialog stays usable, and this line says why the
+/// highlighted kind may look reset.
+pub fn form_kind_index_invalid(index: usize, len: usize) {
+    form_kind_index_invalid_on(logging::logger(), index, len);
+}
+
+pub fn form_kind_index_invalid_on(logger: &Logger, index: usize, len: usize) {
+    logger.event(Level::Warn, "form.kind_index_invalid", &[("index", &index), ("len", &len)]);
+}
+
+/// A mouse click resolved to an import row that is no longer in the filtered view.
+///
+/// The hit map is drawn one frame ahead of the click, so a re-filter or a
+/// re-discovery can invalidate it. The click is dropped (rather than being
+/// applied to whatever row now occupies that slot) and recorded here.
+pub fn import_click_stale(row: usize) {
+    logging::debug("import.click_stale", &[("row", &row)]);
+}
+
 // ---------------------------------------------------------------------------
 // hosts
 // ---------------------------------------------------------------------------
@@ -561,6 +648,74 @@ mod tests {
             Logger::open(&Config { dir: dir.path().to_path_buf(), level: Level::Info, ..Config::default() }).unwrap();
         tunnel_line_on(&log, &sample(), "转发到 10.0.0.9:80 失败: ConnectFailed");
         assert!(text(dir.path()).is_empty(), "at info level a progress line must not be written");
+    }
+
+    // -- panic-hardening events -------------------------------------------
+
+    #[test]
+    fn a_clamped_default_names_the_field_and_both_numbers() {
+        // A repaired config must be discoverable: which key was wrong, what it
+        // said, and what sshpf will actually use.
+        let dir = tempfile::tempdir().unwrap();
+        let log = logger(dir.path());
+        config_defaults_clamped_on(&log, "retry_initial_secs", 0, 1);
+        let text = text(dir.path());
+        assert!(text.contains(" WARN "), "{text}");
+        assert!(text.contains("event=config.defaults_clamped"), "{text}");
+        assert!(text.contains("field=retry_initial_secs"), "{text}");
+        assert!(text.contains("original=0"), "{text}");
+        assert!(text.contains("used=1"), "{text}");
+    }
+
+    #[test]
+    fn an_abandoned_retry_says_which_stage_gave_up() {
+        // The row stops flapping; this is the line that explains why, and which
+        // start stage refused it.
+        let dir = tempfile::tempdir().unwrap();
+        let log = logger(dir.path());
+        let reason = FailureInfo::new(crate::model::FailureKind::PortInUse, "端口被占用");
+        tunnel_retry_abandoned_on(&log, &sample(), 4, "preflight_bind", &reason);
+        let text = text(dir.path());
+        assert!(text.contains(" WARN "), "{text}");
+        assert!(text.contains("event=tunnel.retry_abandoned"), "{text}");
+        assert!(text.contains("attempt=4"), "{text}");
+        assert!(text.contains("stage=preflight_bind"), "{text}");
+        assert!(text.contains("kind=port_in_use"), "{text}");
+        assert!(text.contains("tunnel=7 name=cloud-pc"), "identity fields still come first: {text}");
+    }
+
+    #[test]
+    fn an_exhausted_id_space_is_an_error_that_names_the_maximum() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = logger(dir.path());
+        id_space_exhausted_on(&log, u64::MAX);
+        let text = text(dir.path());
+        assert!(text.contains(" ERROR "), "{text}");
+        assert!(text.contains("event=app.id_space_exhausted"), "{text}");
+        assert!(text.contains("max_id=18446744073709551615"), "{text}");
+    }
+
+    #[test]
+    fn a_missing_action_target_is_a_warning_not_a_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = logger(dir.path());
+        action_target_missing_on(&log, "delete");
+        let text = text(dir.path());
+        assert!(text.contains(" WARN "), "{text}");
+        assert!(text.contains("event=action.target_missing"), "{text}");
+        assert!(text.contains("action=delete"), "{text}");
+    }
+
+    #[test]
+    fn an_invalid_kind_index_records_both_the_index_and_the_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = logger(dir.path());
+        form_kind_index_invalid_on(&log, 99, 3);
+        let text = text(dir.path());
+        assert!(text.contains(" WARN "), "{text}");
+        assert!(text.contains("event=form.kind_index_invalid"), "{text}");
+        assert!(text.contains("index=99"), "{text}");
+        assert!(text.contains("len=3"), "{text}");
     }
 
     #[test]

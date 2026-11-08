@@ -44,6 +44,10 @@ use crate::model::TunnelConfig;
 /// Default SSH port.
 const DEFAULT_PORT: u16 = 22;
 
+/// The `Match` keyword, as bytes: matched with `eq_ignore_ascii_case` against a
+/// byte slice, which cannot panic on a char boundary the way `trimmed[..5]` can.
+const MATCH_KEYWORD: &[u8] = b"match";
+
 /// A resolved host entry from `~/.ssh/config`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SshHost {
@@ -142,9 +146,14 @@ pub fn strip_match_blocks(text: &str) -> String {
     for line in text.lines() {
         let trimmed = line.trim();
         let is_indented = line.starts_with(' ') || line.starts_with('\t');
-        let starts_with_match = trimmed.len() >= 5
-            && trimmed[..5].eq_ignore_ascii_case("match")
-            && matches!(trimmed.as_bytes().get(5), Some(b' ') | Some(b'\t'));
+        // Compare **bytes**, never a `str` slice: `trimmed[..5]` panics when byte
+        // 5 lands inside a multi-byte character, and a config whose first line is
+        // a Chinese comment (「中文注释」 — '文' spans bytes 3..6) is completely
+        // ordinary. Byte comparison is also exactly what OpenSSH's keyword match
+        // is (case-insensitive ASCII).
+        let starts_with_match =
+            trimmed.as_bytes().get(..MATCH_KEYWORD.len()).is_some_and(|word| word.eq_ignore_ascii_case(MATCH_KEYWORD))
+                && matches!(trimmed.as_bytes().get(MATCH_KEYWORD.len()), Some(b' ') | Some(b'\t'));
 
         if starts_with_match {
             in_match = true;
@@ -166,13 +175,16 @@ pub fn strip_match_blocks(text: &str) -> String {
 /// Read and parse every config file. Returns `Ok(None)` when there is nothing
 /// to read (no config file, or an unreadable one).
 fn load_config() -> Result<Option<SshConfig>> {
-    let paths = default_config_paths();
-    if paths.is_empty() {
-        return Ok(None);
-    }
     // `ssh2-config` takes a single reader, but honours `Include` itself, so we
     // parse the first (main) file. An env override is a single file too.
-    let path = &paths[0];
+    //
+    // `first()` rather than `paths[0]`: the emptiness check above makes the index
+    // safe today, but this is a parser entry point and the index would be a panic
+    // if that check ever moved.
+    let Some(path) = default_config_paths().first().cloned() else {
+        return Ok(None);
+    };
+    let path = &path;
     let text = std::fs::read_to_string(path).with_context(|| format!("读取 {} 失败", path.display()))?;
     let cleaned = strip_match_blocks(&text);
     let mut reader = BufReader::new(cleaned.as_bytes());
@@ -409,6 +421,66 @@ Host web2
     fn strip_match_blocks_handles_no_match() {
         let src = "Host a\n  HostName 1.2.3.4\n";
         assert_eq!(strip_match_blocks(src), src);
+    }
+
+    /// Regression: byte 5 landing inside a multi-byte character used to panic
+    /// (`end byte index 5 is not a char boundary`), so an ssh config whose first
+    /// line is a Chinese comment crashed `--list-hosts` at start-up.
+    #[test]
+    fn strip_match_blocks_survives_a_multibyte_first_line() {
+        let src = "中文注释\nHost x\n  HostName 1.2.3.4\n";
+        let out = strip_match_blocks(src);
+        assert!(out.contains("Host x"), "the Host block must be preserved: {out:?}");
+        assert!(out.contains("HostName 1.2.3.4"), "{out:?}");
+        assert!(out.contains("中文注释"), "an unrelated comment must be kept verbatim: {out:?}");
+    }
+
+    /// Every multi-byte line shape that exercises a *different* boundary relative
+    /// to the five-byte keyword window, including 1..=4-byte characters whose
+    /// boundary lands exactly on 5.
+    #[test]
+    fn strip_match_blocks_handles_every_multibyte_boundary_around_the_keyword() {
+        for line in ["中文字", "日本語のコメント", "🚀", "é", "a中b", "中文", "备注：服务器列表", "\t中文缩进"]
+        {
+            let src = format!("{line}\nHost x\n");
+            // The assertion that matters is that this cannot panic.
+            let out = strip_match_blocks(&src);
+            assert!(out.contains("Host x"), "{line:?} broke the scan: {out:?}");
+        }
+    }
+
+    /// A `Match` line preceded by a multi-byte comment is still stripped — the
+    /// bug fix must not turn into "stop recognising Match after non-ASCII text".
+    #[test]
+    fn strip_match_blocks_still_recognises_match_after_multibyte_text() {
+        let src = "中文注释\nHost web1\n  HostName 10.0.0.1\nMatch host foo\n  User ignored\nHost web2\n";
+        let out = strip_match_blocks(src);
+        assert!(!out.contains("Match"), "{out:?}");
+        assert!(!out.contains("ignored"), "{out:?}");
+        assert!(out.contains("Host web1") && out.contains("Host web2"), "{out:?}");
+    }
+
+    /// A `Match` keyword must not be recognised when the 6th byte is a *multi-byte*
+    /// continuation rather than a space/tab — e.g. a host alias named `match中`.
+    #[test]
+    fn a_word_merely_starting_with_match_is_not_a_match_block() {
+        let src = "Host match中文\n  HostName 10.0.0.9\n";
+        let out = strip_match_blocks(src);
+        assert!(out.contains("Host match中文"), "a Host whose name starts with `match` must survive: {out:?}");
+        assert!(out.contains("HostName 10.0.0.9"), "{out:?}");
+    }
+
+    /// The keyword comparison has to stay case-insensitive and whitespace-strict.
+    #[test]
+    fn match_keyword_casing_and_separator_rules_hold() {
+        for src in ["MATCH host x\n  User u\nHost web\n", "Match\thost x\n  User u\nHost web\n"] {
+            let out = strip_match_blocks(src);
+            assert!(!out.contains("User u"), "{src:?} was not stripped: {out:?}");
+            assert!(out.contains("Host web"), "{out:?}");
+        }
+        // `MatchFoo` is a different (unknown) keyword and must be passed through.
+        let out = strip_match_blocks("MatchFoo host x\nHost web\n");
+        assert!(out.contains("MatchFoo"), "{out:?}");
     }
 
     /// The bug this guard exists for: without stripping, `Match` leaks into the
