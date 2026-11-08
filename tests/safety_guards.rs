@@ -18,6 +18,7 @@
 //! | production code per file ≤ [`MAX_PROD_LINES`] | a 3000-line file is a maze, not a module |
 //! | one function ≤ [`MAX_FN_LINES`] lines | a 150-line function cannot be reviewed, tested or reasoned about |
 //! | every `pub mod` in `src/lib.rs` resolves to a real file | a stale declaration is a broken map |
+//! | no `#[cfg(test)]` module is entirely platform-gated | it compiles to nothing on one OS, so its glob imports break the Windows build |
 //!
 //! # Test code is exempt, deliberately
 //!
@@ -166,14 +167,25 @@ impl Scan {
 /// at the next `{`; a `#[cfg(test)]` with no body at all (e.g. on a `use`) is
 /// skipped rather than swallowing the rest of the file.
 fn cfg_test_spans(src: &[char]) -> Vec<(usize, usize)> {
-    const ATTR: &str = "#[cfg(test)]";
+    const ATTR: &str = "#[cfg(";
     let attr: Vec<char> = ATTR.chars().collect();
     let mut spans = Vec::new();
     let mut i = 0usize;
     while i + attr.len() <= src.len() {
-        if src[i..i + attr.len()] == attr[..] {
-            // Find the opening brace of the item this attribute decorates.
+        if src[i..i + attr.len()] == attr[..] && cfg_predicate_mentions_test(src, i + attr.len()) {
+            // Skip the predicate first: `#[cfg(all(test, unix))]` contains no
+            // brace, but starting the search inside it would also look at the
+            // predicate's own characters.
             let mut j = i + attr.len();
+            let mut parens = 1usize;
+            while j < src.len() && parens > 0 {
+                match src[j] {
+                    '(' => parens += 1,
+                    ')' => parens -= 1,
+                    _ => {}
+                }
+                j += 1;
+            }
             while j < src.len() && src[j] != '{' && src[j] != ';' {
                 // A second attribute or a new line without a body ends the search.
                 if src[j] == '#' && src.get(j + 1) == Some(&'[') {
@@ -278,6 +290,33 @@ fn blank_comments_and_strings(src: &[char]) -> Vec<char> {
         }
     }
     out
+}
+
+/// Whether the `#[cfg(...)]` predicate starting at `from` mentions `test`.
+///
+/// `#[cfg(test)]` and `#[cfg(all(test, unix))]` must both count as a test region:
+/// a platform-and-test gate is the *correct* way to write a Unix-only test module
+/// (see `no_test_module_compiles_to_nothing_on_another_platform`), and treating it
+/// as production code would make the panic and size checks fire on test-only
+/// `unwrap()`s.
+fn cfg_predicate_mentions_test(src: &[char], from: usize) -> bool {
+    // Collect the whole `cfg(...)` predicate as text (keeping the parentheses, so
+    // `all(test, unix)` does not collapse into the word `alltest`), then look for
+    // `test` as a standalone identifier.
+    let mut depth = 1usize;
+    let mut i = from;
+    let mut predicate = String::new();
+    while i < src.len() && depth > 0 {
+        let c = src[i];
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            _ => {}
+        }
+        predicate.push(c);
+        i += 1;
+    }
+    predicate.split(|c: char| !(c.is_alphanumeric() || c == '_')).any(|word| word == "test")
 }
 
 /// Whether the `'` at `i` opens a char literal (`'x'`, `'\n'`) rather than a
@@ -396,6 +435,95 @@ fn no_production_function_is_a_swamp() {
         offenders.is_empty(),
         "split these functions into named steps — a function this long hides its own bugs:\n{}",
         offenders.join("\n")
+    );
+}
+
+/// Whether every item in a test module carries its own `cfg` gate.
+///
+/// A `#[cfg(test)] mod tests` whose *entire* body is `#[cfg(unix)]`-gated compiles
+/// to an empty module on Windows. An empty module plus `use super::*` is an
+/// unused-import error, and CI runs with `-D warnings` — which is exactly how the
+/// Windows job caught this once. The fix is to gate the module itself
+/// (`#[cfg(all(test, unix))]`), not each item.
+fn module_is_fully_gated(body: &str) -> bool {
+    // Every non-blank, non-comment line that starts an item must be preceded by a
+    // `cfg` attribute. A cheap but honest approximation: no item-level `fn`/`use`
+    // may appear outside a gated block, and at least one gate must exist.
+    let mut gated = 0usize;
+    let mut ungated = 0usize;
+    let mut pending_gate = false;
+    for line in body.lines() {
+        let l = line.trim();
+        if l.is_empty() || l.starts_with("//") {
+            continue;
+        }
+        if l.starts_with("#[cfg(") || l.starts_with("#[test]") {
+            if l.starts_with("#[cfg(") && l.contains("unix") {
+                pending_gate = true;
+            }
+            continue;
+        }
+        let starts_item = l.starts_with("fn ")
+            || l.starts_with("use ")
+            || l.starts_with("static ")
+            || l.starts_with("const ")
+            || l.starts_with("struct ")
+            || l.starts_with("impl ");
+        if starts_item {
+            if pending_gate {
+                gated += 1;
+            } else {
+                ungated += 1;
+            }
+            pending_gate = false;
+        }
+    }
+    gated > 0 && ungated == 0
+}
+
+#[test]
+fn no_test_module_compiles_to_nothing_on_another_platform() {
+    let mut broken = Vec::new();
+    for path in source_files() {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let chars: Vec<char> = text.chars().collect();
+        let code: String = chars.iter().collect();
+        // Find `#[cfg(test)] mod <name> {` and take its brace-balanced body.
+        let mut search = 0usize;
+        while let Some(offset) = code[search..].find("#[cfg(test)]") {
+            let attr = search + offset;
+            let Some(mod_rel) = code[attr..].find("mod ") else { break };
+            let mod_start = attr + mod_rel;
+            let Some(brace_rel) = code[mod_start..].find('{') else { break };
+            let body_start = mod_start + brace_rel + 1;
+            let mut depth = 1usize;
+            let mut i = body_start;
+            while i < code.len() && depth > 0 {
+                match code.as_bytes()[i] as char {
+                    '{' => depth += 1,
+                    '}' => depth -= 1,
+                    _ => {}
+                }
+                i += 1;
+            }
+            let body = &code[body_start..i.saturating_sub(1)];
+            if module_is_fully_gated(body) {
+                broken.push(format!(
+                    "{}: the `#[cfg(test)]` module at char {mod_start} is entirely `cfg`-gated — \
+                     gate the module itself as `#[cfg(all(test, <os>))]` so it stays real on every \
+                     target",
+                    rel(&path)
+                ));
+            }
+            search = i.max(attr + 1);
+        }
+    }
+    assert!(
+        broken.is_empty(),
+        "a test module that disappears on one OS breaks the other OS build:\n{}",
+        broken.join("\n")
     );
 }
 

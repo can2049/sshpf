@@ -9,7 +9,7 @@
 | 层 | 位置 | 数量级 | 依赖 | 守什么 |
 |---|---|---|---|---|
 | **单元** | 各模块尾部 `#[cfg(test)] mod tests` | 570+ | 无（不 spawn、不 I/O） | 状态机、判定、边界、渲染纯函数 |
-| **覆盖**（源码即断言） | `tests/help_coverage.rs`、`tests/safety_guards.rs` | 9 + 7 | 只读源码 | 帮助不得遗漏/不得撒谎；panic/`unsafe` 政策、模块文档、单文件 ≤400 行、单函数 ≤60 行 |
+| **覆盖**（源码即断言） | `tests/help_coverage.rs`、`tests/safety_guards.rs` | 9 + 8 | 只读源码 | 帮助不得遗漏/不得撒谎；panic/`unsafe` 政策、模块文档、单文件 ≤400 行、单函数 ≤60 行、测试模块不得被平台 cfg 整段吞掉 |
 | **加固**（真二进制） | `tests/logging.rs`、`tests/panic_hardening.rs` | 21 + 13 | 真进程，必须 `--test-threads=1` | 日志全链路、崩溃、恶意输入不 panic |
 | **端到端** | `tests/e2e.rs` | 10 | 真 `sshd`，默认 `#[ignore]` | 三种转发真的通、主机密钥真的拒、端口真的释放 |
 

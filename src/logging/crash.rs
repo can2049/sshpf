@@ -354,23 +354,25 @@ mod imp {
     pub fn emergency(_event: &str) {}
 }
 
-#[cfg(test)]
+// Every assertion here targets a Unix-only `sigaction` path, so on a non-Unix
+// target the module would be empty — and an empty module with a glob import is an
+// unused-import error under `-D warnings`, which is how the Windows CI job caught
+// it. Gate the whole module rather than sprinkling `#[cfg(unix)]` on each test.
+#[cfg(all(test, unix))]
 mod tests {
-    use super::*;
 
-    #[cfg(unix)]
+    // The crate-level re-exports the tests exercise, imported explicitly now that
+    // the glob is gone.
     use super::imp::{LOG_FD, RECORD_MAX, build_signal_record, push, push_int, signal_name};
-    #[cfg(unix)]
+    use super::{adopt, emergency, install, release};
     use std::sync::atomic::Ordering;
 
     /// The crash descriptor is one process-wide slot, so every test that adopts,
     /// releases or inspects it must hold this for its duration. A per-test
     /// `static` would not serialise anything — this is the shared one.
-    #[cfg(unix)]
     static FD_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Serialise a test against the other crash-fd tests.
-    #[cfg(unix)]
     fn lock_fd() -> std::sync::MutexGuard<'static, ()> {
         FD_GUARD.lock().unwrap_or_else(|p| p.into_inner())
     }
@@ -379,7 +381,6 @@ mod tests {
     // signal_name: the `&'static str` the handler uses (no allocation allowed)
     // -----------------------------------------------------------------------
 
-    #[cfg(unix)]
     #[test]
     fn every_fatal_signal_has_a_stable_name() {
         // These five are exactly the signals `install()` catches; a handler that
@@ -391,7 +392,6 @@ mod tests {
         assert_eq!(signal_name(libc::SIGFPE), "SIGFPE");
     }
 
-    #[cfg(unix)]
     #[test]
     fn unknown_and_out_of_range_signals_fall_back() {
         // `signal_name` is total: it runs inside a handler, where a panic (from a
@@ -405,7 +405,6 @@ mod tests {
     // push / push_int: hand-rolled formatting, so the arithmetic is the risk
     // -----------------------------------------------------------------------
 
-    #[cfg(unix)]
     #[test]
     fn push_appends_and_advances() {
         let mut buf = [0u8; 16];
@@ -416,7 +415,6 @@ mod tests {
         assert_eq!(&buf[..4], b"abcd");
     }
 
-    #[cfg(unix)]
     #[test]
     fn push_truncates_instead_of_overrunning() {
         // A short buffer must produce a short record, never a write past the end
@@ -431,7 +429,6 @@ mod tests {
         assert_eq!(&buf, b"abcd");
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_buffer_filled_exactly_to_its_length_is_accepted() {
         // The boundary between "fits" and "truncates": `end == buf.len()` must be
@@ -451,7 +448,6 @@ mod tests {
         assert_eq!(&buf, b"-12");
     }
 
-    #[cfg(unix)]
     #[test]
     fn push_into_a_zero_length_buffer_is_a_no_op() {
         let mut buf = [0u8; 0];
@@ -459,7 +455,6 @@ mod tests {
         assert_eq!(push(&mut buf, 5, b"anything"), 0, "an out-of-range offset must not index");
     }
 
-    #[cfg(unix)]
     #[test]
     fn push_handles_an_offset_at_the_end() {
         let mut buf = [0u8; 4];
@@ -468,7 +463,6 @@ mod tests {
         assert_eq!(&buf, b"\0\0\0\0");
     }
 
-    #[cfg(unix)]
     #[test]
     fn push_int_renders_zero_positive_and_negative() {
         let mut buf = [0u8; 32];
@@ -491,7 +485,6 @@ mod tests {
         assert_eq!(&buf[..at], b"11");
     }
 
-    #[cfg(unix)]
     #[test]
     fn push_int_handles_the_i64_extremes() {
         // `i64::MIN.unsigned_abs()` is `1 << 63`, which is the case a naive
@@ -510,7 +503,6 @@ mod tests {
         assert_eq!(&buf[..at], b"2147483647");
     }
 
-    #[cfg(unix)]
     #[test]
     fn push_int_truncates_a_small_buffer_safely() {
         // The sign goes first, so a truncated number is at least parseable-ish and
@@ -526,7 +518,6 @@ mod tests {
         assert_eq!(&buf, b"-");
     }
 
-    #[cfg(unix)]
     #[test]
     fn push_int_appends_after_existing_content() {
         let mut buf = [0u8; 16];
@@ -539,7 +530,6 @@ mod tests {
     // build_signal_record: the record the handler actually writes
     // -----------------------------------------------------------------------
 
-    #[cfg(unix)]
     #[test]
     fn signal_record_is_async_signal_safe_and_parseable() {
         let (buf, len) = build_signal_record(libc::SIGSEGV);
@@ -553,7 +543,6 @@ mod tests {
         assert!(line.ends_with(|c: char| c.is_ascii_digit()), "pid must be the last field: {line}");
     }
 
-    #[cfg(unix)]
     #[test]
     fn every_fatal_signal_gets_its_own_record() {
         // The record must name the signal, otherwise the five handlers are
@@ -572,7 +561,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[test]
     fn an_unknown_signal_still_produces_a_well_formed_record() {
         // A handler can fire for a signal we did not install (NSIG bounds, a
@@ -584,7 +572,6 @@ mod tests {
         assert!(!line.contains('\n'), "{line}");
     }
 
-    #[cfg(unix)]
     #[test]
     fn the_record_length_is_always_within_the_buffer() {
         // The invariant the handler relies on before `&buf[..len]`: an out-of-range
@@ -595,7 +582,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[test]
     fn an_extreme_signal_number_truncates_instead_of_overrunning() {
         // `i32::MIN` is the longest field value we can be handed; even then the
@@ -615,7 +601,6 @@ mod tests {
     // adopt / release: the descriptor lifecycle rotation depends on
     // -----------------------------------------------------------------------
 
-    #[cfg(unix)]
     #[test]
     fn adopt_then_release_clears_the_crash_fd() {
         use std::os::unix::io::AsRawFd;
@@ -637,7 +622,6 @@ mod tests {
         assert_eq!(LOG_FD.load(Ordering::Relaxed), -1);
     }
 
-    #[cfg(unix)]
     #[test]
     fn adopt_replaces_a_previous_descriptor_without_leaking_the_slot() {
         use std::os::unix::io::AsRawFd;
@@ -663,7 +647,6 @@ mod tests {
     /// The emergency path (re-entrancy degrade) must reach the file through the
     /// adopted descriptor without a lock. It is *not* called from a handler, so
     /// allocation is fine — this asserts the bytes land where a reader looks.
-    #[cfg(unix)]
     #[test]
     fn emergency_writes_the_degrade_record() {
         let _guard = lock_fd();
@@ -684,7 +667,6 @@ mod tests {
 
     /// With no adopted fd the emergency path must do nothing at all (a test-local
     /// logger that never adopted one is the normal case).
-    #[cfg(unix)]
     #[test]
     fn emergency_without_a_descriptor_is_a_no_op() {
         let _guard = lock_fd();
@@ -696,7 +678,6 @@ mod tests {
     /// The end-to-end proof that the handler writes (and keeps the signal exit
     /// status). This is the test the `unsafe` exists for; it must keep running on
     /// a real fork.
-    #[cfg(unix)]
     #[test]
     fn fatal_signal_handler_really_writes_a_record() {
         // `lock_fd` serialises this test with the other fd tests: it installs a
