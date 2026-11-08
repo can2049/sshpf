@@ -311,15 +311,19 @@ enum Auth {
 }
 
 /// Load credentials, preferring an explicit `IdentityFile`, then ssh-agent.
-fn load_auth(endpoint: &Endpoint) -> Result<Auth> {
+///
+/// Async on purpose: `session` already runs inside the tunnel's runtime, so
+/// building a second runtime here would panic with "Cannot start a runtime from
+/// within a runtime" on every hop that has no `IdentityFile` (e.g. a jump host
+/// whose key comes from the agent).
+async fn load_auth(endpoint: &Endpoint) -> Result<Auth> {
     if let Some(path) = &endpoint.identity_file {
         let expanded = expand_path(path);
         if let Ok(key) = load_secret_key(&expanded, None) {
             return Ok(Auth::Key(Arc::new(key)));
         }
     }
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().context("创建 runtime 失败")?;
-    match rt.block_on(connect_agent()) {
+    match connect_agent().await {
         Ok(agent) => Ok(Auth::Agent(agent)),
         Err(_) => bail!("没有可用的认证方式：未找到可读取的私钥，也连接不上 ssh-agent"),
     }
@@ -372,14 +376,21 @@ fn expand_path(path: &str) -> String {
     if let Some(rest) = p.strip_prefix("~/") { format!("{home}/{rest}") } else { p }
 }
 
-/// Try the credential against the server.
+/// Try to authenticate, in the same order OpenSSH uses.
 ///
-/// Returns `Ok(())` only when the server accepted. `BatchMode=yes` meant the old
-/// implementation never prompted for a password either, so there is no
-/// interactive fallback here by design.
-async fn authenticate(handle: &mut client::Handle<Handler>, user: &str, auth: Auth) -> Result<()> {
+/// The `none` method is probed first: it is how a server says "this user needs
+/// no authentication", and some gateways (e.g. a desk-ssh jump host) accept it
+/// while rejecting a public key offered afterwards. Only when `none` is refused
+/// do we load the configured key / ssh-agent. Returns `Ok(())` only when the
+/// server accepted; there is no interactive password fallback by design
+/// (`BatchMode=yes` in the old subprocess implementation).
+async fn authenticate(handle: &mut client::Handle<Handler>, user: &str, endpoint: &Endpoint) -> Result<()> {
+    let none = handle.authenticate_none(user).await.map_err(|e| anyhow!("{e}"))?;
+    if none.success() {
+        return Ok(());
+    }
     let hash = handle.best_supported_rsa_hash().await.ok().flatten().flatten();
-    match auth {
+    match load_auth(endpoint).await? {
         Auth::Key(key) => {
             let res = handle
                 .authenticate_publickey(user, PrivateKeyWithHashAlg::new(key, hash))
@@ -468,7 +479,11 @@ where
         return Err(anyhow::Error::new(HostKeyRejected { verdict: v, host, port }));
     }
 
-    authenticate(&mut handle, &endpoint.user_or_current(), load_auth(endpoint)?).await?;
+    // Name the hop in auth errors: with a ProxyJump chain the message would
+    // otherwise not say *which* host rejected the key.
+    authenticate(&mut handle, &endpoint.user_or_current(), endpoint)
+        .await
+        .with_context(|| format!("认证 {}:{} 失败", endpoint.hostname, endpoint.port))?;
     Ok(Arc::new(handle))
 }
 
@@ -766,5 +781,28 @@ mod tests {
         assert!(expanded.ends_with(".ssh/id_ed25519"));
         let expanded = expand_path("%d/.ssh/id_rsa");
         assert!(!expanded.starts_with('%'));
+    }
+
+    /// Regression: `load_auth` used to build a second runtime and `block_on` it
+    /// from inside the tunnel's runtime, panicking with "Cannot start a runtime
+    /// from within a runtime" on every hop without an `IdentityFile` — which is
+    /// exactly a jump host that authenticates through the agent. Awaiting it here
+    /// (inside a runtime, like `session` does) must return, not abort.
+    #[tokio::test]
+    async fn agent_auth_does_not_build_a_nested_runtime() {
+        let endpoint = Endpoint {
+            hostname: "127.0.0.1".to_string(),
+            port: 22,
+            user: None,
+            proxy_jump: Vec::new(),
+            identity_file: None,
+        };
+        match load_auth(&endpoint).await {
+            Ok(_) => {} // this machine runs an agent
+            Err(e) => assert!(
+                e.to_string().contains("没有可用的认证方式"),
+                "a missing agent must be a clean error, not a panic: {e}"
+            ),
+        }
     }
 }

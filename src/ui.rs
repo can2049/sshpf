@@ -1758,7 +1758,7 @@ mod tests {
                 hostname: "1.1.1.1".into(),
                 user: None,
                 port: 22,
-                proxy_jump: None,
+                proxy_jump: Vec::new(),
                 identity_file: None,
             })
             .collect();
@@ -1838,7 +1838,7 @@ mod tests {
                 hostname: "10.0.4.9".into(),
                 user: Some("deploy".into()),
                 port: 22,
-                proxy_jump: None,
+                proxy_jump: Vec::new(),
                 identity_file: None,
             },
             crate::ssh::SshHost {
@@ -1846,7 +1846,7 @@ mod tests {
                 hostname: "192.168.1.7".into(),
                 user: None,
                 port: 2222,
-                proxy_jump: None,
+                proxy_jump: Vec::new(),
                 identity_file: None,
             },
         ];
@@ -2016,7 +2016,7 @@ mod tests {
             hostname: "10.0.0.9".into(),
             user: None,
             port: 22,
-            proxy_jump: None,
+            proxy_jump: Vec::new(),
             identity_file: None,
         }];
         if let Some(f) = app.form.as_mut() {

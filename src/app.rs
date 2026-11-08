@@ -1183,7 +1183,7 @@ mod tests {
                 hostname: format!("10.0.0.{i}"),
                 user: Some("u".into()),
                 port: 22,
-                proxy_jump: None,
+                proxy_jump: Vec::new(),
                 identity_file: None,
             })
             .collect();
@@ -1220,7 +1220,7 @@ mod tests {
                 hostname: "1.1.1.1".into(),
                 user: None,
                 port: 22,
-                proxy_jump: None,
+                proxy_jump: Vec::new(),
                 identity_file: None,
             })
             .collect();
@@ -1246,7 +1246,7 @@ mod tests {
                 hostname: "10.0.4.9".into(),
                 user: Some("deploy".into()),
                 port: 22,
-                proxy_jump: None,
+                proxy_jump: Vec::new(),
                 identity_file: None,
             },
             SshHost {
@@ -1254,7 +1254,7 @@ mod tests {
                 hostname: "192.168.1.7".into(),
                 user: None,
                 port: 22,
-                proxy_jump: None,
+                proxy_jump: Vec::new(),
                 identity_file: None,
             },
         ];
@@ -1277,7 +1277,7 @@ mod tests {
             hostname: "1.1.1.1".into(),
             user: None,
             port: 22,
-            proxy_jump: None,
+            proxy_jump: Vec::new(),
             identity_file: None,
         }];
         app.open_form_create();
@@ -1301,7 +1301,7 @@ mod tests {
                 hostname: "1.1.1.1".into(),
                 user: None,
                 port: 22,
-                proxy_jump: None,
+                proxy_jump: Vec::new(),
                 identity_file: None,
             },
             SshHost {
@@ -1309,7 +1309,7 @@ mod tests {
                 hostname: "2.2.2.2".into(),
                 user: None,
                 port: 22,
-                proxy_jump: None,
+                proxy_jump: Vec::new(),
                 identity_file: None,
             },
         ];

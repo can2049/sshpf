@@ -3,6 +3,24 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### 修复
+
+- **多跳 `ProxyJump` 只用了第一跳**。`ProxyJump a,b` 在解析时被截成 `a`，于是像
+  `cloud_pc`（`ProxyJump office_pc,ali_cloud_pc_jump`）这样的主机只会经
+  `office_pc` 直连目标；`office_pc` 到目标所在网段没有路由，隧道永远停在
+  `Failed to open channel (ConnectFailed)` 并不断重试。现在保留完整的跳板机列表，
+  并按 OpenSSH 语义展开：第一跳自己的 `ProxyJump` 前置展开，其余跳原样跟随；
+  配置成环时停止展开，不会无限循环。
+- **靠 ssh-agent 认证的跳板机会 panic**。`load_auth` 在隧道的 runtime 里又建了
+  一个 runtime 并 `block_on`，命中 `Cannot start a runtime from within a runtime`；
+  多跳链路里凡是没写 `IdentityFile` 的中间跳板机都会在认证前崩溃。改为在现有
+  runtime 里直接 `await` agent 连接。
+- **接受 `none` 认证的跳板机连不上**。OpenSSH 会先试 `none`；例如 desk-ssh 网关
+  接受它、收到公钥反而拒绝。现在同样先试 `none`，被拒后再用密钥 / ssh-agent。
+- 认证失败的原因带上 `host:port`，多跳时能看出是哪一跳拒绝了密钥。
+
 ## [0.2.1] - 2026-11-08
 
 ### 新增
