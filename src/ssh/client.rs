@@ -33,6 +33,7 @@ use russh::keys::agent::client::AgentClient;
 use russh::keys::{PrivateKeyWithHashAlg, PublicKeyOrCertificate, load_secret_key};
 use tokio::net::{TcpListener, TcpStream};
 
+use crate::app::log as eventlog;
 use crate::model::{FailureInfo, FailureKind, ForwardKind, TunnelConfig, TunnelId};
 use crate::ssh::config::{self, Endpoint};
 use crate::ssh::{known_hosts, socks5};
@@ -237,6 +238,26 @@ impl client::Handler for Handler {
             self.shared.record(verdict);
             return Err(russh::Error::IO(std::io::Error::other(format!("写入 known_hosts 失败: {e}"))));
         }
+        // Every verdict is recorded: this is the only place that knows whether a
+        // session was refused for a security reason, and a refused session leaves
+        // no other trace once the TUI is gone.
+        let policy = match self.shared.policy {
+            known_hosts::HostKeyPolicy::Strict => "strict",
+            known_hosts::HostKeyPolicy::AcceptNew => "accept-new",
+            known_hosts::HostKeyPolicy::Ask => "ask",
+        };
+        match &verdict {
+            known_hosts::HostKeyVerdict::Trusted => {}
+            known_hosts::HostKeyVerdict::Unknown if accept => {
+                eventlog::host_key_learned(self.id, &self.host, self.port, "unknown")
+            }
+            _ => {
+                if !accept {
+                    let detail = verdict.describe(&self.host, self.port);
+                    eventlog::host_key_rejected(self.id, &self.host, self.port, policy, &detail);
+                }
+            }
+        }
         self.shared.record(verdict);
         Ok(accept)
     }
@@ -262,9 +283,14 @@ impl client::Handler for Handler {
             id: self.id,
             line: format!("远端连接 {connected_address}:{connected_port}（来自 {originator_address}）→ {host}:{port}"),
         });
+        let id = self.id;
         tokio::spawn(async move {
             let Ok(mut socket) = TcpStream::connect((host.as_str(), port)).await else {
-                return; // local target down: drop this connection, keep the tunnel
+                // Local target down: drop this one connection, keep the tunnel.
+                // Worth a record — otherwise the user sees a silent hang on the
+                // remote side with nothing explaining it.
+                eventlog::forward_target_failed(id, &format!("{host}:{port}"), "本地目标拒绝连接");
+                return;
             };
             let mut stream = channel.into_stream();
             let _ = tokio::io::copy_bidirectional(&mut socket, &mut stream).await;
@@ -566,6 +592,7 @@ async fn serve_local(
                 Err(e) => {
                     // A dead target must not tear the tunnel down — this matches
                     // `ssh -L` (the connection is refused, the forward survives).
+                    eventlog::forward_target_failed(id, &format!("{th}:{tp}"), &e.to_string());
                     let _ = tx.send(TunnelEvent::Line { id, line: format!("转发到 {th}:{tp} 失败: {e}") });
                 }
             }
@@ -622,11 +649,14 @@ async fn serve_dynamic(
     loop {
         let (mut socket, _origin) = listener.accept().await.context("accept 失败")?;
         let handle = handle.clone();
+        let socks_id = id;
         tokio::spawn(async move {
             if socks5::negotiate(&mut socket).await.is_err() {
+                eventlog::socks5_rejected(socks_id, "SOCKS5 握手失败");
                 return;
             }
             let Ok(req) = socks5::read_request(&mut socket).await else {
+                eventlog::socks5_rejected(socks_id, "SOCKS5 请求无法解析");
                 return;
             };
             match handle.channel_open_direct_tcpip(req.host.clone(), u32::from(req.port), "127.0.0.1", 0).await {
@@ -637,7 +667,10 @@ async fn serve_dynamic(
                     let mut stream = channel.into_stream();
                     let _ = tokio::io::copy_bidirectional(&mut socket, &mut stream).await;
                 }
-                Err(_) => socks5::reply_failure(&mut socket).await,
+                Err(e) => {
+                    eventlog::socks5_rejected(socks_id, &format!("{}:{} 打开失败: {e}", req.host, req.port));
+                    socks5::reply_failure(&mut socket).await
+                }
             }
         });
     }

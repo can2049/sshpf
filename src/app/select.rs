@@ -14,6 +14,7 @@
 //! * Batch actions still go through the confirmation gate. Even "enable" opens N
 //!   listeners at once — the same reason single-row enable-all asks.
 
+use crate::app::log as eventlog;
 use crate::app::{App, ConfirmAction, Overlay};
 use crate::model::{BatchAction, StatusMsg};
 
@@ -134,26 +135,37 @@ impl App {
             return;
         }
         let n = ids.len();
+        // "marked" and "changed" differ (a batch stop over already-stopped rows),
+        // and the discarded difference is exactly what makes a batch drain fast
+        // with no visible effect — worth recording.
+        let mut changed = 0usize;
         for id in &ids {
             match action {
                 BatchAction::Start => {
                     if self.tunnel(*id).is_some_and(|t| !t.status.is_running_or_pending()) {
-                        self.start_tunnel(*id);
+                        self.start_tunnel_with(*id, "batch");
+                        changed += 1;
                     }
                 }
                 BatchAction::Stop => {
                     if self.tunnel(*id).is_some_and(|t| t.status.is_running_or_pending()) {
-                        self.stop_tunnel(*id);
+                        self.stop_tunnel_with(*id, "batch");
+                        changed += 1;
                     }
                 }
                 BatchAction::Restart => {
                     self.supervisor.stop(*id);
                     self.forget_runtime_state(*id);
-                    self.start_tunnel(*id);
+                    self.start_tunnel_with(*id, "batch");
+                    changed += 1;
                 }
-                BatchAction::Delete => self.delete_tunnel(*id),
+                BatchAction::Delete => {
+                    self.delete_tunnel(*id);
+                    changed += 1;
+                }
             }
         }
+        eventlog::action_batch(action.name(), n, changed);
         // Deleting invalidates the marked ids; the others stay marked so the
         // user can follow up (e.g. start, then restart) without re-selecting.
         if action == BatchAction::Delete {

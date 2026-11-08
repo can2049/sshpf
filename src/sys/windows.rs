@@ -23,6 +23,14 @@ pub fn create_private_file(path: &Path) -> std::io::Result<std::fs::File> {
     std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(path)
 }
 
+/// Open for append, creating the file if needed.
+///
+/// Windows opens in append mode by default seeking to the end, which gives the
+/// same one-record-per-write behaviour the log relies on.
+pub fn open_private_append(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new().append(true).create(true).open(path)
+}
+
 /// No-op: see [`PRIVATE_FILE_MODE`].
 pub fn restrict_file(_path: &Path) -> std::io::Result<()> {
     Ok(())

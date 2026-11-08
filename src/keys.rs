@@ -141,7 +141,7 @@ fn handle_detail_key(app: &mut App, key: KeyEvent) {
 fn handle_confirm_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => app.confirm_yes(),
-        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => app.close_overlay(),
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => app.confirm_no(),
         _ => {}
     }
 }

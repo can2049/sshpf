@@ -10,7 +10,9 @@ use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
+use crate::app::log as eventlog;
 use crate::config::{self, ConfigFile, Paths};
+use crate::logging;
 use crate::model::{
     BatchAction, FailureInfo, FormMode, ForwardKind, HostPicker, MultiSelect, StatusMsg, TunnelConfig, TunnelId,
     TunnelStatus, TunnelView, fuzzy_match, now_unix,
@@ -21,6 +23,7 @@ use crate::tunnel::{Supervisor, TunnelEvent};
 pub mod confirm;
 pub mod form;
 pub mod import;
+pub mod log;
 pub mod mouse;
 pub mod picker;
 pub mod runtime;
@@ -138,10 +141,19 @@ pub struct App {
 
 impl App {
     pub fn new(paths: Paths) -> Self {
-        let cfg = config::load(&paths.config).unwrap_or_else(|e| {
-            eprintln!("警告: {e}; 以空配置启动");
-            ConfigFile::default()
-        });
+        let cfg = match config::load(&paths.config) {
+            Ok(cfg) => {
+                eventlog::config_loaded(&config::display_path(&paths.config), cfg.tunnels.len(), &[]);
+                cfg
+            }
+            Err(e) => {
+                // The user's definitions are about to be invisible; the log is
+                // the only place that survives to explain it afterwards.
+                eventlog::config_load_failed(&config::display_path(&paths.config), &e.to_string(), "empty_config");
+                eprintln!("警告: {e}; 以空配置启动");
+                ConfigFile::default()
+            }
+        };
         let (event_tx, event_rx) = mpsc::channel();
         let tunnels = build_views(&cfg);
         App {
@@ -285,10 +297,12 @@ impl App {
     pub fn load_hosts(&mut self) {
         match ssh::list_hosts() {
             Ok(hosts) => {
+                eventlog::hosts_loaded(hosts.len());
                 self.hosts = hosts;
                 self.hosts_error = None;
             }
             Err(e) => {
+                eventlog::hosts_failed(&e.to_string());
                 self.hosts.clear();
                 self.hosts_error = Some(e.to_string());
             }
@@ -355,6 +369,9 @@ impl App {
     /// id without moving the cursor between removals (a shuffled cursor would
     /// make `selected` mean a different tunnel on every iteration).
     pub fn delete_tunnel(&mut self, id: TunnelId) {
+        if let Some(view) = self.tunnels.iter().find(|t| t.cfg.id == id) {
+            eventlog::tunnel_deleted(&view.cfg);
+        }
         self.supervisor.stop(id);
         self.forget_runtime_state(id);
         self.cfg.tunnels.retain(|t| t.id != id);
@@ -386,19 +403,21 @@ impl App {
         let ids: Vec<TunnelId> =
             self.tunnels.iter().filter(|t| !t.status.is_running_or_pending()).map(|t| t.cfg.id).collect();
         for id in ids {
-            self.start_tunnel(id);
+            self.start_tunnel_with(id, "start_all");
         }
     }
 
     pub fn stop_all(&mut self) {
         let ids: Vec<TunnelId> = self.tunnels.iter().map(|t| t.cfg.id).collect();
         for id in ids {
-            self.stop_tunnel(id);
+            self.stop_tunnel_with(id, "stop_all");
         }
     }
 
     /// Stop every tunnel immediately without touching persisted intent.
     pub fn shutdown(&mut self) {
+        let up = self.tunnels.iter().filter(|t| t.status.is_active()).count();
+        logging::info("app.shutdown", &[("tunnels_active", &up), ("running", &self.supervisor.running_count())]);
         self.supervisor.stop_all();
         self.save_state();
     }
@@ -448,7 +467,10 @@ impl App {
                 slot.name = view.cfg.name.clone();
             }
         }
-        config::save(&self.paths.config, &self.cfg).map_err(|e| e.to_string())
+        config::save(&self.paths.config, &self.cfg).map_err(|e| {
+            eventlog::config_save_failed(&config::display_path(&self.paths.config), &e.to_string());
+            e.to_string()
+        })
     }
 
     fn persist_quietly(&mut self) {
@@ -462,7 +484,9 @@ impl App {
         for view in &self.tunnels {
             st.last_state.insert(view.cfg.id.to_string(), view.status.key().to_string());
         }
-        let _ = config::save_state(&self.paths.state, &st);
+        if let Err(e) = config::save_state(&self.paths.state, &st) {
+            eventlog::state_save_failed(&config::display_path(&self.paths.state), &e.to_string());
+        }
     }
 }
 

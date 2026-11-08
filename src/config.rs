@@ -239,15 +239,26 @@ pub fn load(path: &Path) -> Result<ConfigFile> {
     // Repair ids/names that collide due to hand editing.
     let mut seen = Vec::new();
     let mut next = 1;
+    let mut repaired = 0usize;
     for t in &mut cfg.tunnels {
+        let before = t.id;
         while t.id == 0 || seen.contains(&t.id) {
             t.id = next;
             next += 1;
         }
+        if t.id != before {
+            repaired += 1;
+        }
         seen.push(t.id);
         if t.created_at == 0 {
             t.created_at = now_unix();
+            repaired += 1;
         }
+    }
+    if repaired > 0 {
+        // Silent repair is a trap: the user's ids are not what they wrote, and
+        // any id mentioned in a bug report would otherwise look wrong.
+        crate::logging::warn("config.repaired", &[("path", &path.display().to_string()), ("entries", &repaired)]);
     }
     Ok(cfg)
 }

@@ -5,8 +5,37 @@
 //! next to the action that runs makes it hard to add a risky operation without
 //! also adding its confirmation.
 
+use crate::app::log as eventlog;
 use crate::app::{App, ConfirmAction, Overlay};
 use crate::model::StatusMsg;
+
+/// Stable name for a gated action, used as the `action=` field in the log.
+fn action_name(action: &ConfirmAction) -> String {
+    match action {
+        ConfirmAction::Delete(_) => "delete".to_string(),
+        ConfirmAction::Stop(_) => "stop".to_string(),
+        ConfirmAction::StopAll => "stop_all".to_string(),
+        ConfirmAction::Restart(_) => "restart".to_string(),
+        ConfirmAction::StartAll => "start_all".to_string(),
+        ConfirmAction::ApplyEdit(_) => "apply_edit".to_string(),
+        ConfirmAction::DiscardForm => "discard_form".to_string(),
+        ConfirmAction::Batch { action, .. } => format!("batch_{}", action.name()),
+        ConfirmAction::Quit => "quit".to_string(),
+    }
+}
+
+/// Human-readable target of a gated action (tunnel name or count).
+fn action_detail(app: &App, action: &ConfirmAction) -> String {
+    match action {
+        ConfirmAction::Delete(id)
+        | ConfirmAction::Stop(id)
+        | ConfirmAction::Restart(id)
+        | ConfirmAction::ApplyEdit(id) => app.tunnel(*id).map(|t| t.cfg.name.clone()).unwrap_or_default(),
+        ConfirmAction::Batch { count, .. } => format!("{count}"),
+        ConfirmAction::StopAll | ConfirmAction::StartAll => format!("{}", app.tunnels.len()),
+        _ => String::new(),
+    }
+}
 
 impl App {
     /// Arm a confirmation for `action`.
@@ -55,6 +84,7 @@ impl App {
                 _ => "确认执行该操作？".to_string(),
             },
         };
+        eventlog::action_requested(&action_name(&action), &prompt);
         self.overlay = Overlay::Confirm { action, prompt };
     }
 
@@ -75,7 +105,17 @@ impl App {
             return;
         };
         self.overlay = Overlay::None;
+        eventlog::action_applied(&action_name(&action), &action_detail(self, &action));
         self.apply_confirmed(action);
+    }
+
+    /// Cancel whatever gate is open. Logged because "the user hit esc" is the
+    /// explanation when a tunnel that was supposed to stop is still running.
+    pub fn confirm_no(&mut self) {
+        if let Overlay::Confirm { action, .. } = self.overlay.clone() {
+            eventlog::action_cancelled(&action_name(&action));
+        }
+        self.close_overlay();
     }
 
     pub(crate) fn apply_confirmed(&mut self, action: ConfirmAction) {

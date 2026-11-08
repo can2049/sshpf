@@ -357,6 +357,7 @@ impl App {
         }
 
         if !errors.is_empty() {
+            crate::app::log::import_rejected(&errors);
             if let Some(f) = self.form.as_mut() {
                 f.errors = errors;
             }
@@ -369,14 +370,17 @@ impl App {
     pub(crate) fn commit_import_batch(&mut self, configs: Vec<TunnelConfig>) {
         let n = configs.len();
         let first_id = configs.first().map(|c| c.id);
+        let host = configs.first().map(|c| c.ssh_host.clone()).unwrap_or_default();
+        crate::app::log::import_committed(&host, n);
         for cfg in &configs {
+            crate::app::log::tunnel_created(cfg, "import");
             self.cfg.tunnels.push(cfg.clone());
             self.tunnels.push(TunnelView::new(cfg.clone()));
         }
         self.close_overlay();
         self.persist_quietly();
         for cfg in &configs {
-            self.start_tunnel(cfg.id);
+            self.start_tunnel_with(cfg.id, "created");
         }
         // Put the cursor on the first created tunnel so the user lands where the
         // work happened instead of on a row that may be far away.

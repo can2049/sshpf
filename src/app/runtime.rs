@@ -9,8 +9,10 @@
 
 use std::time::{Duration, Instant};
 
+use crate::app::log as eventlog;
 use crate::app::{App, ConfirmAction, RetryState, backoff};
 use crate::config;
+use crate::logging;
 use crate::model::{FailureInfo, FailureKind, ForwardKind, LogLevel, LogLine, StatusMsg, TunnelId, TunnelStatus};
 use crate::ssh;
 use crate::tunnel::TunnelEvent;
@@ -26,8 +28,9 @@ impl App {
             return;
         }
         let n = ids.len();
+        logging::info("app.restore", &[("tunnels", &n)]);
         for id in ids {
-            self.start_tunnel(id);
+            self.start_tunnel_with(id, "restore");
         }
         self.set_status(StatusMsg::info(format!("正在恢复 {n} 条转发…")));
     }
@@ -55,14 +58,25 @@ impl App {
 
     /// Start (or restart) one tunnel.
     pub fn start_tunnel(&mut self, id: TunnelId) {
+        self.start_tunnel_with(id, "manual");
+    }
+
+    /// Start one tunnel, recording *why* it was started.
+    ///
+    /// `trigger` is one of `manual`, `restore`, `retry`, `batch`; it goes into the
+    /// log so a reconnect storm is distinguishable from a user pressing space.
+    pub(crate) fn start_tunnel_with(&mut self, id: TunnelId, trigger: &str) {
         let Some(cfg) = self.tunnels.iter().find(|t| t.cfg.id == id).map(|t| t.cfg.clone()) else {
+            eventlog::orphan_event("start", id);
             return;
         };
+        eventlog::tunnel_start_requested(&cfg, trigger);
         self.arm_retry(id);
 
         // 1. Definition-level validation.
         if let Err(e) = config::validate_tunnel(&cfg) {
             let info = FailureInfo::with_short(FailureKind::Unknown, "配置无效", e.to_string());
+            eventlog::tunnel_start_rejected(&cfg, "validate", &info);
             self.set_state(id, TunnelStatus::Failed { reason: info });
             self.log(id, LogLevel::Error, format!("配置无效: {e}"));
             self.set_status(StatusMsg::error(format!("{}: {e}", cfg.name)));
@@ -80,6 +94,7 @@ impl App {
                     None => format!("{addr}:{port} 已被占用"),
                 };
                 let info = FailureInfo::with_short(FailureKind::PortInUse, "本地端口被占用", detail.clone());
+                eventlog::tunnel_start_rejected(&cfg, "preflight_bind", &info);
                 self.set_state(id, TunnelStatus::Failed { reason: info });
                 self.log(id, LogLevel::Error, detail.clone());
                 self.set_status(StatusMsg::error(format!("{}: {detail}", cfg.name)));
@@ -103,9 +118,17 @@ impl App {
                 if !endpoint.proxy_jump.is_empty() {
                     self.log(id, LogLevel::Info, format!("经跳板机: {}", endpoint.proxy_jump.join(" → ")));
                 }
+                eventlog::tunnel_spawned(
+                    &cfg,
+                    &format!("{}@{}:{}", endpoint.user_or_current(), endpoint.hostname, endpoint.port),
+                    &endpoint.proxy_jump,
+                    eventlog::host_key_policy_name(self.host_key_policy),
+                );
             }
             Err(e) => {
                 let info = FailureInfo::with_short(FailureKind::AuthFailed, "无法解析 SSH 主机", format!("{e:#}"));
+                eventlog::host_resolve_failed(&cfg, &format!("{e:#}"));
+                eventlog::tunnel_start_rejected(&cfg, "resolve_endpoint", &info);
                 self.set_state(id, TunnelStatus::Failed { reason: info });
                 self.log(id, LogLevel::Error, format!("解析 SSH 主机失败: {e:#}"));
                 self.set_status(StatusMsg::error(format!("{}: 无法解析 SSH 主机", cfg.name)));
@@ -125,6 +148,7 @@ impl App {
             Err(e) => {
                 let short: String = e.to_string().chars().take(28).collect();
                 let info = FailureInfo::with_short(FailureKind::SpawnFailed, short, format!("启动隧道失败: {e}"));
+                eventlog::tunnel_spawn_failed(&cfg, &e.to_string());
                 self.set_state(id, TunnelStatus::Failed { reason: info });
                 self.log(id, LogLevel::Error, format!("启动隧道失败: {e}"));
                 self.set_status(StatusMsg::error(format!("{} 启动失败: {e}", cfg.name)));
@@ -135,6 +159,15 @@ impl App {
 
     /// Stop one tunnel and clear its `enabled` flag (user intent).
     pub fn stop_tunnel(&mut self, id: TunnelId) {
+        self.stop_tunnel_with(id, "manual");
+    }
+
+    /// Stop one tunnel, recording *why* (stop-all, batch, quit, …).
+    pub(crate) fn stop_tunnel_with(&mut self, id: TunnelId, trigger: &str) {
+        match self.tunnels.iter().find(|t| t.cfg.id == id) {
+            Some(view) => eventlog::tunnel_stopped(&view.cfg, trigger),
+            None => eventlog::orphan_event("stop", id),
+        }
         self.supervisor.stop(id);
         self.forget_runtime_state(id);
         self.set_enabled(id, false);
@@ -192,6 +225,10 @@ impl App {
                 }
                 TunnelEvent::SpawnFailed { id, error } => {
                     let info = FailureInfo::with_short(FailureKind::SpawnFailed, "无法启动 ssh", error);
+                    match self.tunnels.iter().find(|t| t.cfg.id == id) {
+                        Some(view) => eventlog::tunnel_spawn_failed(&view.cfg, &info.detail),
+                        None => eventlog::orphan_event("spawn_failed", id),
+                    }
                     self.set_state(id, TunnelStatus::Failed { reason: info });
                 }
             }
@@ -234,6 +271,12 @@ impl App {
             return;
         }
         let name = view.cfg.name.clone();
+        let cfg = view.cfg.clone();
+        let started = match view.status {
+            TunnelStatus::Starting { since } => since.elapsed().as_millis(),
+            _ => 0,
+        };
+        eventlog::tunnel_ready(&cfg, started);
         self.set_state(id, TunnelStatus::Up { since: Instant::now() });
         self.retry_state.remove(&id);
         self.pending_exit.remove(&id);
@@ -253,6 +296,9 @@ impl App {
     /// worked around.
     pub(crate) fn on_line(&mut self, id: TunnelId, line: String) {
         let level = if line.contains("失败") || line.contains("错误") { LogLevel::Warn } else { LogLevel::Info };
+        if let Some(view) = self.tunnels.iter().find(|t| t.cfg.id == id) {
+            eventlog::tunnel_line(&view.cfg, &line);
+        }
         self.log(id, level, line);
     }
 
@@ -271,9 +317,11 @@ impl App {
     pub(crate) fn on_exit(&mut self, id: TunnelId, code: Option<i32>) {
         let classified = self.pending_reason.remove(&id).flatten();
         let Some(view) = self.tunnels.iter().find(|t| t.cfg.id == id) else {
+            eventlog::orphan_event("exit", id);
             return;
         };
         let status = view.status.clone();
+        let cfg = view.cfg.clone();
         // A deliberate stop already reset the status; nothing to do.
         if matches!(status, TunnelStatus::Stopped) {
             return;
@@ -310,12 +358,19 @@ impl App {
             let delay = backoff(entry.attempt, self.cfg.defaults.retry_initial_secs, self.cfg.defaults.retry_max_secs);
             entry.next_at = Instant::now() + delay;
             let (attempt, next_at) = (entry.attempt, entry.next_at);
+            // The classified cause of a *drop* is not a failure the user must
+            // act on: recording it at warn with the scheduled delay is what tells
+            // a reconnect storm apart from a one-off blip.
+            eventlog::tunnel_exit(&cfg, was_up, code, Some(&reason));
+            eventlog::tunnel_retry_scheduled(&cfg, attempt, delay.as_millis(), &reason);
             self.set_state(id, TunnelStatus::Retrying { attempt, next_at, reason });
             if let Some(v) = self.tunnels.iter_mut().find(|t| t.cfg.id == id) {
                 v.retries = attempt;
             }
             return;
         }
+        eventlog::tunnel_exit(&cfg, was_up, code, Some(&reason));
+        eventlog::tunnel_failed(&cfg, &reason);
         self.set_state(id, TunnelStatus::Failed { reason });
     }
 
@@ -337,7 +392,7 @@ impl App {
                 r.next_at = now + delay;
             }
             self.log(id, LogLevel::Info, format!("第 {attempt} 次自动重连…"));
-            self.start_tunnel(id);
+            self.start_tunnel_with(id, "retry");
         }
     }
 
