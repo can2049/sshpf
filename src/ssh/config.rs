@@ -53,8 +53,12 @@ pub struct SshHost {
     pub hostname: String,
     pub user: Option<String>,
     pub port: u16,
-    /// First jump host of `ProxyJump`, if any.
-    pub proxy_jump: Option<String>,
+    /// `ProxyJump` hops exactly as written, first hop first.
+    ///
+    /// Empty when the host declares no `ProxyJump` (or sets it to `none`).
+    /// Keeping the whole list matters: OpenSSH treats `ProxyJump a,b` as the
+    /// chain `a → b`, so dropping everything after `a` silently removes hops.
+    pub proxy_jump: Vec<String>,
     /// First `IdentityFile` (token-expanded only for `~` / `%d`).
     pub identity_file: Option<String>,
 }
@@ -97,10 +101,15 @@ impl SshHost {
             hostname: p.host_name.clone().unwrap_or_else(|| alias.to_string()),
             user: p.user.clone(),
             port: p.port.unwrap_or(DEFAULT_PORT),
-            proxy_jump: p.proxy_jump.as_ref().and_then(|j| j.first().cloned()).filter(|j| j != "none"),
+            proxy_jump: proxy_jump_list(p),
             identity_file: p.identity_file.as_ref().and_then(|v| v.first()).map(|p| p.display().to_string()),
         }
     }
+}
+
+/// The whole `ProxyJump` list of a host, with the `none` sentinel removed.
+fn proxy_jump_list(p: &ssh2_config::HostParams) -> Vec<String> {
+    p.proxy_jump.clone().unwrap_or_default().into_iter().filter(|j| j != "none").collect()
 }
 
 /// Configuration file locations to read.
@@ -210,7 +219,7 @@ pub fn resolve_host(alias: &str) -> Result<SshHost> {
             hostname: alias.to_string(),
             user: None,
             port: DEFAULT_PORT,
-            proxy_jump: None,
+            proxy_jump: Vec::new(),
             identity_file: None,
         });
     };
@@ -244,7 +253,7 @@ fn parse_inline_destination(s: &str) -> Option<SshHost> {
     if user.is_none() && port == DEFAULT_PORT {
         return None;
     }
-    Some(SshHost { alias: s.to_string(), hostname: host, user, port, proxy_jump: None, identity_file: None })
+    Some(SshHost { alias: s.to_string(), hostname: host, user, port, proxy_jump: Vec::new(), identity_file: None })
 }
 
 /// Everything the tunnel layer needs to reach a host, resolved from config.
@@ -267,21 +276,10 @@ impl Endpoint {
     pub fn resolve(ssh_host: &str) -> Result<Endpoint> {
         let host = resolve_host(ssh_host)?;
         let cfg = load_config()?;
-        let mut proxy_jump = Vec::new();
-        if let Some(cfg) = &cfg {
-            // `query` already folds in aliases; walk the chain so a jump host
-            // that itself declares ProxyJump is followed too.
-            let mut current = host.proxy_jump.clone();
-            let mut guard = 0;
-            while let Some(jump) = current {
-                if guard > 8 || proxy_jump.contains(&jump) {
-                    break; // cycle / runaway guard
-                }
-                proxy_jump.push(jump.clone());
-                current = cfg.query(&jump).proxy_jump.as_ref().and_then(|v| v.first().cloned()).filter(|j| j != "none");
-                guard += 1;
-            }
-        }
+        let proxy_jump = match &cfg {
+            Some(cfg) => proxy_chain(cfg, &host.proxy_jump),
+            None => Vec::new(),
+        };
         Ok(Endpoint {
             hostname: host.hostname,
             port: host.port,
@@ -301,6 +299,47 @@ impl Endpoint {
     }
 }
 
+/// The hops to dial for `jumps` (a host's `ProxyJump` list), first hop first.
+fn proxy_chain(cfg: &SshConfig, jumps: &[String]) -> Vec<String> {
+    let mut chain = Vec::new();
+    let mut seen = Vec::new();
+    expand_proxy_jump(cfg, jumps, &mut seen, &mut chain);
+    chain
+}
+
+/// Expand one `ProxyJump` list into the hops to dial, first hop first.
+///
+/// `ProxyJump a,b` is OpenSSH's explicit chain `a → b`: `b` is reached over a
+/// channel opened by `a`. The list therefore has to stay whole — keeping only
+/// `a` silently drops every hop after the first.
+///
+/// The *first* hop is reached by a plain `ssh`, which still honours that hop's
+/// own `ProxyJump`, so its chain is expanded and prepended recursively (measured
+/// against OpenSSH: `Host A ProxyJump B` plus `Host B ProxyJump C` produces the
+/// chain `C → B`). Hops after the first are reached through `-J`, which
+/// overrides their own `ProxyJump`, so they are appended as written.
+///
+/// A repeated alias stops the expansion instead of looping forever.
+fn expand_proxy_jump(cfg: &SshConfig, jumps: &[String], seen: &mut Vec<String>, chain: &mut Vec<String>) {
+    let Some((first, rest)) = jumps.split_first() else {
+        return;
+    };
+    if seen.contains(first) {
+        return; // cycle (a → b → a) or a hop already on the chain
+    }
+    seen.push(first.clone());
+    let nested = proxy_jump_list(&cfg.query(first));
+    expand_proxy_jump(cfg, &nested, seen, chain);
+    chain.push(first.clone());
+    for hop in rest {
+        if seen.contains(hop) {
+            continue;
+        }
+        seen.push(hop.clone());
+        chain.push(hop.clone());
+    }
+}
+
 /// Resolve the endpoint for a tunnel definition.
 pub fn endpoint_for(cfg: &TunnelConfig) -> Result<Endpoint> {
     Endpoint::resolve(&cfg.ssh_host)
@@ -314,6 +353,19 @@ pub fn jump_endpoint(alias: &str) -> Result<Endpoint> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Parse a config snippet the way `load_config` does, without touching the
+    /// real `~/.ssh/config` (tests must not depend on the machine they run on).
+    fn parsed(src: &str) -> SshConfig {
+        let mut reader = BufReader::new(src.as_bytes());
+        SshConfig::default().parse(&mut reader, ParseRule::ALLOW_UNKNOWN_FIELDS).unwrap()
+    }
+
+    /// The chain `Endpoint::resolve` would dial for `alias`.
+    fn chain_for(cfg: &SshConfig, alias: &str) -> Vec<String> {
+        let host = SshHost::from_params(alias, &cfg.query(alias));
+        proxy_chain(cfg, &host.proxy_jump)
+    }
 
     #[test]
     fn inline_destination_parsing() {
@@ -413,6 +465,119 @@ Host *
         assert_eq!(h.port, 2222);
     }
 
+    /// Regression: only the first hop of a comma-separated `ProxyJump` used to
+    /// survive. The user's real config is `ProxyJump office_pc,ali_cloud_pc_jump`
+    /// and the missing second hop made every attempt fail with
+    /// "Failed to open channel (ConnectFailed)": office_pc has no route to the
+    /// cloud host, the jump host it was supposed to hand over to does.
+    #[test]
+    fn proxy_jump_keeps_every_hop() {
+        let cfg = parsed(
+            "\
+Host cloud_pc
+  HostName 10.244.119.128
+  ProxyJump office_pc,ali_cloud_pc_jump
+Host office_pc
+  HostName 10.24.96.190
+Host ali_cloud_pc_jump
+  HostName desk-ssh.srv.deeproute.cn
+  Port 80
+",
+        );
+        let host = SshHost::from_params("cloud_pc", &cfg.query("cloud_pc"));
+        assert_eq!(host.proxy_jump.join(","), "office_pc,ali_cloud_pc_jump");
+        // ... and the dial order is OpenSSH's: office_pc first, then the jump host.
+        assert_eq!(chain_for(&cfg, "cloud_pc").join(","), "office_pc,ali_cloud_pc_jump");
+    }
+
+    #[test]
+    fn proxy_jump_none_means_direct() {
+        let cfg = parsed("Host direct\n  HostName 10.0.0.5\n  ProxyJump none\n");
+        let host = SshHost::from_params("direct", &cfg.query("direct"));
+        assert!(host.proxy_jump.is_empty(), "`none` must not become a hop");
+        assert!(chain_for(&cfg, "direct").is_empty());
+    }
+
+    /// OpenSSH prepends the first hop's own chain: with `A -> B` and `B -> C`,
+    /// reaching `A` dials `C`, then `B`, then `A`. The pre-fix code appended it
+    /// instead (`B`, then `C`), which is the wrong order.
+    #[test]
+    fn nested_proxy_jump_of_first_hop_is_prepended() {
+        let cfg = parsed(
+            "\
+Host A
+  HostName 10.244.119.128
+  ProxyJump B
+Host B
+  HostName desk-ssh.srv.deeproute.cn
+  Port 80
+  ProxyJump office_pc
+Host office_pc
+  HostName 10.24.96.190
+",
+        );
+        assert_eq!(chain_for(&cfg, "A").join(","), "office_pc,B");
+    }
+
+    /// Hops after the first are reached over a channel opened by the previous
+    /// hop, so `-J` overrides their own `ProxyJump`; it must not be expanded.
+    #[test]
+    fn later_hops_do_not_contribute_their_own_proxy_jump() {
+        let cfg = parsed(
+            "\
+Host A
+  HostName 10.244.119.128
+  ProxyJump B,C
+Host B
+  HostName b.example
+Host C
+  HostName c.example
+  ProxyJump office_pc
+Host office_pc
+  HostName 10.24.96.190
+",
+        );
+        assert_eq!(chain_for(&cfg, "A").join(","), "B,C");
+    }
+
+    /// A `ProxyJump` loop must stop expanding instead of hanging the UI thread.
+    #[test]
+    fn proxy_jump_cycle_is_bounded() {
+        let cfg = parsed(
+            "\
+Host A
+  HostName 10.0.0.1
+  ProxyJump B
+Host B
+  HostName 10.0.0.2
+  ProxyJump A
+",
+        );
+        let chain = chain_for(&cfg, "A");
+        assert!(chain.len() <= 2, "a cycle must not grow the chain: {chain:?}");
+        let mut unique = chain.clone();
+        unique.dedup();
+        assert_eq!(unique, chain, "no hop may appear twice: {chain:?}");
+    }
+
+    /// `Host *` defaults can carry the whole list too.
+    #[test]
+    fn proxy_jump_list_is_inherited_from_star() {
+        let cfg = parsed(
+            "\
+Host target
+  HostName 10.0.0.9
+Host *
+  ProxyJump bastion,gateway
+Host bastion
+  HostName 10.0.0.1
+Host gateway
+  HostName 10.0.0.2
+",
+        );
+        assert_eq!(chain_for(&cfg, "target").join(","), "bastion,gateway");
+    }
+
     #[test]
     fn wildcard_hosts_are_not_listed_as_aliases() {
         let src = "\
@@ -444,7 +609,7 @@ Host *
             hostname: "10.0.0.1".into(),
             user: Some("alice".into()),
             port: 2222,
-            proxy_jump: None,
+            proxy_jump: Vec::new(),
             identity_file: None,
         };
         assert_eq!(h.display(), "web (alice@10.0.0.1:2222)");

@@ -832,7 +832,7 @@ mod tests {
             hostname: "127.0.0.1".into(),
             user: Some("u".into()),
             port: 22,
-            proxy_jump: None,
+            proxy_jump: Vec::new(),
             identity_file: None,
         }];
         handle_key(&mut app, ch('n'));
