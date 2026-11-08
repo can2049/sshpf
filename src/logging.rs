@@ -53,6 +53,7 @@
 //!   the file only. The crash path is the single exception, after it has left
 //!   the alternate screen.
 
+use std::cell::Cell;
 use std::fmt::{self, Write as _};
 use std::fs::{self, File};
 use std::io::{self, Write};
@@ -191,6 +192,82 @@ pub struct Logger {
     sink: Option<Mutex<Sink>>,
 }
 
+// ---------------------------------------------------------------------------
+// reentrancy guard
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    /// `true` while *this thread* is inside the logger's critical section.
+    ///
+    /// `std::sync::Mutex` is not reentrant, and re-locking it from the thread
+    /// that already holds it does not return `Err(poisoned)` — it blocks
+    /// forever. That is not the case [`Logger::record`]'s poison handling
+    /// covers; it is a hang, and the way to reach it is the panic hook:
+    /// a panic raised inside `record` (a `Display` impl, the timezone lookup,
+    /// the I/O) makes the hook call `record` again on the same thread, which
+    /// would then wait on a mutex that can only be released by the panicking
+    /// frame. The process would sit there with the terminal in the alternate
+    /// screen and not one byte in the log. This flag is how the hook notices.
+    static IN_CRITICAL_SECTION: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Marks the logger's critical section for as long as it is alive.
+///
+/// Cleared in `Drop`, so a panic unwinding out of `record` cannot leave the flag
+/// stuck. (`panic = "abort"` skips the `Drop`, but it also kills the process,
+/// which makes a stuck flag irrelevant.)
+struct CriticalSection;
+
+impl CriticalSection {
+    /// `None` when this thread is already inside the logger: the caller must
+    /// degrade instead of locking.
+    fn enter() -> Option<CriticalSection> {
+        // `try_with` fails only while the thread-local is being destroyed. Treat
+        // that as "not re-entrant": during TLS teardown there is no panic hook
+        // left to protect anyway.
+        IN_CRITICAL_SECTION
+            .try_with(|flag| !flag.replace(true))
+            .ok()
+            .and_then(|fresh| if fresh { Some(CriticalSection) } else { None })
+    }
+}
+
+impl Drop for CriticalSection {
+    fn drop(&mut self) {
+        let _ = IN_CRITICAL_SECTION.try_with(|flag| flag.set(false));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// degraded write path
+// ---------------------------------------------------------------------------
+
+/// Whether the reentrancy note has been emitted. One line is enough: a repeat
+/// adds nothing and stderr may be a terminal the user is still looking at.
+static REENTRANT_NOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Report a write that had to be skipped because this thread already holds the
+/// logger.
+///
+/// The sink itself is unusable (that is the whole problem), so evidence goes to
+/// the two places that cannot deadlock: stderr for the human watching the crash,
+/// and — best effort — the pre-`dup`ed crash descriptor, which is written with a
+/// bare `write(2)` and needs no lock.
+fn report_reentrant(event: &str) {
+    use std::sync::atomic::Ordering;
+    if REENTRANT_NOTED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    // `writeln!` on a `Stderr` handle returns a `Result`; `eprintln!` panics when
+    // stderr is gone, and panicking inside a panic hook aborts the process.
+    let _ = writeln!(
+        io::stderr(),
+        "[sshpf] 日志系统重入（event={}）：该条记录被跳过以免死锁；崩溃信息请看本行前后的 panic 输出。",
+        event
+    );
+    fatal::emergency(event);
+}
+
 impl Logger {
     /// A logger that writes nothing. Used before [`init`] and by tests.
     pub fn disabled() -> Logger {
@@ -217,8 +294,12 @@ impl Logger {
     }
 
     /// Path of the active file, if this logger writes to one.
+    ///
+    /// Returns `None` when called re-entrantly (from inside a record on the same
+    /// thread): reporting the path is never important enough to risk the hang.
     pub fn path(&self) -> Option<PathBuf> {
         let mutex = self.sink.as_ref()?;
+        let _critical = CriticalSection::enter()?;
         let sink = mutex.lock().ok()?;
         Some(sink.path.clone())
     }
@@ -257,37 +338,60 @@ impl Logger {
         if !force && !self.enabled(level) {
             return;
         }
-        let mut guard = match mutex.lock() {
-            Ok(g) => g,
-            // A panic while the lock was held must not disable logging forever.
-            Err(poisoned) => poisoned.into_inner(),
+        // Built *before* the lock: `Local::now()` consults the timezone database
+        // and can panic on a corrupt one, and a panic while holding the sink is
+        // the deadlock this function is careful to avoid.
+        let timestamp = now_timestamp();
+
+        let rotated = {
+            // Re-entered from this thread (a panic hook firing inside `record`):
+            // locking again would hang, so degrade instead.
+            let Some(_critical) = CriticalSection::enter() else {
+                report_reentrant(event);
+                return;
+            };
+            let mut guard = match mutex.lock() {
+                Ok(g) => g,
+                // A panic while the lock was held must not disable logging forever.
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let sink = &mut *guard;
+
+            // `saturating_*` rather than `+`: this code runs in the panic hook, so
+            // "the counter cannot realistically overflow" is not good enough — a
+            // panic here would abort instead of leaving the crash record.
+            let seq = sink.seq.saturating_add(1);
+            let mut line = String::with_capacity(192);
+            let _ = write!(line, "{} {:<5} seq={seq} event={}", timestamp, level.as_str(), token(event));
+            for (key, value) in fields {
+                line.push(' ');
+                line.push_str(&token(key));
+                line.push('=');
+                push_value(&mut line, &value.to_string());
+            }
+            line.push('\n');
+
+            // Rotate *before* appending, so a record never straddles two files (a
+            // half-record at a rotation boundary is unparseable).
+            let needed = line.len() as u64;
+            let mut rotated = false;
+            if sink.max_bytes > 0
+                && sink.size > 0
+                && sink.size.saturating_add(needed) > sink.max_bytes
+                && rotate(sink, self.is_global()).is_ok()
+            {
+                rotated = true;
+            }
+
+            if sink.file.write_all(line.as_bytes()).is_ok() {
+                sink.seq = seq;
+                sink.size = sink.size.saturating_add(needed);
+            }
+            rotated
+            // `guard` and `_critical` are both dropped here, so the rewire below
+            // takes a fresh critical section instead of being mistaken for a
+            // re-entrant call.
         };
-        let sink = &mut *guard;
-
-        let seq = sink.seq + 1;
-        let mut line = String::with_capacity(192);
-        let _ = write!(line, "{} {:<5} seq={seq} event={}", now_timestamp(), level.as_str(), token(event));
-        for (key, value) in fields {
-            line.push(' ');
-            line.push_str(&token(key));
-            line.push('=');
-            push_value(&mut line, &value.to_string());
-        }
-        line.push('\n');
-
-        // Rotate *before* appending, so a record never straddles two files (a
-        // half-record at a rotation boundary is unparseable).
-        let needed = line.len() as u64;
-        let mut rotated = false;
-        if sink.max_bytes > 0 && sink.size > 0 && sink.size + needed > sink.max_bytes && rotate(sink).is_ok() {
-            rotated = true;
-        }
-
-        if sink.file.write_all(line.as_bytes()).is_ok() {
-            sink.seq = seq;
-            sink.size += needed;
-        }
-        drop(guard);
         if rotated && self.is_global() {
             self.rewire_crash_fd();
         }
@@ -296,9 +400,13 @@ impl Logger {
     /// Force a rotation. Used by tests and for an operator-triggered log split.
     pub fn rotate_now(&self) -> io::Result<()> {
         let Some(mutex) = &self.sink else { return Ok(()) };
-        let mut guard = mutex.lock().unwrap_or_else(|p| p.into_inner());
-        rotate(&mut guard)?;
-        drop(guard);
+        {
+            let Some(_critical) = CriticalSection::enter() else {
+                return Err(io::Error::other("日志系统重入，已跳过轮转"));
+            };
+            let mut guard = mutex.lock().unwrap_or_else(|p| p.into_inner());
+            rotate(&mut guard, self.is_global())?;
+        }
         if self.is_global() {
             self.rewire_crash_fd();
         }
@@ -315,6 +423,11 @@ impl Logger {
     /// steal the descriptor a real crash would need.
     fn rewire_crash_fd(&self) {
         let Some(mutex) = &self.sink else { return };
+        // Called from `record`/`rotate_now` only *after* their guard is dropped,
+        // so this is a fresh entry, not a re-entrant one. If it ever were
+        // re-entrant, skipping is still better than hanging: the previously
+        // adopted fd keeps working.
+        let Some(_critical) = CriticalSection::enter() else { return };
         let guard = match mutex.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
@@ -344,14 +457,23 @@ impl fmt::Debug for Logger {
 ///
 /// History is `sshpf.log.1` (newest) … `sshpf.log.<keep>` (oldest). A failed
 /// archive rename is ignored: losing history beats losing the present.
-fn rotate(sink: &mut Sink) -> io::Result<()> {
+///
+/// `owns_crash_fd` is `true` only when this sink belongs to the process-global
+/// logger. The crash descriptor is a single process-wide slot, so a *test-local*
+/// logger rotating its own file must not touch it: doing so closed the fd the
+/// global logger had adopted and made the fatal-signal record vanish — which is
+/// exactly how a concurrent `cargo test --lib` run could lose
+/// `fatal_signal_handler_really_writes_a_record` intermittently.
+fn rotate(sink: &mut Sink, owns_crash_fd: bool) -> io::Result<()> {
     let dir = sink.path.parent().unwrap_or_else(|| Path::new("."));
     let archive = |n: usize| dir.join(format!("{LOG_FILE_NAME}.{n}"));
 
     // Detach the crash descriptor first: it is a `dup` of the file about to be
     // renamed, so a crash in this window would append to the archive instead of
     // the active file. The caller re-attaches it right after rotation.
-    fatal::release();
+    if owns_crash_fd {
+        fatal::release();
+    }
 
     let _ = fs::remove_file(archive(sink.keep));
     for n in (1..sink.keep).rev() {
@@ -374,8 +496,34 @@ fn rotate(sink: &mut Sink) -> io::Result<()> {
 
 /// `2026-11-08T18:20:01.123+08:00` — millisecond precision in local time, which
 /// is what lets sshpf records line up with `journalctl` and sshd output.
+///
+/// Deliberately **not** `chrono::Local::now()`: that is `Utc::now()` followed by a
+/// local-offset lookup, and `Utc::now()` is
+/// `SystemTime::now().duration_since(UNIX_EPOCH).expect("system time before Unix
+/// epoch")`. A board without an RTC — or a container started before its clock is
+/// synced — has a pre-epoch clock, and this function runs inside the panic hook,
+/// where a nested panic aborts the process instead of leaving a crash record.
+/// Building the instant by hand cannot panic; a pre-epoch clock simply formats as
+/// 1970-01-01.
 pub fn now_timestamp() -> String {
-    chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.3f%:z").to_string()
+    const FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.3f%:z";
+    let elapsed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let secs = i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX);
+    let Some(utc) = chrono::DateTime::from_timestamp(secs, elapsed.subsec_nanos()) else {
+        // Only reachable with a clock set past the representable range; keep the
+        // record instead of losing it.
+        return format!("epoch={secs}");
+    };
+    // The local-offset lookup is the one third-party call here that can still
+    // panic: `chrono`'s `Local::offset_from_utc_datetime` is
+    // `.expect("unable to select local time type")` over a fallible TZif lookup,
+    // which a corrupt `/usr/share/zoneinfo` can fail. There is no fallible public
+    // API to use instead, and this function is on the panic-hook path, where a
+    // nested panic aborts the process — so `catch_unwind` here is the documented
+    // last-resort case, and the fallback (UTC) is a fully valid record rather than
+    // a lost one.
+    std::panic::catch_unwind(|| utc.with_timezone(&chrono::Local).format(FORMAT).to_string())
+        .unwrap_or_else(|_| utc.format(FORMAT).to_string())
 }
 
 /// Keys and event names are parsed by splitting on `=` and whitespace, so either
@@ -498,8 +646,17 @@ pub fn message(level: Level, event: &str, text: &str) {
 /// Install the panic hook and (on Unix) the fatal-signal handlers.
 ///
 /// Call once, as early as possible, so a panic during start-up is captured too.
-/// The panic hook chains to whatever hook was installed before it, which is how
-/// `ratatui`'s terminal restore keeps working when it installs its hook later.
+///
+/// # Interaction with `ratatui`
+///
+/// This hook chains to whatever hook was installed before it, and it is installed
+/// from `main` *before* `ratatui::try_init()`. `try_init` then wraps **this** hook
+/// in its own (whose first action is to restore the terminal), so a panic runs
+/// ratatui's restore and then this record — in that order, which is the one both
+/// libraries document. The reverse order would restore the terminal and then
+/// still write the crash record, so the ordering is not critical, but it is
+/// verified: see `the_hook_chain_runs_ratatuis_restore_before_recording` and the
+/// real crash tests in `tests/logging.rs`.
 pub fn install_crash_hooks() {
     install_panic_hook();
     fatal::install();
@@ -510,7 +667,13 @@ fn install_panic_hook() {
     std::panic::set_hook(Box::new(move |info| {
         let logger = logger();
         if logger.is_active() {
-            log_panic(logger, info);
+            // A panic raised *inside* this hook aborts the process on the spot
+            // ("thread panicked while processing panic"), taking the original
+            // panic message with it. Everything here is therefore infallible by
+            // construction, and `catch_unwind` is only the belt to that braces:
+            // if it ever is wrong, the process still gets the upstream hook and
+            // its terminal restore.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| log_panic(logger, info)));
         }
         previous(info);
     }));
@@ -518,6 +681,10 @@ fn install_panic_hook() {
 
 /// Turn one panic into a `crash.panic` record plus its trace block.
 fn log_panic(logger: &Logger, info: &std::panic::PanicHookInfo<'_>) {
+    // Every step below is fallible in a "would panic again" sense: `Display` of a
+    // user type, `panic::Location`, a thread name, and capturing a backtrace. They
+    // are all fallbacks by use of `Option`/`unwrap_or`, so no allocation failure
+    // or non-string payload can turn one crash into an abort.
     let payload = payload_text(info);
     let location = info.location().map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()));
     let thread = std::thread::current().name().unwrap_or("<unnamed>").to_string();
@@ -732,6 +899,28 @@ mod fatal {
         }
     }
 
+    /// Leave one line in the log file when the normal writer cannot be used.
+    ///
+    /// Called from the *re-entrancy* degrade path, not from a signal handler, so
+    /// formatting and allocation are allowed here; the write still goes through
+    /// the pre-`dup`ed descriptor with a bare `write(2)`, which needs no lock and
+    /// therefore cannot deadlock. The signature is shared with the non-Unix stub.
+    pub fn emergency(event: &str) {
+        let fd = LOG_FD.load(Ordering::Relaxed);
+        if fd < 0 {
+            return;
+        }
+        // No `now_timestamp()` here: this path is already the "something in the
+        // writer went wrong" path, so it must stay as dumb as possible.
+        let line = format!(
+            "ts={} ERROR seq=0 event=crash.log_reentrant cause={} msg=\"日志写入重入，记录被跳过以避免死锁\"\n",
+            // SAFETY: `time(null)` is async-signal-safe and cannot fail.
+            unsafe { libc::time(std::ptr::null_mut()) },
+            event
+        );
+        write_all(fd, line.as_bytes());
+    }
+
     /// Note whether the TUI currently owns the terminal.
     pub fn set_tui_active(active: bool) {
         TUI_ACTIVE.store(active, Ordering::Relaxed);
@@ -809,6 +998,7 @@ mod fatal {
     pub fn adopt(_file: &std::fs::File, _path: &Path) {}
     pub fn release() {}
     pub fn set_tui_active(_active: bool) {}
+    pub fn emergency(_event: &str) {}
 }
 
 /// Tell the crash path whether the TUI currently owns the terminal.
@@ -824,6 +1014,7 @@ pub fn open_at(dir: &Path, level: Level) -> io::Result<Logger> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn temp_logger(dir: &Path, level: Level) -> Logger {
         Logger::open(&Config { dir: dir.to_path_buf(), level, ..Config::default() }).unwrap()
@@ -1102,6 +1293,55 @@ mod tests {
         assert!(text.contains("name=SIGSEGV"), "{text}");
     }
 
+    /// The panic hook has to keep chaining. `ratatui::try_init()` installs its own
+    /// hook (terminal restore) *around* ours; a panic must reach both, in the
+    /// documented order. This pins that shape without needing a terminal: it
+    /// installs the same wrapper `try_init` uses and checks both ran.
+    #[test]
+    fn the_hook_chain_runs_ratatuis_restore_before_recording() {
+        use std::sync::Arc;
+        use std::sync::Mutex as StdMutex;
+        // The hook is process-global, so this test owns it while it runs.
+        static GUARD: Mutex<()> = Mutex::new(());
+        let _guard = GUARD.lock().unwrap_or_else(|p| p.into_inner());
+
+        let dir = tempfile::tempdir().unwrap();
+        let logger = Arc::new(temp_logger(dir.path(), Level::Info));
+        let order: Arc<StdMutex<Vec<&'static str>>> = Arc::new(StdMutex::new(Vec::new()));
+
+        // Our hook, as `install_crash_hooks` builds it but on a local logger.
+        let ours_logger = Arc::clone(&logger);
+        let ours_order = Arc::clone(&order);
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            ours_order.lock().unwrap().push("sshpf");
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                write_panic_record(&ours_logger, &payload_text(info), None, "chain-probe", "");
+            }));
+            previous(info);
+        }));
+
+        // What `ratatui::try_init` installs: restore first, then call the previous
+        // hook (ours).
+        let inner = std::panic::take_hook();
+        let restore_order = Arc::clone(&order);
+        std::panic::set_hook(Box::new(move |info| {
+            restore_order.lock().unwrap().push("ratatui-restore");
+            inner(info);
+        }));
+
+        let caught = std::panic::catch_unwind(|| panic!("chain probe"));
+        let _ = std::panic::take_hook();
+        assert!(caught.is_err());
+
+        let order = order.lock().unwrap().clone();
+        assert_eq!(order, vec!["ratatui-restore", "sshpf"], "a panic must reach both hooks, restore first");
+
+        let text = read(&dir.path().join(LOG_FILE_NAME));
+        assert!(text.contains("event=crash.panic"), "the crash record must still be written: {text:?}");
+        assert!(text.contains("chain probe"), "{text:?}");
+    }
+
     #[test]
     fn opening_a_bad_directory_reports_instead_of_panicking() {
         let dir = tempfile::tempdir().unwrap();
@@ -1109,5 +1349,174 @@ mod tests {
         fs::write(&file, "x").unwrap();
         let cfg = Config { dir: file, level: Level::Info, ..Config::default() };
         assert!(Logger::open(&cfg).is_err(), "a regular file cannot be used as a log directory");
+    }
+
+    // -----------------------------------------------------------------------
+    // re-entrancy: the deadlock the panic hook could otherwise walk into
+    // -----------------------------------------------------------------------
+
+    /// A `Display` that panics, i.e. a caller-supplied value the log formats
+    /// while it holds the sink lock.
+    struct PanickingDisplay;
+
+    impl fmt::Display for PanickingDisplay {
+        fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            panic!("Display impl exploded while the log lock was held");
+        }
+    }
+
+    /// The exact hazard: `record` panics while holding the sink mutex, the panic
+    /// hook calls `record` again on the same thread, and a plain `lock()` would
+    /// block forever — no output, no exit, terminal stuck in the alternate
+    /// screen. The re-entrancy guard has to make the hook's record a no-op that
+    /// returns immediately.
+    ///
+    /// The hook is *simulated* rather than installed: it is process-global, and
+    /// swapping it here would suppress crash records other tests in this binary
+    /// assert on. Calling [`write_panic_record`] from inside the critical section
+    /// is exactly what the installed hook does; the real hook wiring is covered
+    /// in `tests/logging.rs`, where the crash runs in its own process.
+    ///
+    /// A hang would show up as the `recv_timeout` expiring, so the test fails
+    /// instead of wedging CI.
+    #[test]
+    fn a_panic_inside_the_writer_never_deadlocks_the_panic_hook() {
+        use std::sync::Arc;
+        use std::sync::mpsc;
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .name("reentrancy-probe".to_string())
+            .spawn(move || {
+                let dir = tempfile::tempdir().unwrap();
+                let logger = Arc::new(temp_logger(dir.path(), Level::Info));
+
+                // 1. A panic raised by a caller-supplied `Display`, i.e. while
+                //    `record` holds the guard.
+                let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    logger.event(Level::Info, "writer.boom", &[("v", &PanickingDisplay)]);
+                }))
+                .is_err();
+
+                // 2. What the hook does on the same thread, while the guard was
+                //    held: it must return, not block on its own mutex.
+                let nested = {
+                    let _inside = CriticalSection::enter().expect("first entry must succeed");
+                    write_panic_record(&logger, "nested", Some("src/x.rs:1:1"), "probe", "");
+                    "returned"
+                };
+
+                // 3. And the writer must be usable again: the flag is cleared by
+                //    `Drop` during the unwind, not left stuck.
+                logger.event(Level::Info, "writer.recovered", &[]);
+                let text = fs::read_to_string(dir.path().join(LOG_FILE_NAME)).unwrap_or_default();
+                done_tx.send((panicked, nested, text)).unwrap();
+                drop(dir);
+            })
+            .unwrap();
+
+        let (panicked, nested, text) =
+            done_rx.recv_timeout(Duration::from_secs(10)).expect("deadlocked on the log mutex");
+        assert!(panicked, "the panicking Display should have made the record panic");
+        assert_eq!(nested, "returned", "the hook's record must not block");
+        assert!(text.contains("event=writer.recovered"), "logging must work again after the unwind: {text:?}");
+        assert!(
+            !text.contains("event=writer.boom"),
+            "the record that panicked mid-format must not be half-written: {text:?}"
+        );
+        worker.join().unwrap();
+    }
+
+    /// Directly: while this thread is inside the logger's critical section, a
+    /// nested record is skipped rather than blocking.
+    #[test]
+    fn a_nested_record_is_skipped_instead_of_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        // Run it on a helper thread so that *if* it blocked, the timeout below
+        // fails the test instead of hanging CI. The critical-section flag is
+        // thread-local, so the helper has to claim it itself.
+        let probe = dir.path().to_path_buf();
+        let helper = std::thread::spawn(move || {
+            let logger = temp_logger(&probe, Level::Info);
+            let _inside = CriticalSection::enter().expect("first entry must succeed");
+            logger.event(Level::Info, "nested.record", &[]);
+            tx.send(()).unwrap();
+        });
+        rx.recv_timeout(Duration::from_secs(2)).expect("a nested record blocked on its own lock");
+        helper.join().unwrap();
+        let text = read(&dir.path().join(LOG_FILE_NAME));
+        assert!(!text.contains("event=nested.record"), "the nested record must be dropped, not written: {text:?}");
+    }
+
+    /// `path()` is used by `init`; it must return rather than hang when called
+    /// re-entrantly (it is the same mutex).
+    #[test]
+    fn path_lookup_is_reentrancy_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        let logger = temp_logger(dir.path(), Level::Info);
+        let _inside = CriticalSection::enter().expect("first entry must succeed");
+        assert!(logger.path().is_none(), "a re-entrant path lookup degrades to None");
+    }
+
+    /// Cross-thread poison is a separate case from same-thread re-entrancy: a
+    /// guard dropped during another thread's unwind poisons the mutex, and the
+    /// next record must recover via `into_inner()` (already the existing
+    /// behaviour, now pinned).
+    #[test]
+    fn a_lock_poisoned_by_another_thread_still_accepts_records() {
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let logger = Arc::new(temp_logger(dir.path(), Level::Info));
+
+        let poisoned = Arc::clone(&logger);
+        let victim = std::thread::spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mutex = poisoned.sink.as_ref().unwrap();
+                let _guard = mutex.lock().unwrap();
+                panic!("poison the sink mutex");
+            }));
+            assert!(result.is_err());
+        });
+        victim.join().unwrap();
+
+        logger.event(Level::Info, "after.poison", &[]);
+        let text = read(&dir.path().join(LOG_FILE_NAME));
+        assert!(text.contains("event=after.poison"), "a poisoned lock must not silence the logger: {text:?}");
+    }
+
+    /// `record` runs inside the panic hook, so its counters use saturating
+    /// arithmetic: an overflow must degrade, never panic (a panic while
+    /// processing a panic aborts the process).
+    #[test]
+    fn counters_at_the_u64_ceiling_saturate_instead_of_overflowing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LOG_FILE_NAME);
+        let file = open_append(&path).unwrap();
+        // `max_bytes = 0` disables rotation, so only the arithmetic is exercised.
+        let sink = Sink { file, path: path.clone(), size: u64::MAX - 1, max_bytes: 0, keep: 1, seq: u64::MAX };
+        let logger = Logger { level: Level::Info, sink: Some(Mutex::new(sink)) };
+
+        logger.event(Level::Info, "ceiling.probe", &[("x", &"y")]);
+        let text = read(&path);
+        assert!(text.contains("event=ceiling.probe"), "the record must still be written: {text:?}");
+        assert!(text.contains("seq=18446744073709551615"), "seq must saturate, not wrap: {text:?}");
+
+        let mutex = logger.sink.as_ref().unwrap();
+        let sink = mutex.lock().unwrap();
+        assert_eq!(sink.size, u64::MAX, "size must saturate, not wrap");
+    }
+
+    /// `now_timestamp` cannot panic: it is called from inside the panic hook.
+    #[test]
+    fn the_record_timestamp_is_always_well_formed() {
+        // The documented shape, whatever the clock says.
+        let ts = now_timestamp();
+        assert!(ts.len() >= 19, "no timestamp at all: {ts:?}");
+        // Either the RFC 3339 form or the `epoch=` fallback for a clock past 9999.
+        assert!(
+            ts.starts_with("epoch=") || (ts.chars().nth(4) == Some('-') && ts.chars().nth(10) == Some('T')),
+            "unexpected timestamp shape: {ts:?}"
+        );
     }
 }

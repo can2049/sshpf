@@ -24,6 +24,7 @@
 //!   a state the user never asked for, so everything is validated up front and
 //!   nothing is written unless all of it is valid.
 
+use crate::app::log as eventlog;
 use crate::app::{App, FormMode};
 use crate::config;
 use crate::model::{
@@ -213,14 +214,18 @@ impl App {
     }
 
     pub fn import_home(&mut self) {
+        let rows = keys::IMPORT_ROWS_VISIBLE;
         if let Some(form) = self.form.as_mut() {
             form.import.home();
+            form.import.ensure_visible(rows);
         }
     }
 
     pub fn import_end(&mut self) {
+        let rows = keys::IMPORT_ROWS_VISIBLE;
         if let Some(form) = self.form.as_mut() {
             form.import.end();
+            form.import.ensure_visible(rows);
         }
     }
 
@@ -231,25 +236,34 @@ impl App {
     }
 
     /// Toggle the row at a raw index (mouse click on a checkbox).
+    ///
+    /// The index comes from the frame's hit map, which can be one frame stale:
+    /// a filter change or a re-discovery between drawing and clicking leaves the
+    /// click pointing at a row that is no longer visible. That must be a no-op —
+    /// moving the cursor to "wherever it happens to be" and ticking *that* row
+    /// would tick a row the user did not click.
     pub fn import_toggle_at(&mut self, row: usize) {
-        if let Some(form) = self.form.as_mut()
-            && form.import.cursor_row().is_some()
-        {
-            // Move the cursor there too: the click both selects and toggles, so
-            // the highlighted row always matches what the user just acted on.
-            if let Some(pos) = form.import.visible().iter().position(|i| *i == row) {
-                form.import.cursor = pos;
-            }
-            form.import.toggle_cursor();
-        }
+        let Some(form) = self.form.as_mut() else {
+            return;
+        };
+        let Some(pos) = form.import.visible().iter().position(|i| *i == row) else {
+            eventlog::import_click_stale(row);
+            return;
+        };
+        // Move the cursor there too: the click both selects and toggles, so the
+        // highlighted row always matches what the user just acted on.
+        form.import.cursor = pos;
+        form.import.toggle_cursor();
     }
 
     /// Put the cursor on a raw row index (mouse click elsewhere on a row).
     pub fn import_select_at(&mut self, row: usize) {
-        if let Some(form) = self.form.as_mut()
-            && let Some(pos) = form.import.visible().iter().position(|i| *i == row)
-        {
-            form.import.cursor = pos;
+        let Some(form) = self.form.as_mut() else {
+            return;
+        };
+        match form.import.visible().iter().position(|i| *i == row) {
+            Some(pos) => form.import.cursor = pos,
+            None => eventlog::import_click_stale(row),
         }
     }
 
@@ -369,7 +383,28 @@ impl App {
         let mut out: Vec<TunnelConfig> = Vec::with_capacity(forwards.len());
         let mut errors: Vec<String> = Vec::new();
 
-        for (next_id, forward) in (self.cfg.next_id()..).zip(forwards.iter()) {
+        // Ids are allocated up front and checked, not taken from an unbounded
+        // `(next_id..)` range: `max_id + 1` overflows for a hand-edited
+        // `id = u64::MAX`, and wrapping the range would reuse existing ids.
+        let base_id = match self.next_tunnel_id() {
+            Some(id) => id,
+            None => {
+                if let Some(f) = self.form.as_mut() {
+                    f.errors = vec!["无法分配新的转发编号，请检查配置中的 id".to_string()];
+                }
+                return None;
+            }
+        };
+        let span = (forwards.len() as u64).saturating_sub(1);
+        let Some(last_id) = base_id.checked_add(span) else {
+            crate::app::log::id_space_exhausted(self.cfg.max_id());
+            if let Some(f) = self.form.as_mut() {
+                f.errors = vec!["无法为全部转发分配编号，请减少一次导入的条目数".to_string()];
+            }
+            return None;
+        };
+
+        for (next_id, forward) in (base_id..=last_id).zip(forwards.iter()) {
             let mut cfg = self.config_from_forward(next_id, forward, &taken);
             cfg.ssh_host = ssh_host.clone();
             // Keep names unique within the batch itself, not just against the
@@ -1131,5 +1166,223 @@ mod port_planning_tests {
         let cfg = plan(&local(18001), &[18001]);
         assert_ne!(cfg.local_port, 18001);
         assert!(cfg.local_port > 18001, "must bump up, got {}", cfg.local_port);
+    }
+}
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+    use crate::config::{ConfigFile, Paths};
+    use crate::model::TunnelStatus;
+
+    fn app_fresh() -> (tempfile::TempDir, App) {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths { config: dir.path().join("config.toml"), state: dir.path().join("state.toml") };
+        crate::config::save(&paths.config, &ConfigFile::default()).unwrap();
+        (dir, App::new(paths))
+    }
+
+    fn show(port: u16) -> SshForward {
+        SshForward {
+            kind: ForwardKind::Local,
+            listen_addr: "127.0.0.1".into(),
+            listen_port: port,
+            target_host: "10.0.0.1".into(),
+            target_port: 80,
+            host_alias: "dev-box".into(),
+            line: 1,
+            raw: format!("LocalForward {port} 10.0.0.1:80"),
+        }
+    }
+
+    fn app_with_import(rows: Vec<SshForward>) -> (tempfile::TempDir, App) {
+        let (dir, mut app) = app_fresh();
+        app.open_form_create();
+        app.form.as_mut().unwrap().ssh_host.set("dev-box");
+        let table = ImportTable::new(rows);
+        app.form.as_mut().unwrap().set_import_table("dev-box", table);
+        app.form.as_mut().unwrap().import_open = true;
+        (dir, app)
+    }
+
+    /// Give the app a saved tunnel with `id`, so `next_id()` is deterministic.
+    fn app_with_max_id(id: crate::model::TunnelId) -> (tempfile::TempDir, App) {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths { config: dir.path().join("config.toml"), state: dir.path().join("state.toml") };
+        let cfg = ConfigFile {
+            tunnels: vec![TunnelConfig {
+                id,
+                name: "existing".into(),
+                kind: ForwardKind::Local,
+                ssh_host: "h".into(),
+                local_addr: "127.0.0.1".into(),
+                local_port: 18001,
+                remote_host: "127.0.0.1".into(),
+                remote_port: 22,
+                enabled: false,
+                auto_restart: false,
+                ssh_options: vec![],
+                note: String::new(),
+                created_at: 1,
+            }],
+            ..ConfigFile::default()
+        };
+        crate::config::save(&paths.config, &cfg).unwrap();
+        (dir, App::new(paths))
+    }
+
+    // -- port planning at the edges of the port space ----------------------
+
+    #[test]
+    fn a_port_at_the_top_of_the_range_does_not_wrap_to_zero() {
+        // `plan_local_port` scans `remote.max(1024)..=u16::MAX` (bounded by
+        // PORT_SCAN_LIMIT). At the very top there is no room above, so the
+        // planner must give up rather than wrap to 0 — a port-0 listener is not
+        // a "next free port", it silently asks the OS to choose one.
+        let (dir, mut app) = app_with_import(vec![show(u16::MAX)]);
+        let configs = app.validated_import_batch().expect("validation should still produce a batch");
+        assert_eq!(configs.len(), 1);
+        assert_ne!(configs[0].local_port, 0, "a wrapped port must never reach the config");
+        drop(app);
+
+        // And the pure planner agrees: nothing free at the top means None.
+        let planned = crate::model::plan_local_port(u16::MAX, &[], |_| false);
+        assert!(planned.is_none(), "exhausted port space must report None, not wrap");
+        drop(dir);
+    }
+
+    #[test]
+    fn an_already_taken_top_port_is_not_reused() {
+        // Every candidate above the requested port is exhausted, so the planner
+        // must decline; the config then falls back to the requested port so
+        // validation can report the real problem instead of silently using 0.
+        let (dir, mut app) = app_with_import(vec![show(u16::MAX)]);
+        let configs = app.validated_import_batch().expect("still a batch");
+        assert_ne!(configs[0].local_port, 0, "giving up must not mean port 0");
+        drop(app);
+        drop(dir);
+    }
+
+    #[test]
+    fn imported_ids_do_not_overflow_and_stay_unique() {
+        // The batch used to iterate an unbounded `(next_id..)` range, and the
+        // ids came from `max_id + 1` — an overflow for `u64::MAX`.
+        let (_d, mut app) = app_with_max_id(100);
+        app.open_form_create();
+        app.form.as_mut().unwrap().ssh_host.set("dev-box");
+        app.form.as_mut().unwrap().set_import_table("dev-box", ImportTable::new(vec![show(18101), show(18102)]));
+        let configs = app.validated_import_batch().expect("batch");
+        assert_eq!(configs.len(), 2);
+        let ids: Vec<_> = configs.iter().map(|c| c.id).collect();
+        assert_eq!(ids, vec![101, 102]);
+        assert_ne!(ids[0], ids[1], "two rows must not share an id");
+    }
+
+    #[test]
+    fn an_exhausted_id_space_fails_the_import_batch_without_panicking() {
+        let (_d, mut app) = app_with_max_id(u64::MAX);
+        app.open_form_create();
+        app.form.as_mut().unwrap().ssh_host.set("dev-box");
+        app.form.as_mut().unwrap().set_import_table("dev-box", ImportTable::new(vec![show(18101)]));
+        assert!(app.validated_import_batch().is_none(), "no ids left means no batch");
+        let errors = app.form.as_ref().unwrap().errors.clone();
+        assert!(errors.iter().any(|e| e.contains("编号")), "the user must be told why: {errors:?}");
+    }
+
+    #[test]
+    fn a_batch_that_would_run_past_the_id_space_is_refused_whole() {
+        // u64::MAX - 1 leaves room for exactly one id; two rows must not be
+        // silently truncated into a partial import.
+        let (_d, mut app) = app_with_max_id(u64::MAX - 1);
+        app.open_form_create();
+        app.form.as_mut().unwrap().ssh_host.set("dev-box");
+        app.form.as_mut().unwrap().set_import_table("dev-box", ImportTable::new(vec![show(18101), show(18102)]));
+        assert!(app.validated_import_batch().is_none(), "a partial batch is worse than none");
+        let errors = app.form.as_ref().unwrap().errors.clone();
+        assert!(errors.iter().any(|e| e.contains("编号")), "{errors:?}");
+    }
+
+    #[test]
+    fn one_row_fits_into_the_last_free_id() {
+        let (_d, mut app) = app_with_max_id(u64::MAX - 1);
+        app.open_form_create();
+        app.form.as_mut().unwrap().ssh_host.set("dev-box");
+        app.form.as_mut().unwrap().set_import_table("dev-box", ImportTable::new(vec![show(18101)]));
+        let configs = app.validated_import_batch().expect("the last id is usable");
+        assert_eq!(configs[0].id, u64::MAX);
+    }
+
+    #[test]
+    fn a_forward_with_no_listen_port_is_never_imported() {
+        // A `DynamicForward` / unix socket with no numeric port: listing it is
+        // fine, but it must not reach `plan_local_port(0, ..)` as a request.
+        let mut broken = show(0);
+        broken.listen_port = 0;
+        let (_d, mut app) = app_with_import(vec![broken, show(18103)]);
+        let configs = app.validated_import_batch().expect("the good row is still importable");
+        assert_eq!(configs.len(), 1, "the port-less row must be skipped, not created with port 0");
+        // Not asserted to be exactly 18103: the planner probes real sockets and
+        // may bump a busy port, which would make this flaky on a loaded machine.
+        assert_ne!(configs[0].local_port, 0, "an imported config may never listen on port 0");
+        assert!(config::validate_tunnel(&configs[0]).is_ok());
+    }
+
+    #[test]
+    fn every_imported_config_passes_validation() {
+        // The batch's whole promise: validate up front so a partial write cannot
+        // happen. A config that fails validation here would contradict it.
+        let mut remote = show(7000);
+        remote.kind = ForwardKind::Remote;
+        remote.listen_addr = "127.0.0.1".into();
+        remote.listen_port = 7000;
+        remote.target_host = "127.0.0.1".into();
+        remote.target_port = 22;
+        let mut dynamic = show(1080);
+        dynamic.kind = ForwardKind::Dynamic;
+        dynamic.target_host = String::new();
+        dynamic.target_port = 0;
+
+        let (_d, mut app) = app_with_import(vec![show(18104), remote, dynamic]);
+        let configs = app.validated_import_batch().expect("batch");
+        assert_eq!(configs.len(), 3);
+        for cfg in &configs {
+            assert!(config::validate_tunnel(cfg).is_ok(), "{cfg:?} must validate before anything is written");
+        }
+    }
+
+    #[test]
+    fn commit_import_batch_with_an_empty_vec_is_a_no_op() {
+        // `configs.first()` would be `None`; the cursor bookkeeping must cope.
+        let (_d, mut app) = app_fresh();
+        app.commit_import_batch(Vec::new());
+        assert!(app.tunnels.is_empty());
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn toggling_a_row_that_is_not_visible_is_a_no_op() {
+        // Mouse clicks carry a raw row index from the hit map, which can be
+        // stale after a filter change. It must not index out of bounds.
+        let (_d, mut app) = app_with_import(vec![show(18105), show(18106)]);
+        app.begin_import_filter(ImportColumn::Listen);
+        app.import_filter_char('1');
+        app.import_filter_char('8');
+        app.import_filter_char('1');
+        app.import_filter_char('0');
+        app.import_filter_char('5');
+        let before = app.form.as_ref().unwrap().import.checked_count();
+        app.import_toggle_at(999); // raw index that cannot exist
+        app.import_select_at(999);
+        assert_eq!(app.form.as_ref().unwrap().import.checked_count(), before, "a stale click must not tick anything");
+        assert!(app.form.as_ref().unwrap().import.cursor_row().is_some() || before == 0);
+    }
+
+    #[test]
+    fn the_cursor_lands_on_the_first_imported_tunnel_even_with_a_filter() {
+        let (_d, mut app) = app_with_import(vec![show(18107), show(18108)]);
+        app.submit_form();
+        assert_eq!(app.tunnels.len(), 2);
+        assert!(app.selected_tunnel().is_some(), "the cursor must land on something");
+        assert!(matches!(app.tunnels[0].status, TunnelStatus::Starting { .. } | TunnelStatus::Failed { .. }));
     }
 }

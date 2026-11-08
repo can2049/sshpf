@@ -310,13 +310,14 @@ impl ImportColumn {
         }
     }
 
+    /// Position in [`ImportColumn::ALL`], i.e. the index into
+    /// [`ImportTable::filters`].
+    ///
+    /// Derived from `ALL` rather than hand-numbered: the filter array is sized
+    /// `COUNT`, so a variant missing from `ALL` must not silently get a
+    /// hand-written index that is out of range.
     pub fn index(self) -> usize {
-        match self {
-            ImportColumn::Kind => 0,
-            ImportColumn::Listen => 1,
-            ImportColumn::Target => 2,
-            ImportColumn::Raw => 3,
-        }
+        ImportColumn::ALL.iter().position(|c| *c == self).unwrap_or(0)
     }
 
     /// `value` as the filter sees it, so the table and the matcher cannot
@@ -331,11 +332,15 @@ impl ImportColumn {
     }
 
     pub fn next(self) -> ImportColumn {
-        ImportColumn::ALL[(self.index() + 1) % ImportColumn::COUNT]
+        let i = self.index();
+        ImportColumn::ALL.get(i + 1).or_else(|| ImportColumn::ALL.first()).copied().unwrap_or(self)
     }
 
     pub fn prev(self) -> ImportColumn {
-        ImportColumn::ALL[(self.index() + ImportColumn::COUNT - 1) % ImportColumn::COUNT]
+        match self.index() {
+            0 => ImportColumn::ALL.last().copied().unwrap_or(self),
+            i => ImportColumn::ALL.get(i - 1).copied().unwrap_or(self),
+        }
     }
 }
 
@@ -419,11 +424,11 @@ impl ImportTable {
     /// Row indices that survive every column filter, in file order.
     pub fn visible(&self) -> Vec<usize> {
         let active: Vec<ImportColumn> =
-            ImportColumn::ALL.into_iter().filter(|c| !self.filters[c.index()].trim().is_empty()).collect();
+            ImportColumn::ALL.into_iter().filter(|c| !self.filter(*c).trim().is_empty()).collect();
         self.rows
             .iter()
             .enumerate()
-            .filter(|(_, row)| active.iter().all(|col| col_match(&self.filters[col.index()], &col.cell(&row.forward))))
+            .filter(|(_, row)| active.iter().all(|col| col_match(self.filter(*col), &col.cell(&row.forward))))
             .map(|(i, _)| i)
             .collect()
     }
@@ -463,17 +468,21 @@ impl ImportTable {
     }
 
     /// Clip `scroll` so the cursor row is inside a `height`-row viewport.
+    ///
+    /// `scroll`/`height` are `u16` and `scroll` can be written directly, so the
+    /// comparisons use `usize` arithmetic: `self.scroll + height` in `u16` would
+    /// overflow (and panic in a debug build) for a scroll left at `u16::MAX`.
     pub fn ensure_visible(&mut self, height: usize) {
-        let sel = self.cursor as u16;
+        let sel = self.cursor;
         if height == 0 {
-            self.scroll = sel;
+            self.scroll = sel.min(u16::MAX as usize) as u16;
             return;
         }
-        let height = height as u16;
-        if sel < self.scroll {
-            self.scroll = sel;
-        } else if sel >= self.scroll + height {
-            self.scroll = sel + 1 - height;
+        let scroll = self.scroll as usize;
+        if sel < scroll {
+            self.scroll = sel.min(u16::MAX as usize) as u16;
+        } else if sel >= scroll.saturating_add(height) {
+            self.scroll = (sel + 1 - height).min(u16::MAX as usize) as u16;
         }
     }
 
@@ -544,7 +553,10 @@ impl ImportTable {
     }
 
     pub fn filter(&self, col: ImportColumn) -> &str {
-        &self.filters[col.index()]
+        // The array is sized `ImportColumn::COUNT` and indexed by
+        // `ImportColumn::index()`; `get` makes the coupling explicit instead of
+        // relying on the two staying in step.
+        self.filters.get(col.index()).map(String::as_str).unwrap_or("")
     }
 
     fn snapshot(&mut self) {
@@ -557,33 +569,50 @@ impl ImportTable {
     /// Replace one column's filter, recording an undo point.
     pub fn set_filter(&mut self, col: ImportColumn, text: impl Into<String>) {
         self.snapshot();
-        self.filters[col.index()] = text.into();
+        if let Some(slot) = self.filters.get_mut(col.index()) {
+            *slot = text.into();
+        }
         self.after_filter_change();
     }
 
     pub fn filter_char(&mut self, col: ImportColumn, c: char) {
         self.snapshot();
-        self.filters[col.index()].push(c);
+        if let Some(slot) = self.filters.get_mut(col.index()) {
+            slot.push(c);
+        }
         self.after_filter_change();
     }
 
     pub fn filter_backspace(&mut self, col: ImportColumn) {
-        if self.filters[col.index()].is_empty() {
+        let Some(index) = self.filter_index(col) else {
+            return;
+        };
+        if self.filters[index].is_empty() {
             return;
         }
         self.snapshot();
-        self.filters[col.index()].pop();
+        self.filters[index].pop();
         self.after_filter_change();
     }
 
     /// Delete one column's filter (undoable).
     pub fn clear_filter(&mut self, col: ImportColumn) {
-        if self.filters[col.index()].is_empty() {
+        let Some(index) = self.filter_index(col) else {
+            return;
+        };
+        if self.filters[index].is_empty() {
             return;
         }
         self.snapshot();
-        self.filters[col.index()].clear();
+        self.filters[index].clear();
         self.after_filter_change();
+    }
+
+    /// `col`'s slot in `filters`, or `None` when the array and the column list
+    /// disagree about how many columns exist.
+    fn filter_index(&self, col: ImportColumn) -> Option<usize> {
+        let index = col.index();
+        (index < self.filters.len()).then_some(index)
     }
 
     /// Delete every filter at once (undoable).
@@ -636,8 +665,9 @@ impl ImportTable {
         if self.has_filters() {
             let parts: Vec<String> = ImportColumn::ALL
                 .into_iter()
-                .filter(|c| !self.filters[c.index()].trim().is_empty())
-                .map(|c| format!("{}={}", c.label(), self.filters[c.index()]))
+                .map(|c| (c, self.filter(c)))
+                .filter(|(_, f)| !f.trim().is_empty())
+                .map(|(c, f)| format!("{}={f}", c.label()))
                 .collect();
             s.push_str(&format!(" · 筛选: {}", parts.join(", ")));
         }
@@ -722,13 +752,18 @@ impl MultiSelect {
 
     /// Mark the inclusive range `from..=to` in `ids`.
     pub fn mark_range(&mut self, ids: &[TunnelId], from: usize, to: usize) {
-        if ids.is_empty() {
+        // `lo`/`hi` are caller-supplied indices; clamp both to the view before
+        // slicing, and use `get` so an empty view stays a no-op rather than a
+        // `len() - 1` underflow.
+        let Some(last) = ids.len().checked_sub(1) else {
             return;
-        }
+        };
         let (lo, hi) = if from <= to { (from, to) } else { (to, from) };
-        let lo = lo.min(ids.len() - 1);
-        let hi = hi.min(ids.len() - 1);
-        self.marked.extend(ids[lo..=hi].iter().copied());
+        let lo = lo.min(last);
+        let hi = hi.min(last);
+        if let Some(range) = ids.get(lo..=hi) {
+            self.marked.extend(range.iter().copied());
+        }
         self.anchor = Some(hi);
     }
 
@@ -974,11 +1009,16 @@ pub struct LogRing {
 
 impl LogRing {
     pub fn new(cap: usize) -> Self {
+        // A zero-capacity ring would never evict: `push` pops only when
+        // `len == cap`, so `cap == 0` grows without bound. The bound is the
+        // whole point of this type, so enforce it here rather than at every
+        // call site.
+        let cap = cap.max(1);
         LogRing { buf: VecDeque::with_capacity(cap.min(1024)), cap }
     }
 
     pub fn push(&mut self, line: LogLine) {
-        if self.buf.len() == self.cap {
+        while self.buf.len() >= self.cap {
             self.buf.pop_front();
         }
         self.buf.push_back(line);
@@ -1116,13 +1156,19 @@ impl FormField {
     }
 
     pub fn next(self) -> FormField {
+        // `ORDER` is a fixed array, but the "position may be missing" case is
+        // real: a field added without being listed would make `position` return
+        // `None`. Fall back to the first field instead of indexing blind.
         let i = FormField::ORDER.iter().position(|f| *f == self).unwrap_or(0);
-        FormField::ORDER[(i + 1) % FormField::ORDER.len()]
+        FormField::ORDER.get(i + 1).or_else(|| FormField::ORDER.first()).copied().unwrap_or(self)
     }
 
     pub fn prev(self) -> FormField {
         let i = FormField::ORDER.iter().position(|f| *f == self).unwrap_or(0);
-        FormField::ORDER[(i + FormField::ORDER.len() - 1) % FormField::ORDER.len()]
+        match i.checked_sub(1) {
+            Some(prev) => FormField::ORDER.get(prev).copied().unwrap_or(self),
+            None => FormField::ORDER.last().copied().unwrap_or(self),
+        }
     }
 }
 
@@ -1161,12 +1207,29 @@ impl InputBuf {
     }
 
     pub fn insert(&mut self, c: char) {
+        // `cursor` is a public field and can be stale (past the end of the text).
+        // Clamping first keeps `cursor += 1` from overflowing and puts the new
+        // character where the user is looking rather than after a `usize::MAX`.
+        let len = self.text.chars().count();
+        if self.cursor > len {
+            self.cursor = len;
+        }
         let byte = self.byte_index(self.cursor);
         self.text.insert(byte, c);
-        self.cursor += 1;
+        self.cursor = self.cursor.saturating_add(1);
     }
 
     pub fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        // A stale `cursor` past the end means "the caret is after the last
+        // character", so clamp and delete that character rather than bailing
+        // out — backspace at the end is the common case.
+        let len = self.text.chars().count();
+        if self.cursor > len {
+            self.cursor = len;
+        }
         if self.cursor == 0 {
             return;
         }
@@ -1267,21 +1330,29 @@ impl HostPicker {
         self.scroll = 0;
     }
 
-    pub fn end(&mut self) {
+    pub fn end(&mut self, visible: usize) {
         self.selected = self.matches.len().saturating_sub(1);
+        self.ensure_visible(visible);
     }
 
     /// Clip `scroll` so the selected row is inside the viewport.
+    ///
+    /// `selected` is clamped to the match list first: it is a public field and
+    /// the query can shrink the list at any time, which would otherwise let the
+    /// `u16` arithmetic below overflow.
     pub fn ensure_visible(&mut self, visible: usize) {
+        let last = self.matches.len().saturating_sub(1);
+        let sel = self.selected.min(last);
+        self.selected = sel;
         if visible == 0 {
-            self.scroll = self.selected.min(u16::MAX as usize) as u16;
+            self.scroll = sel.min(u16::MAX as usize) as u16;
             return;
         }
-        let sel = self.selected as u16;
-        if sel < self.scroll {
-            self.scroll = sel;
-        } else if sel >= self.scroll + visible as u16 {
-            self.scroll = sel + 1 - visible as u16;
+        let scroll = self.scroll as usize;
+        if sel < scroll {
+            self.scroll = sel.min(u16::MAX as usize) as u16;
+        } else if sel >= scroll.saturating_add(visible) {
+            self.scroll = (sel + 1 - visible).min(u16::MAX as usize) as u16;
         }
     }
 
@@ -1681,7 +1752,7 @@ mod tests {
 
         p.home();
         assert_eq!((p.selected, p.scroll), (0, 0));
-        p.end();
+        p.end(5);
         assert_eq!(p.selected, 19);
         assert_eq!(p.current(), Some(19));
 
@@ -2136,5 +2207,231 @@ mod tests {
         }
         assert_eq!(f, FormField::SshHost);
         assert_eq!(FormField::SshHost.prev(), FormField::AutoRestart);
+    }
+
+    // -- panic hardening: index/scroll invariants --------------------------
+    //
+    // These pin the "the scalar came from somewhere untrusted" paths: a column
+    // list that can drift from the filter array, a scroll offset written
+    // directly, and cursor indices supplied by a caller.
+
+    #[test]
+    fn every_import_column_index_is_a_valid_filter_slot() {
+        // `ImportTable::filters` is `[String; ImportColumn::COUNT]` and is
+        // indexed by `ImportColumn::index()`. The two used to be hand-numbered,
+        // so a new variant could describe a slot the array does not have.
+        let table = ImportTable::empty();
+        for col in ImportColumn::ALL {
+            let index = col.index();
+            assert!(index < ImportColumn::COUNT, "{col:?} maps to {index}, past COUNT");
+            assert!(index < table.filters.len(), "{col:?} would index outside the filter array");
+        }
+    }
+
+    #[test]
+    fn import_column_cycling_visits_every_column_from_every_start() {
+        // `next`/`prev` used `% COUNT` on a hand-written index; verify the wrap
+        // holds for every starting column, in both directions.
+        for start in ImportColumn::ALL {
+            let mut seen = Vec::new();
+            let mut col = start;
+            for _ in 0..ImportColumn::COUNT {
+                seen.push(col);
+                col = col.next();
+            }
+            assert_eq!(col, start, "next must come back to {start:?}");
+            assert_eq!(seen.len(), ImportColumn::COUNT);
+            let mut seen = Vec::new();
+            let mut col = start;
+            for _ in 0..ImportColumn::COUNT {
+                seen.push(col);
+                col = col.prev();
+            }
+            assert_eq!(col, start, "prev must come back to {start:?}");
+            assert_eq!(seen.len(), ImportColumn::COUNT);
+        }
+    }
+
+    #[test]
+    fn filter_accessors_tolerate_a_null_scroll_target() {
+        // `filter()` returning "" for an unknown slot is what lets `visible()` /
+        // `summary()` use it without a bounds check that could be stale.
+        let mut table = sample_table();
+        for col in ImportColumn::ALL {
+            assert!(table.filter(col).is_empty());
+            table.set_filter(col, "x");
+            assert_eq!(table.filter(col), "x");
+            table.clear_filter(col);
+            assert!(table.filter(col).is_empty());
+        }
+    }
+
+    #[test]
+    fn import_ensure_visible_survives_a_scroll_left_at_u16_max() {
+        // `scroll` is a public `u16` field. The old code compared `cursor` and
+        // `scroll + height` in `u16`, so a scroll near 65535 overflowed (panic in
+        // a debug build — which is what CI runs).
+        let mut table = sample_table();
+        table.scroll = u16::MAX;
+        table.cursor = 0;
+        table.ensure_visible(5); // must not overflow
+        assert_eq!(table.scroll, 0, "the window must follow the cursor back up");
+
+        // The actual overflowing pair: both ends at the top of the `u16` range.
+        table.scroll = u16::MAX - 1;
+        table.cursor = u16::MAX as usize;
+        table.ensure_visible(2); // must not overflow either
+        assert!(table.scroll as usize <= table.cursor);
+    }
+
+    #[test]
+    fn import_ensure_visible_handles_a_zero_height_viewport() {
+        // A pane squeezed to nothing must not divide or subtract by zero.
+        let mut table = sample_table();
+        table.cursor = 2;
+        table.ensure_visible(0);
+        assert_eq!(table.scroll, 2);
+    }
+
+    #[test]
+    fn import_ensure_visible_with_a_cursor_past_the_end_is_clamped() {
+        let mut table = sample_table();
+        table.cursor = 99;
+        table.ensure_visible(2);
+        assert!(table.scroll as usize <= table.cursor);
+    }
+
+    #[test]
+    fn picker_ensure_visible_survives_a_scroll_left_at_u16_max() {
+        // Same `u16` overflow as the import table: `scroll + visible`.
+        let mut p = HostPicker::new();
+        p.matches = (0..20).collect();
+        p.scroll = u16::MAX;
+        p.selected = 0;
+        p.ensure_visible(5);
+        assert_eq!(p.scroll, 0);
+        assert_eq!(p.selected, 0);
+    }
+
+    #[test]
+    fn picker_selection_is_clamped_to_the_match_list() {
+        // `selected` is public and the query can shrink `matches` at any time;
+        // an out-of-range selection must degrade to the last row, not panic.
+        let mut p = HostPicker::new();
+        p.matches = (0..3).collect();
+        p.selected = 99;
+        p.ensure_visible(5);
+        assert_eq!(p.selected, 2);
+        assert_eq!(p.current(), Some(2));
+
+        p.matches.clear();
+        p.selected = 5;
+        p.ensure_visible(5);
+        assert_eq!(p.selected, 0);
+        assert_eq!(p.scroll, 0);
+        assert_eq!(p.current(), None);
+    }
+
+    #[test]
+    fn picker_end_keeps_the_last_row_inside_the_window() {
+        // `end` used to move the selection without moving the viewport, leaving
+        // the highlighted row scrolled out of sight.
+        let mut p = HostPicker::new();
+        p.matches = (0..20).collect();
+        p.end(5);
+        assert_eq!(p.selected, 19);
+        assert!(p.selected < p.scroll as usize + 5, "the last row must be visible: scroll={}", p.scroll);
+    }
+
+    #[test]
+    fn mark_range_with_extreme_indices_marks_a_clamped_range() {
+        // `from`/`to` come from a cursor index; `usize::MAX` must clamp instead
+        // of slicing out of bounds (and the empty case must not underflow
+        // `len() - 1`).
+        let ids: Vec<TunnelId> = (1..=3).collect();
+        let mut ms = MultiSelect::new();
+        ms.enter();
+        ms.mark_range(&ids, usize::MAX, usize::MAX);
+        assert_eq!(ms.ids(), vec![3], "both ends clamp to the last row");
+        ms.enter();
+        ms.mark_range(&ids, 0, usize::MAX);
+        assert_eq!(ms.ids(), vec![1, 2, 3]);
+        ms.enter();
+        ms.mark_range(&[], usize::MAX, 0);
+        assert!(ms.is_empty());
+        assert_eq!(ms.anchor, None, "an empty view must not record an anchor");
+    }
+
+    #[test]
+    fn a_zero_capacity_log_ring_still_evicts() {
+        // `push` evicted only when `len == cap`, so a `cap` of 0 never evicted
+        // and the "bounded" ring grew without limit.
+        let mut r = LogRing::new(0);
+        for i in 0..10 {
+            r.push(LogLine::new(LogLevel::Info, format!("{i}")));
+        }
+        assert_eq!(r.len(), 1, "an empty-cap ring must still hold at most one line");
+        assert_eq!(r.last().map(|l| l.text.as_str()), Some("9"));
+    }
+
+    #[test]
+    fn a_log_ring_push_with_a_cap_of_one_keeps_the_newest() {
+        let mut r = LogRing::new(1);
+        r.push(LogLine::new(LogLevel::Info, "a"));
+        r.push(LogLine::new(LogLevel::Info, "b"));
+        assert_eq!(r.len(), 1);
+        assert_eq!(r.last().map(|l| l.text.as_str()), Some("b"));
+    }
+
+    #[test]
+    fn an_input_buffer_with_a_stale_cursor_does_not_panic() {
+        // `cursor` is a public field: a value past the end must clamp, not slice
+        // at a byte offset the text does not have (and not overflow on `+= 1`).
+        let mut b = InputBuf::new("abc");
+        b.cursor = usize::MAX;
+        b.insert('X');
+        assert!(b.value().ends_with('X'), "the character must land at the end: {:?}", b.value());
+        assert_eq!(b.value(), "abcX");
+
+        b.cursor = usize::MAX;
+        b.backspace();
+        assert_eq!(b.value(), "abc");
+
+        b.cursor = usize::MAX;
+        b.delete();
+        assert_eq!(b.value(), "abc", "delete at the end is a no-op");
+
+        b.cursor = usize::MAX;
+        b.right();
+        b.left();
+        b.home();
+        b.end();
+        assert_eq!(b.cursor, b.value().chars().count());
+    }
+
+    #[test]
+    fn an_input_buffer_with_a_stale_cursor_edits_multibyte_text_safely() {
+        let mut b = InputBuf::new("中文");
+        b.cursor = 99;
+        b.insert('X');
+        assert_eq!(b.value(), "中文X");
+        b.cursor = 1;
+        b.insert('Y');
+        assert_eq!(b.value(), "中Y文X");
+    }
+
+    #[test]
+    fn form_field_navigation_wraps_in_both_directions() {
+        // `next`/`prev` index a fixed array; a field missing from ORDER would
+        // make `position` return `None`, and the old code then indexed blind.
+        for field in FormField::ORDER {
+            let next = field.next();
+            let prev = field.prev();
+            assert!(FormField::ORDER.contains(&next), "{field:?}.next() = {next:?} is not in ORDER");
+            assert!(FormField::ORDER.contains(&prev), "{field:?}.prev() = {prev:?} is not in ORDER");
+            assert_eq!(next.prev(), field, "next/prev must be inverses for {field:?}");
+        }
+        assert_eq!(FormField::ORDER.first().copied().unwrap().prev(), FormField::AutoRestart);
+        assert_eq!(FormField::ORDER.last().copied().unwrap().next(), FormField::SshHost);
     }
 }

@@ -124,12 +124,25 @@ impl FormState {
     }
 
     pub fn kind(&self) -> ForwardKind {
-        ForwardKind::all()[self.kind_idx.min(2)]
+        // `kind_idx` is a plain `usize` field other modules can assign, and
+        // `ForwardKind::all()` is a fixed array whose length is not a constant
+        // this line can hard-code. A stale index degrades to the default kind
+        // (and says so) instead of panicking on an out-of-bounds slice index.
+        match ForwardKind::all().get(self.kind_idx) {
+            Some(kind) => *kind,
+            None => {
+                eventlog::form_kind_index_invalid(self.kind_idx, ForwardKind::all().len());
+                ForwardKind::default()
+            }
+        }
     }
 
     pub fn cycle_kind(&mut self, forward: bool) {
         let n = ForwardKind::all().len();
-        self.kind_idx = if forward { (self.kind_idx + 1) % n } else { (self.kind_idx + n - 1) % n };
+        // Start from a valid index: a form built with an out-of-range `kind_idx`
+        // would otherwise stay out of range under `(i + n - 1) % n` as well.
+        let i = self.kind_idx % n;
+        self.kind_idx = if forward { (i + 1) % n } else { (i + n - 1) % n };
     }
 
     /// True when this form is *saving changes to* an existing tunnel.
@@ -356,7 +369,17 @@ impl App {
         };
         let id = match form.mode {
             FormMode::Edit(id) => id,
-            FormMode::Create => self.cfg.next_id(),
+            // A hand-edited `id = u64::MAX` leaves no allocatable id; report it
+            // like any other validation problem instead of overflowing.
+            FormMode::Create => match self.next_tunnel_id() {
+                Some(id) => id,
+                None => {
+                    if let Some(f) = self.form.as_mut() {
+                        f.errors = vec!["无法分配新的转发编号，请检查配置中的 id".to_string()];
+                    }
+                    return None;
+                }
+            },
         };
         let mut cfg = match form.to_config(id, existing.as_ref()) {
             Ok(c) => c,
@@ -388,8 +411,11 @@ impl App {
         cfg.enabled = true;
         eventlog::tunnel_created(&cfg, "form");
         self.cfg.tunnels.push(cfg.clone());
+        // Remember where the row landed *before* pushing, rather than recovering
+        // it as `len() - 1` afterwards: the arithmetic is the same today, but it
+        // stops being an underflow trap if the push ever moves.
+        let pos = self.tunnels.len();
         self.tunnels.push(TunnelView::new(cfg.clone()));
-        let pos = self.tunnels.len() - 1;
         let vis = self.visible_indices();
         self.selected = vis.iter().position(|i| *i == pos).unwrap_or(vis.len().saturating_sub(1));
         self.start_tunnel_with(cfg.id, "created");
@@ -461,5 +487,269 @@ impl App {
         } else {
             self.close_overlay();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{ConfigFile, Paths};
+    use crate::model::InputBuf;
+
+    fn create_form() -> FormState {
+        let mut f = FormState::create("127.0.0.1");
+        f.ssh_host.set("host");
+        f.name.set("demo");
+        f
+    }
+
+    /// A form whose `kind_idx` was written past the end of `ForwardKind::all()`.
+    ///
+    /// The field is public, so this is not a hypothetical: the UI and tests both
+    /// assign it directly.
+    fn form_with_kind_idx(idx: usize) -> FormState {
+        let mut f = create_form();
+        f.kind_idx = idx;
+        f
+    }
+
+    #[test]
+    fn an_out_of_range_kind_index_degrades_to_the_default_kind() {
+        // Regression: this used to be `ForwardKind::all()[self.kind_idx.min(2)]`
+        // — a hard-coded `2` that only happened to match the array length. Both
+        // `3` (past the end) and a reordered array would have indexed out of
+        // bounds, which panics.
+        for idx in [3usize, 4, 99, usize::MAX] {
+            let f = form_with_kind_idx(idx);
+            assert_eq!(f.kind(), ForwardKind::default(), "kind_idx={idx} must degrade, not panic");
+        }
+        // Valid indices still work.
+        assert_eq!(form_with_kind_idx(0).kind(), ForwardKind::Local);
+        assert_eq!(form_with_kind_idx(1).kind(), ForwardKind::Remote);
+        assert_eq!(form_with_kind_idx(2).kind(), ForwardKind::Dynamic);
+    }
+
+    #[test]
+    fn cycling_a_kind_from_an_out_of_range_index_comes_back_in_range() {
+        // `(i + n - 1) % n` on an out-of-range `i` stays out of range; the cycle
+        // must normalise first, so one keypress repairs the form.
+        let mut f = form_with_kind_idx(99);
+        f.cycle_kind(true);
+        assert!(f.kind_idx < ForwardKind::all().len(), "kind_idx still out of range: {}", f.kind_idx);
+        assert_eq!(f.kind(), ForwardKind::all()[f.kind_idx]);
+
+        let mut f = form_with_kind_idx(99);
+        f.cycle_kind(false);
+        assert!(f.kind_idx < ForwardKind::all().len(), "kind_idx still out of range: {}", f.kind_idx);
+    }
+
+    #[test]
+    fn cycling_the_kind_wraps_in_both_directions() {
+        let mut f = form_with_kind_idx(0);
+        for expected in [1usize, 2, 0, 1] {
+            f.cycle_kind(true);
+            assert_eq!(f.kind_idx, expected);
+        }
+        let mut f = form_with_kind_idx(0);
+        for expected in [2usize, 1, 0, 2] {
+            f.cycle_kind(false);
+            assert_eq!(f.kind_idx, expected);
+        }
+    }
+
+    #[test]
+    fn a_form_with_a_bogus_kind_still_validates_and_saves() {
+        // The degraded kind must not smuggle an invalid config through: the
+        // default kind needs a remote port, so the validation result is
+        // whatever the default kind demands — but it must not panic.
+        let mut f = form_with_kind_idx(usize::MAX);
+        f.remote_port.set("22");
+        f.local_port.set("8080");
+        let cfg = f.to_config(1, None).expect("the degraded kind is a real kind");
+        assert_eq!(cfg.kind, ForwardKind::default());
+        assert_eq!(cfg.remote_port, 22);
+    }
+
+    #[test]
+    fn editing_a_forward_keeps_a_valid_kind_index() {
+        let mut cfg = crate::model::TunnelConfig {
+            id: 1,
+            name: "x".into(),
+            kind: ForwardKind::Dynamic,
+            ssh_host: "h".into(),
+            local_addr: "127.0.0.1".into(),
+            local_port: 1080,
+            remote_host: String::new(),
+            remote_port: 0,
+            enabled: false,
+            auto_restart: false,
+            ssh_options: vec![],
+            note: String::new(),
+            created_at: 1,
+        };
+        for kind in ForwardKind::all() {
+            cfg.kind = kind;
+            let f = FormState::edit(&cfg);
+            assert!(f.kind_idx < ForwardKind::all().len());
+            assert_eq!(f.kind(), kind);
+        }
+    }
+
+    #[test]
+    fn a_tunnel_with_no_remote_target_does_not_break_the_edit_form() {
+        // A `-D` row has empty remote fields; opening it for edit must not
+        // produce an index or parse panic, just a valid form.
+        let cfg = crate::model::TunnelConfig {
+            id: 4,
+            name: "socks".into(),
+            kind: ForwardKind::Dynamic,
+            ssh_host: "h".into(),
+            local_addr: "127.0.0.1".into(),
+            local_port: 1080,
+            remote_host: String::new(),
+            remote_port: 0,
+            enabled: true,
+            auto_restart: true,
+            ssh_options: vec![],
+            note: String::new(),
+            created_at: 1,
+        };
+        let mut f = FormState::edit(&cfg);
+        f.revalidate();
+        assert!(f.to_config(4, Some(&cfg)).is_ok());
+    }
+
+    #[test]
+    fn malformed_port_input_never_reaches_a_config() {
+        // Every non-numeric / out-of-range string must be a validation error,
+        // not a parse panic or a config with a zero port.
+        for bad in ["", " ", "abc", "-1", "0", "65536", "99999999999", "１２３", "1e5"] {
+            let mut f = create_form();
+            f.local_port.set(bad);
+            f.remote_port.set(bad);
+            let result = f.to_config(1, None);
+            if bad.trim().parse::<u16>().map(|p| p != 0).unwrap_or(false) {
+                // Only strings that are genuinely a valid non-zero u16 may pass
+                // — none of the samples above are, so this branch is a guard.
+                continue;
+            }
+            assert!(result.is_err(), "input {bad:?} must be rejected, got {result:?}");
+        }
+    }
+
+    #[test]
+    fn port_zero_is_rejected_for_both_ends() {
+        let mut f = create_form();
+        f.local_port.set("0");
+        f.remote_port.set("22");
+        assert!(f.to_config(1, None).is_err(), "local port 0 cannot be listened on");
+
+        let mut f = create_form();
+        f.local_port.set("8080");
+        f.remote_port.set("0");
+        assert!(f.to_config(1, None).is_err(), "remote port 0 is not a target");
+    }
+
+    #[test]
+    fn a_dynamic_forward_tolerates_an_empty_remote_side() {
+        let mut f = create_form();
+        f.kind_idx = 2;
+        f.local_port.set("1080");
+        f.remote_port.set("");
+        f.remote_host.set("");
+        let cfg = f.to_config(1, None).expect("a SOCKS forward needs no remote side");
+        assert_eq!(cfg.remote_port, 0);
+        assert!(cfg.remote_host.is_empty());
+    }
+
+    #[test]
+    fn suggesting_a_local_port_terminates_for_every_remote_port() {
+        // `plan_local_port` has a bounded scan; this pins that the *form* path
+        // (which also probes real sockets) cannot hang or panic for any input.
+        for remote in ["0", "1", "22", "1023", "1024", "8080", "65535", "abc"] {
+            let mut f = create_form();
+            f.remote_port.set(remote);
+            f.suggest_local_port(&[]);
+            // Whatever it decided, the buffer must stay parseable-or-empty.
+            let value = f.local_port.value().to_string();
+            assert!(value.is_empty() || value.parse::<u16>().is_ok(), "remote {remote} produced {value:?}");
+        }
+    }
+
+    #[test]
+    fn a_form_with_an_empty_import_table_is_not_mistaken_for_a_batch() {
+        let f = create_form();
+        assert!(f.import.is_empty());
+        assert!(matches!(f.mode, FormMode::Create));
+    }
+
+    #[test]
+    fn input_buffers_survive_a_degenerate_cursor() {
+        // `cursor` is a public field on `InputBuf`; a stale value past the end
+        // must clamp rather than slice-panic.
+        let mut buf = InputBuf::new("abc");
+        buf.cursor = usize::MAX;
+        let mut f = create_form();
+        f.name = buf;
+        f.revalidate();
+        // The buffer is not edited here, but `to_config` reads it.
+        let _ = f.to_config(1, None);
+    }
+
+    #[test]
+    fn an_exhausted_id_space_is_reported_into_the_form() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths { config: dir.path().join("config.toml"), state: dir.path().join("state.toml") };
+        let mut cfg = ConfigFile::default();
+        cfg.tunnels.push(crate::model::TunnelConfig {
+            id: u64::MAX,
+            name: "huge".into(),
+            kind: ForwardKind::Local,
+            ssh_host: "h".into(),
+            local_addr: "127.0.0.1".into(),
+            local_port: 18001,
+            remote_host: "127.0.0.1".into(),
+            remote_port: 22,
+            enabled: false,
+            auto_restart: false,
+            ssh_options: vec![],
+            note: String::new(),
+            created_at: 1,
+        });
+        crate::config::save(&paths.config, &cfg).unwrap();
+        let mut app = App::new(paths);
+        app.open_form_create();
+        {
+            let f = app.form.as_mut().unwrap();
+            f.ssh_host.set("host");
+            f.name.set("fresh");
+            f.remote_port.set("22");
+            f.local_port.set("18002");
+        }
+        app.submit_form();
+        assert_eq!(app.tunnels.len(), 1, "no new definition without a free id");
+        let errors = app.form.as_ref().map(|f| f.errors.clone()).unwrap_or_default();
+        assert!(errors.iter().any(|e| e.contains("编号")), "{errors:?}");
+    }
+
+    #[test]
+    fn a_new_tunnel_lands_on_the_row_it_was_added_at() {
+        // `commit_form_create` used to recover the new row as `len() - 1`; the
+        // cursor must still land on that row.
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths { config: dir.path().join("config.toml"), state: dir.path().join("state.toml") };
+        crate::config::save(&paths.config, &ConfigFile::default()).unwrap();
+        let mut app = App::new(paths);
+        app.open_form_create();
+        {
+            let f = app.form.as_mut().unwrap();
+            f.ssh_host.set("host");
+            f.name.set("fresh");
+            f.remote_port.set("22");
+            f.local_port.set("18003");
+        }
+        app.submit_form();
+        assert_eq!(app.tunnels.len(), 1);
+        assert_eq!(app.selected_tunnel().map(|t| t.cfg.name.as_str()), Some("fresh"));
     }
 }

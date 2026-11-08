@@ -253,8 +253,14 @@ fn draw_header(frame: &mut Frame, table: &ImportTable, cols: &[ColSpec], inner: 
         spans.push(cell_span(&text, spec.width, style));
         hits.push(Rect { x, y: inner.y, width: spec.width, height: 1 }, HitTarget::ImportColumnHeader(spec.col));
         if editing {
-            let cx = (x + display_width(&text) as u16).min(x + spec.width);
-            if cx < inner.right() {
+            // `text` is `label:value` with a user-typed value: unbounded, so the
+            // cursor offset is clamped in `usize` instead of wrapping a u16.
+            let want = usize::from(x) + display_width(&text);
+            let cap = usize::from(x) + usize::from(spec.width);
+            let cx = want.min(cap);
+            if cx < usize::from(inner.right())
+                && let Ok(cx) = u16::try_from(cx)
+            {
                 frame.set_cursor_position((cx, inner.y));
             }
         }
@@ -374,16 +380,23 @@ fn columns(width: u16) -> Vec<ColSpec> {
 
     // Every spare cell goes to the elastic columns, weighted towards 监听: it is
     // the column a user narrows by when the list is long.
+    //
+    // The arithmetic runs in u32: `width` is the pane's cell count and can be
+    // anything up to `u16::MAX`, where `spare * 4` overflows a u16 and panics in
+    // a debug build (release would wrap and hand out a nonsensical width). The
+    // shares are provably `<= spare`, so narrowing back to u16 cannot clip.
     let spare = width.saturating_sub(used);
     let flexible: Vec<usize> =
         out.iter().enumerate().filter(|(_, spec)| spec.col != ImportColumn::Kind).map(|(i, _)| i).collect();
     if !flexible.is_empty() {
-        let weights = [4u16, 3, 3];
-        let mut left = spare;
+        let weights = [4u32, 3, 3];
+        let mut left = u32::from(spare);
+        let total = u32::from(spare);
         for (k, &i) in flexible.iter().enumerate() {
-            let share = if k + 1 == flexible.len() { left } else { (spare * weights[k.min(2)] / 10).min(left) };
-            out[i].width += share;
-            left -= share;
+            let share = if k + 1 == flexible.len() { left } else { (total * weights[k.min(2)] / 10).min(left) };
+            let share = u16::try_from(share).unwrap_or(u16::MAX);
+            out[i].width = out[i].width.saturating_add(share);
+            left = left.saturating_sub(u32::from(share));
         }
     }
     out
@@ -417,7 +430,11 @@ fn row_line(row: &ImportRow, is_cursor: bool, cols: &[ColSpec], width: u16, p: P
         // the row, not a column value, hence the indent kept below the headers.
         if !importable && last {
             let reason = format!("⚠ {}", row.forward.unsupported_reason().unwrap_or("无法导入"));
-            let rest = cols[i..].iter().map(|c| c.width).sum::<u16>() + (cols.len() - i - 1) as u16;
+            // Widened before summing: the widths come from a pane that can be up
+            // to `u16::MAX` cells wide, and the running total plus the separator
+            // cells can pass that.
+            let rest: u32 = cols[i..].iter().map(|c| u32::from(c.width)).sum::<u32>() + (cols.len() - i - 1) as u32;
+            let rest = u16::try_from(rest).unwrap_or(u16::MAX);
             spans.push(cell_span(&reason, rest.max(spec.width), p.fg(p.failed)));
             continue;
         }
@@ -435,12 +452,14 @@ fn row_line(row: &ImportRow, is_cursor: bool, cols: &[ColSpec], width: u16, p: P
     // stops mid-row reads as a text selection instead of a focused row. The
     // reason span above can already have absorbed the spare width, so this only
     // ever pads — it never truncates.
-    let mut used = CHECK_W + 1;
+    // Same widening: this total is only compared against `width` and used as a
+    // padding count, so an over-wide sum simply means "no padding needed".
+    let mut used = u32::from(CHECK_W) + 1;
     for (i, spec) in cols.iter().enumerate() {
-        used += spec.width + u16::from(i > 0);
+        used += u32::from(spec.width) + u32::from(i > 0);
     }
-    if used < width {
-        spans.push(Span::raw(" ".repeat((width - used) as usize)));
+    if used < u32::from(width) {
+        spans.push(Span::raw(" ".repeat((u32::from(width) - used) as usize)));
     }
 
     let line = Line::from(spans);
@@ -474,11 +493,13 @@ impl<'a> LineCursor<'a> {
     }
 
     /// Plain text, no hit rect.
+    ///
+    /// Chip and button labels embed user-typed filter text, which has no length
+    /// cap, so the label's cell width is measured wide and the fit test is done
+    /// in `usize` — a u16 sum of `x + w` would wrap and let an oversized label
+    /// be placed on top of the ones after it.
     fn text(&mut self, text: &str, style: Style) {
-        let w = display_width(text) as u16;
-        if self.x + w > self.right {
-            return;
-        }
+        let Some(w) = self.fit(text) else { return };
         self.spans.push(Span::styled(text.to_string(), style));
         self.x += w;
     }
@@ -486,10 +507,7 @@ impl<'a> LineCursor<'a> {
     /// A clickable label. Returns false when it does not fit, so callers stop
     /// instead of drawing a half-clipped button.
     fn button(&mut self, label: &str, style: Style, target: HitTarget) -> bool {
-        let w = display_width(label) as u16;
-        if self.x + w > self.right {
-            return false;
-        }
+        let Some(w) = self.fit(label) else { return false };
         self.hits.push(Rect { x: self.x, y: self.y, width: w, height: 1 }, target);
         self.spans.push(Span::styled(label.to_string(), style));
         self.x += w;
@@ -503,7 +521,18 @@ impl<'a> LineCursor<'a> {
             return;
         }
         self.spans.push(Span::raw(" ".repeat(room as usize)));
-        self.x += room;
+        self.x = self.x.saturating_add(room);
+    }
+
+    /// The label's width in cells if it still fits on the line.
+    fn fit(&self, label: &str) -> Option<u16> {
+        let w = display_width(label);
+        let end = usize::from(self.x) + w;
+        if end > usize::from(self.right) {
+            return None;
+        }
+        // `end <= right <= u16::MAX`, so the cast cannot truncate.
+        u16::try_from(w).ok()
     }
 
     fn finish(self) -> Line<'static> {
@@ -549,6 +578,54 @@ mod tests {
         }
         // Even 20 columns still fits a few columns; 12 leaves only the type.
         assert_eq!(columns(10).iter().map(|c| c.col).collect::<Vec<_>>(), vec![ImportColumn::Kind]);
+    }
+
+    /// The elastic-space pass must not overflow on a very wide pane.
+    ///
+    /// `share = spare * weight / 10` is computed in u16 upstream; `spare` can be
+    /// almost `u16::MAX` (a pane spanning a very wide terminal), so `spare * 4`
+    /// overflows and panics in a debug build. The widths it then hands out also
+    /// have to stay within the pane.
+    #[test]
+    fn columns_survive_a_very_wide_pane_without_overflowing() {
+        for w in [4_000u16, 20_000, u16::MAX - 1, u16::MAX] {
+            let cols = columns(w);
+            assert!(!cols.is_empty(), "width {w} produced no columns");
+            let used = u32::from(CHECK_W)
+                + 1
+                + cols.iter().map(|c| u32::from(c.width)).sum::<u32>()
+                + cols.len().saturating_sub(1) as u32;
+            assert!(used <= u32::from(w), "width {w} overflows: {cols:?}");
+        }
+    }
+
+    /// A row whose reason absorbs the remaining columns sums those widths in
+    /// u32, so the same wide-pane case cannot wrap into a tiny span.
+    #[test]
+    fn an_unimportable_row_on_a_wide_pane_keeps_its_reason_readable() {
+        let p = palette_with(true);
+        let bad =
+            ImportRow { forward: forward(ForwardKind::Local, 0, "LocalForward abc 127.0.0.1:3000"), checked: false };
+        for w in [90u16, 4_000, u16::MAX] {
+            let cols = columns(w);
+            let line = row_line(&bad, false, &cols, w, p);
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(text.contains("⚠ 端口无法解析"), "width {w}: {text}");
+        }
+    }
+
+    /// Chip/button labels embed user-typed filter text; `LineCursor` must refuse
+    /// to place one that does not fit rather than wrapping its x coordinate.
+    #[test]
+    fn line_cursor_refuses_a_label_wider_than_the_line() {
+        let mut hits = HitMap::new();
+        let mut line = LineCursor::new(0, 0, 10, &mut hits);
+        assert!(line.button("abc", Style::default(), HitTarget::ImportCheckAll));
+        assert!(!line.button(&"x".repeat(65_535), Style::default(), HitTarget::ImportInvert), "must not fit");
+        assert!(!line.button("abcdefghij", Style::default(), HitTarget::ImportUndoFilter), "must not fit");
+        // Only the first button was recorded, and it is where it was drawn.
+        assert_eq!(hits.rect_of(&HitTarget::ImportCheckAll), Some(Rect { x: 0, y: 0, width: 3, height: 1 }));
+        assert!(hits.rect_of(&HitTarget::ImportInvert).is_none());
     }
 
     #[test]

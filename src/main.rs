@@ -3,6 +3,7 @@
 //! Entry point: CLI parsing, terminal lifecycle, signal handling and the
 //! event loop. All state lives in [`app::App`]; all drawing in [`ui::draw`].
 
+use std::io::Write as _;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -71,37 +72,66 @@ LocalForward/RemoteForward/DynamicForward 会自动列进「从 ~/.ssh/config �
 SSH 连接参数（ProxyJump/IdentityFile/ssh-agent 等）交给 ~/.ssh/config。
 ";
 
+#[derive(Debug)]
 struct Args {
-    config: Option<String>,
+    /// Kept as an `OsString`: a config path need not be valid UTF-8.
+    config: Option<std::ffi::OsString>,
     no_restore: bool,
     list_hosts: bool,
     check: bool,
 }
 
+/// Parse the command line.
+///
+/// Reads `args_os`, not `args`: `std::env::args()` **panics** on an argument that
+/// is not valid UTF-8, and a filename in a non-UTF-8 locale is a perfectly legal
+/// thing to pass. Non-UTF-8 arguments are handled two ways, whichever is
+/// truthful: as a path they are kept byte-for-byte (the OS API is `OsStr`), as an
+/// option name they are rejected with a normal usage error.
+///
+/// Help and version output is written through `write!` rather than `print!` /
+/// `println!`, which panic on a broken pipe or a full disk (`sshpf --help | head
+/// -1`, `> /dev/full`). A help text that cannot be delivered is not an error
+/// worth a panic; the exit code still says what happened.
 fn parse_args() -> Result<Option<Args>, String> {
-    let mut args = Args { config: None, no_restore: false, list_hosts: false, check: false };
-    let mut it = std::env::args().skip(1);
+    parse_args_from(std::env::args_os().skip(1))
+}
+
+fn parse_args_from<I>(args: I) -> Result<Option<Args>, String>
+where
+    I: IntoIterator<Item = std::ffi::OsString>,
+{
+    let mut parsed = Args { config: None, no_restore: false, list_hosts: false, check: false };
+    let mut it = args.into_iter();
     while let Some(arg) = it.next() {
-        match arg.as_str() {
+        // Lossy only for the *match*; a path is stored untouched below.
+        let flag = arg.to_string_lossy().into_owned();
+        match flag.as_str() {
             "-h" | "--help" => {
-                print!("{USAGE}");
+                let _ = write_stdout(USAGE);
                 return Ok(None);
             }
             "-V" | "--version" => {
-                println!("sshpf {}", env!("CARGO_PKG_VERSION"));
+                let _ = writeln!(std::io::stdout(), "sshpf {}", env!("CARGO_PKG_VERSION"));
                 return Ok(None);
             }
             "-c" | "--config" => match it.next() {
-                Some(p) => args.config = Some(p),
+                Some(p) => parsed.config = Some(p),
                 None => return Err("--config 需要一个路径参数".to_string()),
             },
-            "--no-restore" => args.no_restore = true,
-            "--list-hosts" => args.list_hosts = true,
-            "--check" => args.check = true,
+            "--no-restore" => parsed.no_restore = true,
+            "--list-hosts" => parsed.list_hosts = true,
+            "--check" => parsed.check = true,
             other => return Err(format!("未知参数: {other}\n\n{USAGE}")),
         }
     }
-    Ok(Some(args))
+    Ok(Some(parsed))
+}
+
+/// Best-effort stdout write: returns whether it landed, never panics.
+fn write_stdout(text: &str) -> bool {
+    let mut out = std::io::stdout();
+    out.write_all(text.as_bytes()).and_then(|()| out.flush()).is_ok()
 }
 
 fn main() -> ExitCode {
@@ -117,7 +147,7 @@ fn main() -> ExitCode {
         Ok(None) => return ExitCode::SUCCESS,
         Err(e) => {
             eventlog::cli_error("cli.bad_args", &e);
-            eprintln!("{e}");
+            let _ = writeln!(std::io::stderr(), "{e}");
             return ExitCode::from(2);
         }
     };
@@ -152,7 +182,7 @@ fn main() -> ExitCode {
             // The TUI could not even start (terminal init, event loop I/O) — the
             // one failure with no UI left to explain it.
             logging::error("app.fatal", &[("stage", &"tui"), ("msg", &e.to_string())]);
-            eprintln!("错误: {e}");
+            let _ = writeln!(std::io::stderr(), "错误: {e}");
             ExitCode::FAILURE
         }
     }
@@ -161,19 +191,31 @@ fn main() -> ExitCode {
 fn list_hosts() -> ExitCode {
     match ssh::list_hosts() {
         Ok(hosts) if hosts.is_empty() => {
-            println!("未在 ~/.ssh/config 中找到任何主机");
+            if !write_stdout("未在 ~/.ssh/config 中找到任何主机\n") {
+                logging::warn("cli.stdout_failed", &[("mode", &"list_hosts")]);
+            }
             ExitCode::SUCCESS
         }
         Ok(hosts) => {
-            println!("{} 个主机:", hosts.len());
+            // One buffer, one write: `| head -1` closing the pipe mid-loop would
+            // otherwise turn a successful listing into a panic on the next line.
+            let mut out = format!("{} 个主机:\n", hosts.len());
             for h in hosts {
-                println!("  {}", h.display());
+                out.push_str("  ");
+                out.push_str(&h.display());
+                out.push('\n');
+            }
+            if !write_stdout(&out) {
+                // stdout is gone (closed pipe, full disk): the listing itself
+                // succeeded and nothing can be shown, so say so in the log and
+                // leave the exit status alone.
+                logging::warn("cli.stdout_failed", &[("mode", &"list_hosts")]);
             }
             ExitCode::SUCCESS
         }
         Err(e) => {
             eventlog::cli_error("sshconfig.load_failed", &e.to_string());
-            eprintln!("读取 ~/.ssh/config 失败: {e}");
+            let _ = writeln!(std::io::stderr(), "读取 ~/.ssh/config 失败: {e}");
             ExitCode::FAILURE
         }
     }
@@ -183,21 +225,27 @@ fn check_config(paths: &Paths) -> ExitCode {
     match config::load(&paths.config) {
         Ok(cfg) => {
             let problems = cfg.validate();
-            println!("{}: {} 条转发", config::display_path(&paths.config), cfg.tunnels.len());
+            let mut out = format!("{}: {} 条转发\n", config::display_path(&paths.config), cfg.tunnels.len());
             if problems.is_empty() {
-                println!("校验通过");
-                ExitCode::SUCCESS
+                out.push_str("校验通过\n");
             } else {
                 for p in &problems {
-                    println!("  警告: {p}");
+                    out.push_str("  警告: ");
+                    out.push_str(p);
+                    out.push('\n');
                 }
                 eventlog::config_loaded(&config::display_path(&paths.config), cfg.tunnels.len(), &problems);
-                ExitCode::SUCCESS
             }
+            // The verdict is in the exit code and the file; a failed stdout write
+            // only costs the echo, never the exit status.
+            if !write_stdout(&out) {
+                logging::warn("cli.stdout_failed", &[("mode", &"check")]);
+            }
+            ExitCode::SUCCESS
         }
         Err(e) => {
             eventlog::cli_error("config.invalid", &e.to_string());
-            eprintln!("配置错误: {e}");
+            let _ = writeln!(std::io::stderr(), "配置错误: {e}");
             ExitCode::FAILURE
         }
     }
@@ -218,13 +266,60 @@ fn run_tui(paths: Paths, no_restore: bool, started: Instant) -> std::io::Result<
         let set_flag = quit.clone();
         let sig = *sig;
         // SAFETY: the closure only performs atomic stores.
-        unsafe {
-            let _ = signal_hook::low_level::register(sig, move || {
+        let registered = unsafe {
+            signal_hook::low_level::register(sig, move || {
                 RECEIVED_SIGNAL.store(sig, Ordering::Relaxed);
                 set_flag.store(true, Ordering::SeqCst);
-            });
+            })
+        };
+        if let Err(e) = registered {
+            // Swallowing this used to be a silent trap: Ctrl-C would kill the
+            // process without running any `Drop`, leaving tunnels unstopped and
+            // the terminal in raw mode. Not fatal — the TUI still runs, and `q`
+            // quits — but the user deserves to know which shortcut is gone.
+            logging::warn("app.signal_unavailable", &[("signal", &signal_name(sig)), ("msg", &e.to_string())]);
         }
     }
+
+    // Take the terminal **before** any tunnel is restored: if there is no tty
+    // (`sshpf < /dev/null`, a CI runner, `ssh host sshpf` without a pty, a Windows
+    // process with no console), this is the first thing that fails and there is
+    // nothing to clean up yet.
+    //
+    // `ratatui::init()` is `try_init().expect("failed to initialize terminal")`, so
+    // it **panics** in exactly those cases — bypassing the `app.fatal` handling
+    // below, which was written for this failure. `try_init` returns the error
+    // instead, so it reaches `main` as an `io::Error`, is recorded as `app.fatal`,
+    // and exits 1 instead of 101.
+    //
+    // `try_init` installs ratatui's own panic hook (which restores the terminal)
+    // *after* ours, so the two chain: ratatui restores the screen and then calls
+    // our hook, which writes `crash.panic`. That is the documented ordering of both
+    // libraries and the one the crash tests rely on.
+    //
+    // `try_init` can fail *after* it has already put the terminal in raw mode
+    // (its steps are: install hook → enable raw mode → enter the alternate screen
+    // → build the terminal). Unlike `init`, which panics and lets the hook restore
+    // the screen, returning the error leaves that partial state in place — and the
+    // shell that regains control would then be unusable. So undo it explicitly;
+    // `restore` is best effort and never panics.
+    let mut terminal: DefaultTerminal = match ratatui::try_init() {
+        Ok(terminal) => terminal,
+        Err(e) => {
+            // Only undo state we actually created: `is_raw_mode_enabled` is the
+            // observable proof that `try_init` got past its first step. With no
+            // tty at all it fails on that first step, and emitting escape
+            // sequences at a redirected stdout would corrupt whatever is reading
+            // it (a CI log, a file).
+            if crossterm::terminal::is_raw_mode_enabled().unwrap_or(false) {
+                ratatui::restore();
+            }
+            return Err(e);
+        }
+    };
+    // From here on the crash handler must release the alternate screen before the
+    // message lands in the user's shell.
+    logging::set_tui_active(true);
 
     if config::perms_too_open(&paths.config) {
         // Group/world readable config: it names hosts and key paths, so this is a
@@ -248,10 +343,6 @@ fn run_tui(paths: Paths, no_restore: bool, started: Instant) -> std::io::Result<
         app.set_status(StatusMsg::info("已跳过自动恢复（--no-restore）"));
     }
 
-    let mut terminal: DefaultTerminal = ratatui::init();
-    // From here on the crash handler must release the alternate screen before the
-    // message lands in the user's shell.
-    logging::set_tui_active(true);
     // Mouse capture is on for the whole session: the import table's filtering and
     // the table's row selection are click-driven, and terminals cannot report a
     // click without it. It is best-effort — a terminal that refuses capture (some
@@ -281,6 +372,8 @@ fn run_tui(paths: Paths, no_restore: bool, started: Instant) -> std::io::Result<
         // makes the shell that regains control print garbage on every move.
         let _ = execute!(std::io::stdout(), DisableMouseCapture);
     }
+    // `restore` prints to stderr (never panics) if the terminal cannot be put
+    // back; the event loop's own `io::Result` is what decides the exit code.
     ratatui::restore();
     result.map(|()| ExitCode::SUCCESS)
 }
@@ -313,4 +406,109 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, quit: &Arc<AtomicBo
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    fn parse(args: &[&str]) -> Result<Option<Args>, String> {
+        parse_args_from(args.iter().map(OsString::from))
+    }
+
+    /// The error half of a parse, for the cases that must fail.
+    fn parse_err(args: &[&str]) -> String {
+        match parse(args) {
+            Err(e) => e,
+            Ok(_) => panic!("expected a usage error for {args:?}"),
+        }
+    }
+
+    #[test]
+    fn plain_flags_parse() {
+        let args = parse(&["--check"]).unwrap().unwrap();
+        assert!(args.check && !args.list_hosts && !args.no_restore);
+        let args = parse(&["--list-hosts", "--no-restore"]).unwrap().unwrap();
+        assert!(args.list_hosts && args.no_restore && !args.check);
+    }
+
+    #[test]
+    fn config_takes_the_next_argument_verbatim() {
+        let args = parse(&["-c", "/tmp/x.toml"]).unwrap().unwrap();
+        assert_eq!(args.config.as_deref(), Some(std::ffi::OsStr::new("/tmp/x.toml")));
+        let args = parse(&["--config", "rel/config.toml"]).unwrap().unwrap();
+        assert_eq!(args.config.as_deref(), Some(std::ffi::OsStr::new("rel/config.toml")));
+    }
+
+    #[test]
+    fn missing_config_value_is_a_usage_error_not_a_panic() {
+        let err = parse_err(&["--config"]);
+        assert!(err.contains("--config"), "{err}");
+    }
+
+    #[test]
+    fn unknown_flags_are_rejected_with_the_usage_text() {
+        let err = parse_err(&["--nope"]);
+        assert!(err.contains("未知参数"), "{err}");
+        assert!(err.contains("用法"), "the message must include the usage: {err}");
+    }
+
+    #[test]
+    fn help_and_version_short_circuit() {
+        assert!(parse(&["--help"]).unwrap().is_none());
+        assert!(parse(&["-h"]).unwrap().is_none());
+        assert!(parse(&["-V"]).unwrap().is_none());
+        assert!(parse(&["--version"]).unwrap().is_none());
+        // Everything after `--help` is irrelevant, and must not be validated.
+        assert!(parse(&["--help", "--totally-bogus"]).unwrap().is_none());
+    }
+
+    /// The bug: `std::env::args()` panics on a non-UTF-8 argument. A config path
+    /// is an OS path, so it has to survive byte-for-byte.
+    #[test]
+    fn a_non_utf8_config_path_is_accepted_verbatim() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::{OsStrExt, OsStringExt};
+            let raw = OsString::from_vec(b"/tmp/\xff\xfe.toml".to_vec());
+            let parsed = parse_args_from(vec![OsString::from("--config"), raw.clone()]).unwrap().unwrap();
+            assert_eq!(parsed.config.as_deref().map(|c| c.as_bytes()), Some(&b"/tmp/\xff\xfe.toml"[..]));
+        }
+        // The portable check: at minimum it must not panic, on any platform.
+        let raw = OsString::from("/tmp/config.toml");
+        assert!(parse_args_from(vec![OsString::from("--config"), raw]).is_ok());
+    }
+
+    /// A non-UTF-8 *option name* cannot be a known flag, so it is a usage error
+    /// (exit 2) rather than a panic.
+    #[test]
+    fn a_non_utf8_flag_is_a_usage_error() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let raw = OsString::from_vec(b"--\xff".to_vec());
+            let err = match parse_args_from(vec![raw]) {
+                Err(e) => e,
+                Ok(_) => panic!("a non-UTF-8 flag must be a usage error"),
+            };
+            assert!(err.contains("未知参数"), "{err}");
+        }
+    }
+
+    #[test]
+    fn write_stdout_reports_instead_of_panicking() {
+        // Not a tty here, so this exercises the buffered path end to end.
+        assert!(write_stdout("sshpf test line\n"));
+    }
+
+    /// `signal_name` must never panic for an out-of-range number: it is used in
+    /// the log line for a signal we do not know.
+    #[test]
+    fn signal_name_is_total() {
+        for sig in [i32::MIN, -1, 0, 9, 15, i32::MAX] {
+            let name = signal_name(sig);
+            assert!(!name.is_empty(), "sig {sig} produced an empty name");
+        }
+    }
 }
