@@ -62,6 +62,22 @@ jobs:
       - name: Unit tests
         run: cargo test --lib
 
+      # Help-coverage test. It only reads source files and compares them against
+      # `src/help.rs`, so it needs no service and runs on every OS in the matrix —
+      # which is the point: "every dispatched key is documented" is a property of
+      # the source, not of the platform.
+      #
+      # `cargo test --lib` above only compiles the library's own `#[cfg(test)]`
+      # modules, so a `tests/*.rs` target is not executed by it. Without this step
+      # the whole guarantee of the in-app help would sit in a file CI never runs.
+      #
+      # `tests/logging.rs` and `tests/panic_hardening.rs` are *not* listed here:
+      # they drive the real binary and must not overlap, so they run in the
+      # dedicated `hardening` job below (`--test-threads=1`). `tests/e2e.rs` needs
+      # a real `sshd` and likewise has its own job.
+      - name: Help coverage
+        run: cargo test --test help_coverage
+
       - name: Build (release)
         run: cargo build --release
 

@@ -31,12 +31,29 @@ pub(crate) const COL_SPACING: u16 = 1;
 const MAX_LAST_ERROR: u16 = 34;
 /// Narrowest LAST ERROR column we accept before dropping columns instead.
 const MIN_LAST_ERROR: u16 = 4;
-/// Label column of the form (`SSH 主机` = 8 cells) plus one separating space.
+/// Narrow label column of the form: widest Chinese label (`SSH 主机` = 8 cells).
 pub(crate) const FORM_LABEL_W: usize = 8;
-/// Field value column of the form starts at this offset inside the popup.
-pub(crate) const FORM_VALUE_X: usize = FORM_LABEL_W + 1;
+/// Wide label column: widest bilingual label, `远端端口 Remote port` = 20 cells.
+pub(crate) const FORM_LABEL_W_BI: usize = 20;
 /// How many log lines the detail overlay keeps on screen.
 pub(crate) const DETAIL_LOG_TAIL: usize = 15;
+
+/// Width of the form's label column inside a popup of `inner_width` cells.
+///
+/// Every label carries both languages (`名称 Name`), which is worth a much wider
+/// column on a normal terminal but would squeeze the values to nothing on a
+/// small one. So the bilingual column is only paid for when the popup can spare
+/// it; below the threshold the labels degrade to Chinese, which [`crate::help::fit`]
+/// then renders on one line.
+pub(crate) fn form_label_w(inner_width: u16) -> usize {
+    // 20 cells of label + 1 of gap + 25 of value, the narrowest readable form.
+    if inner_width >= (FORM_LABEL_W_BI + 26) as u16 { FORM_LABEL_W_BI } else { FORM_LABEL_W }
+}
+
+/// First cell of the form's value column inside a popup of `inner_width` cells.
+pub(crate) fn form_value_x(inner_width: u16) -> usize {
+    form_label_w(inner_width) + 1
+}
 
 /// Minimum width for a column when squeezing.
 fn min_width(col: Col) -> u16 {

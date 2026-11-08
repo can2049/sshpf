@@ -197,6 +197,29 @@ fn handle_form_key(app: &mut App, key: KeyEvent) {
 /// suggestion, and typing in the local port marks it as hand-set so the
 /// suggestion stops overwriting it.
 fn handle_field_editing(app: &mut App, key: KeyEvent) {
+    // Save keys are stage-independent, and they must be matched *before* the
+    // generic `Char(c)` path in `edit_field`:
+    //
+    // * `edit_field` inserts any `Char`, ignoring modifiers, so without this
+    //   branch ctrl+s typed the letter `s` into the field instead of saving —
+    //   a silent data corruption, not just a missing shortcut.
+    // * `f10` has no `KeyCode::Char`, so it fell through to `_ => return` and
+    //   did nothing at all, while the navigating stage saved on it.
+    //
+    // Ending the edit first keeps the two stages equivalent: `submit_form`
+    // validates the same buffers either way, and a pending edit mode left on
+    // the form would make the next frame render a text cursor over a form that
+    // is about to close.
+    if matches!(key.code, KeyCode::F(10))
+        || (key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL))
+    {
+        if let Some(f) = app.form.as_mut() {
+            f.end_edit();
+            f.revalidate();
+        }
+        app.submit_form();
+        return;
+    }
     match key.code {
         // Leave editing; the highlight stays where it is.
         KeyCode::Enter | KeyCode::Esc => {
@@ -409,7 +432,7 @@ fn handle_import_key(app: &mut App, key: KeyEvent) -> bool {
             } else if let Some(col) = active_filter_column(app) {
                 app.clear_import_filter(col);
             } else {
-                app.set_status(crate::model::StatusMsg::info("没有筛选可清除"));
+                app.set_status(crate::model::StatusMsg::info(crate::help::bi("没有筛选可清除", "No filter to clear")));
             }
             true
         }
@@ -999,6 +1022,52 @@ mod tests {
         assert_eq!(app.tunnels.len(), 1);
         let reloaded = config::load(&app.paths.config).unwrap();
         assert_eq!(reloaded.tunnels[0].name, "saved");
+    }
+
+    #[test]
+    fn ctrl_s_saves_while_a_field_is_being_edited() {
+        // Regression: `edit_field` inserts every `KeyCode::Char` without looking
+        // at modifiers, so ctrl+s used to type the letter `s` into the field and
+        // leave the form open. The save keys are stage-independent.
+        let (_d, mut app) = form_app();
+        {
+            let f = app.form.as_mut().unwrap();
+            f.ssh_host.set("testhost");
+            f.name.set("saved");
+            f.remote_port.set("22");
+            f.local_port.set("18050");
+            f.field = FormField::Name;
+        }
+        handle_key(&mut app, key(KeyCode::Enter)); // start editing NAME
+        handle_key(&mut app, ch('x'));
+        handle_key(&mut app, ctrl('s'));
+        assert!(matches!(app.overlay, Overlay::None), "ctrl+s must save from the editing stage");
+        assert_eq!(app.tunnels.len(), 1);
+        let reloaded = config::load(&app.paths.config).unwrap();
+        assert_eq!(reloaded.tunnels[0].name, "savedx", "the typed text is kept, and no stray 's' is appended");
+    }
+
+    #[test]
+    fn f10_saves_from_both_form_stages() {
+        // The navigating stage already bound f10; the editing stage used to fall
+        // through to `_ => return`, so the same key silently did nothing there.
+        for edit_first in [false, true] {
+            let (_d, mut app) = form_app();
+            {
+                let f = app.form.as_mut().unwrap();
+                f.ssh_host.set("testhost");
+                f.name.set("via-f10");
+                f.remote_port.set("22");
+                f.local_port.set("18051");
+                f.field = FormField::Name;
+            }
+            if edit_first {
+                handle_key(&mut app, key(KeyCode::Enter));
+            }
+            handle_key(&mut app, key(KeyCode::F(10)));
+            assert!(matches!(app.overlay, Overlay::None), "f10 must save (editing={edit_first})");
+            assert_eq!(app.tunnels.len(), 1, "f10 must save (editing={edit_first})");
+        }
     }
 
     #[test]

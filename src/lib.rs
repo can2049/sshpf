@@ -14,6 +14,7 @@
 
 pub mod app;
 pub mod config;
+pub mod help;
 pub mod keys;
 pub mod logging;
 pub mod model;

@@ -6,6 +6,7 @@
 
 use crate::app::log as eventlog;
 use crate::app::{App, ConfirmAction};
+use crate::help;
 use crate::model::{
     self, FormField, FormMode, ForwardKind, ImportTable, InputBuf, TunnelConfig, TunnelId, TunnelView, now_unix,
 };
@@ -206,15 +207,19 @@ impl FormState {
             Some((port, reason)) => {
                 self.local_port.set(port.to_string());
                 self.local_port_note = Some(match reason {
-                    model::LocalPortReason::SameAsRemote => format!("已自动设为 {port}（与远端端口相同）"),
-                    model::LocalPortReason::PrivilegedAlias => {
-                        format!("远端端口 {remote} 需特权，本地建议 {port}")
+                    model::LocalPortReason::SameAsRemote => {
+                        help::bi(&format!("已自动设为 {port}（与远端端口相同）"), "same as the remote port")
                     }
-                    model::LocalPortReason::Bumped => format!("{remote} 已被占用，已自动顺延到 {port}"),
+                    model::LocalPortReason::PrivilegedAlias => {
+                        help::bi(&format!("远端端口 {remote} 需特权，本地建议 {port}"), "needs root: <1024")
+                    }
+                    model::LocalPortReason::Bumped => {
+                        help::bi(&format!("{remote} 已被占用，已自动顺延到 {port}"), "already taken, moved up")
+                    }
                 });
             }
             None => {
-                self.local_port_note = Some("找不到可用本地端口，请手动填写".to_string());
+                self.local_port_note = Some(help::bi("找不到可用本地端口，请手动填写", "no free port — type one"));
             }
         }
     }
@@ -229,7 +234,7 @@ impl FormState {
     pub fn revalidate(&mut self) {
         self.errors.clear();
         if self.ssh_host.value().trim().is_empty() {
-            self.errors.push("SSH 主机不能为空".into());
+            self.errors.push(help::bi("SSH 主机不能为空", "SSH host must not be empty"));
         }
         if let (Ok(port), false) =
             (self.local_port.value().trim().parse::<u16>(), self.local_port.value().trim().is_empty())
@@ -237,9 +242,12 @@ impl FormState {
         {
             let addr = self.local_addr.value().trim();
             if !addr.is_empty() && !ssh::port_available(addr, port) {
-                self.port_hint = Some(format!("{addr}:{port} 已被占用"));
+                // `src/ui.rs` colours this line by `contains("占用")`, so the
+                // Chinese phrase must stay first and verbatim.
+                self.port_hint =
+                    Some(help::bi(&format!("{addr}:{port} 已被占用"), &format!("{addr}:{port} is already in use")));
             } else {
-                self.port_hint = Some(format!("{addr}:{port} 可用"));
+                self.port_hint = Some(help::bi(&format!("{addr}:{port} 可用"), &format!("{addr}:{port} is available")));
             }
         } else {
             self.port_hint = None;
@@ -255,21 +263,23 @@ impl FormState {
         let kind = self.kind();
 
         if name.is_empty() {
-            errs.push("名称不能为空".to_string());
+            errs.push(help::bi("名称不能为空", "Name must not be empty"));
         }
         if ssh_host.is_empty() {
-            errs.push("SSH 主机不能为空".to_string());
+            errs.push(help::bi("SSH 主机不能为空", "SSH host must not be empty"));
         }
         if ssh_host.chars().any(char::is_whitespace) {
-            errs.push("SSH 主机不能包含空格".to_string());
+            errs.push(help::bi("SSH 主机不能包含空格", "SSH host must not contain spaces"));
         }
         if kind != ForwardKind::Remote && local_addr.is_empty() {
-            errs.push("本地地址不能为空".to_string());
+            errs.push(help::bi("本地地址不能为空", "Local address must not be empty"));
         }
 
         let mut local_port = 0u16;
         match self.local_port.value().trim().parse::<u16>() {
-            Ok(0) | Err(_) => errs.push("本地端口必须是 1-65535 的数字".to_string()),
+            Ok(0) | Err(_) => {
+                errs.push(help::bi("本地端口必须是 1-65535 的数字", "Local port must be a number 1-65535"));
+            }
             Ok(p) => local_port = p,
         }
 
@@ -277,12 +287,14 @@ impl FormState {
         let mut remote_host = String::new();
         if kind != ForwardKind::Dynamic {
             match self.remote_port.value().trim().parse::<u16>() {
-                Ok(0) | Err(_) => errs.push("远端端口必须是 1-65535 的数字".to_string()),
+                Ok(0) | Err(_) => {
+                    errs.push(help::bi("远端端口必须是 1-65535 的数字", "Remote port must be a number 1-65535"));
+                }
                 Ok(p) => remote_port = p,
             }
             remote_host = self.remote_host.value().trim().to_string();
             if remote_host.is_empty() {
-                errs.push("远端地址不能为空".to_string());
+                errs.push(help::bi("远端地址不能为空", "Remote address must not be empty"));
             }
         }
 
@@ -393,7 +405,10 @@ impl App {
         // Cross-entry conflict: same listen endpoint as another enabled tunnel.
         if let Some(conflict) = self.listen_conflict(&cfg) {
             if let Some(f) = self.form.as_mut() {
-                f.errors = vec![format!("监听地址与「{conflict}」冲突")];
+                f.errors = vec![help::bi(
+                    &format!("监听地址与「{conflict}」冲突"),
+                    &format!("Listen endpoint collides with \"{conflict}\""),
+                )];
             }
             return None;
         }

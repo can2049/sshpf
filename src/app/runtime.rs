@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use crate::app::log as eventlog;
 use crate::app::{App, ConfirmAction, MAX_EVENTS_PER_FRAME, RetryState, backoff, deadline_after};
 use crate::config;
+use crate::help;
 use crate::logging;
 use crate::model::{FailureInfo, FailureKind, ForwardKind, LogLevel, LogLine, StatusMsg, TunnelId, TunnelStatus};
 use crate::ssh;
@@ -32,7 +33,10 @@ impl App {
         for id in ids {
             self.start_tunnel_with(id, "restore");
         }
-        self.set_status(StatusMsg::info(format!("正在恢复 {n} 条转发…")));
+        self.set_status(StatusMsg::info(help::bi(
+            &format!("正在恢复 {n} 条转发…"),
+            &format!("Restoring {n} forwards…"),
+        )));
     }
 
     pub(crate) fn log(&mut self, id: TunnelId, level: LogLevel, text: impl Into<String>) {
@@ -79,8 +83,10 @@ impl App {
             eventlog::tunnel_start_rejected(&cfg, "validate", &info);
             self.abandon_retry(&cfg, "validate", &info);
             self.set_state(id, TunnelStatus::Failed { reason: info });
-            self.log(id, LogLevel::Error, format!("配置无效: {e}"));
-            self.set_status(StatusMsg::error(format!("{}: {e}", cfg.name)));
+            self.log(id, LogLevel::Error, help::bi(&format!("配置无效: {e}"), &format!("Invalid config: {e}")));
+            // `e` comes from the config validator and is already bilingual-safe
+            // Chinese; the English half states only the category.
+            self.set_status(StatusMsg::error(format!("{}: {e} / Invalid config", cfg.name)));
             return;
         }
 
@@ -99,7 +105,10 @@ impl App {
                 self.abandon_retry(&cfg, "preflight_bind", &info);
                 self.set_state(id, TunnelStatus::Failed { reason: info });
                 self.log(id, LogLevel::Error, detail.clone());
-                self.set_status(StatusMsg::error(format!("{}: {detail}", cfg.name)));
+                self.set_status(StatusMsg::error(help::bi(
+                    &format!("{}: {detail}", cfg.name),
+                    &format!("{}: {addr}:{port} is already in use", cfg.name),
+                )));
                 self.persist_quietly();
                 return;
             }
@@ -115,10 +124,20 @@ impl App {
                 self.log(
                     id,
                     LogLevel::Info,
-                    format!("连接 {}@{}:{}", endpoint.user_or_current(), endpoint.hostname, endpoint.port),
+                    help::bi(
+                        &format!("连接 {}@{}:{}", endpoint.user_or_current(), endpoint.hostname, endpoint.port),
+                        &format!("Connecting {}@{}:{}", endpoint.user_or_current(), endpoint.hostname, endpoint.port),
+                    ),
                 );
                 if !endpoint.proxy_jump.is_empty() {
-                    self.log(id, LogLevel::Info, format!("经跳板机: {}", endpoint.proxy_jump.join(" → ")));
+                    self.log(
+                        id,
+                        LogLevel::Info,
+                        help::bi(
+                            &format!("经跳板机: {}", endpoint.proxy_jump.join(" → ")),
+                            &format!("Via jump hosts: {}", endpoint.proxy_jump.join(" → ")),
+                        ),
+                    );
                 }
                 eventlog::tunnel_spawned(
                     &cfg,
@@ -133,8 +152,15 @@ impl App {
                 eventlog::tunnel_start_rejected(&cfg, "resolve_endpoint", &info);
                 self.abandon_retry(&cfg, "resolve_endpoint", &info);
                 self.set_state(id, TunnelStatus::Failed { reason: info });
-                self.log(id, LogLevel::Error, format!("解析 SSH 主机失败: {e:#}"));
-                self.set_status(StatusMsg::error(format!("{}: 无法解析 SSH 主机", cfg.name)));
+                self.log(
+                    id,
+                    LogLevel::Error,
+                    help::bi(&format!("解析 SSH 主机失败: {e:#}"), &format!("Cannot resolve the SSH host: {e:#}")),
+                );
+                self.set_status(StatusMsg::error(help::bi(
+                    &format!("{}: 无法解析 SSH 主机", cfg.name),
+                    &format!("{}: cannot resolve the SSH host", cfg.name),
+                )));
                 return;
             }
         }
@@ -146,7 +172,10 @@ impl App {
         let policy = self.host_key_policy;
         match self.supervisor.spawn(cfg.clone(), policy, self.event_tx.clone()) {
             Ok(()) => {
-                self.set_status(StatusMsg::info(format!("{} 正在连接…", cfg.name)));
+                self.set_status(StatusMsg::info(help::bi(
+                    &format!("{} 正在连接…", cfg.name),
+                    &format!("{} connecting…", cfg.name),
+                )));
             }
             Err(e) => {
                 let short: String = e.to_string().chars().take(28).collect();
@@ -154,8 +183,15 @@ impl App {
                 eventlog::tunnel_spawn_failed(&cfg, &e.to_string());
                 self.abandon_retry(&cfg, "spawn", &info);
                 self.set_state(id, TunnelStatus::Failed { reason: info });
-                self.log(id, LogLevel::Error, format!("启动隧道失败: {e}"));
-                self.set_status(StatusMsg::error(format!("{} 启动失败: {e}", cfg.name)));
+                self.log(
+                    id,
+                    LogLevel::Error,
+                    help::bi(&format!("启动隧道失败: {e}"), &format!("Cannot start the tunnel: {e}")),
+                );
+                self.set_status(StatusMsg::error(help::bi(
+                    &format!("{} 启动失败: {e}", cfg.name),
+                    &format!("{} failed to start", cfg.name),
+                )));
             }
         }
         self.persist_quietly();
@@ -197,7 +233,7 @@ impl App {
         if let Some(v) = self.tunnels.iter_mut().find(|t| t.cfg.id == id) {
             v.retries = 0;
         }
-        self.log(id, LogLevel::Info, "已停止");
+        self.log(id, LogLevel::Info, help::bi("已停止", "Stopped"));
         self.persist_quietly();
     }
 
@@ -317,7 +353,7 @@ impl App {
         if let Some(v) = self.tunnels.iter_mut().find(|t| t.cfg.id == id) {
             v.retries = 0;
         }
-        self.set_status(StatusMsg::ok(format!("✓ {name} 已连通")));
+        self.set_status(StatusMsg::ok(help::bi(&format!("✓ {name} 已连通"), &format!("✓ {name} up"))));
     }
 
     /// Handle one progress line from a tunnel.
@@ -360,7 +396,11 @@ impl App {
             return;
         }
         let was_up = matches!(status, TunnelStatus::Up { .. });
-        self.log(id, if was_up { LogLevel::Warn } else { LogLevel::Error }, format!("连接已结束 (code {code:?})"));
+        self.log(
+            id,
+            if was_up { LogLevel::Warn } else { LogLevel::Error },
+            help::bi(&format!("连接已结束 (code {code:?})"), &format!("Connection ended (code {code:?})")),
+        );
 
         let reason = match status.failure().cloned().or(classified) {
             Some(f) => f,
@@ -427,7 +467,11 @@ impl App {
             if let Some(r) = self.retry_state.get_mut(&id) {
                 r.next_at = deadline_after(now, delay);
             }
-            self.log(id, LogLevel::Info, format!("第 {attempt} 次自动重连…"));
+            self.log(
+                id,
+                LogLevel::Info,
+                help::bi(&format!("第 {attempt} 次自动重连…"), &format!("Auto-reconnect attempt {attempt}…")),
+            );
             self.start_tunnel_with(id, "retry");
         }
     }
