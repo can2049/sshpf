@@ -77,6 +77,7 @@ impl Supervisor {
         &mut self,
         cfg: crate::model::TunnelConfig,
         host_key_policy: crate::ssh::known_hosts::HostKeyPolicy,
+        health_check: Option<Duration>,
         tx: Sender<TunnelEvent>,
     ) -> std::io::Result<()> {
         let id = cfg.id;
@@ -86,7 +87,7 @@ impl Supervisor {
         let stop_thread = stop.clone();
 
         let handle = std::thread::Builder::new().name(format!("sshpf-tunnel-{id}")).spawn(move || {
-            contain(id, &tx, || drive(id, cfg, host_key_policy, &tx, stop_thread));
+            contain(id, &tx, || drive(id, cfg, host_key_policy, health_check, &tx, stop_thread));
         })?;
 
         self.running.insert(id, Running { stop, handle });
@@ -217,6 +218,7 @@ fn drive(
     id: TunnelId,
     cfg: crate::model::TunnelConfig,
     host_key_policy: crate::ssh::known_hosts::HostKeyPolicy,
+    health_check: Option<Duration>,
     tx: &Sender<TunnelEvent>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<()> {
@@ -237,7 +239,7 @@ fn drive(
     };
 
     rt.block_on(async {
-        let opts = crate::ssh::client::Options { host_key_policy };
+        let opts = crate::ssh::client::Options { host_key_policy, health_check };
         let run = crate::ssh::client::run(&cfg, &opts, id, tx.clone(), ready);
         tokio::pin!(run);
         // Race the driver against the shutdown flag. `select!` already loops
@@ -305,7 +307,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let mut sup = Supervisor::new();
         // Port 1 on loopback refuses immediately.
-        sup.spawn(cfg(1, 0), crate::ssh::known_hosts::HostKeyPolicy::AcceptNew, tx).unwrap();
+        sup.spawn(cfg(1, 0), crate::ssh::known_hosts::HostKeyPolicy::AcceptNew, None, tx).unwrap();
 
         let mut saw_exit = false;
         let mut saw_closed = false;
@@ -331,7 +333,7 @@ mod tests {
     fn stop_is_idempotent_and_forgets_the_tunnel() {
         let (tx, _rx) = mpsc::channel();
         let mut sup = Supervisor::new();
-        sup.spawn(cfg(2, 0), crate::ssh::known_hosts::HostKeyPolicy::AcceptNew, tx).unwrap();
+        sup.spawn(cfg(2, 0), crate::ssh::known_hosts::HostKeyPolicy::AcceptNew, None, tx).unwrap();
         assert_eq!(sup.running_count(), 1);
         sup.stop(2);
         assert_eq!(sup.running_count(), 0);
@@ -343,8 +345,8 @@ mod tests {
     fn stop_all_clears_everything() {
         let (tx, _rx) = mpsc::channel();
         let mut sup = Supervisor::new();
-        sup.spawn(cfg(3, 0), crate::ssh::known_hosts::HostKeyPolicy::AcceptNew, tx.clone()).unwrap();
-        sup.spawn(cfg(4, 0), crate::ssh::known_hosts::HostKeyPolicy::AcceptNew, tx).unwrap();
+        sup.spawn(cfg(3, 0), crate::ssh::known_hosts::HostKeyPolicy::AcceptNew, None, tx.clone()).unwrap();
+        sup.spawn(cfg(4, 0), crate::ssh::known_hosts::HostKeyPolicy::AcceptNew, None, tx).unwrap();
         assert_eq!(sup.running_count(), 2);
         sup.stop_all();
         assert_eq!(sup.running_count(), 0);
@@ -355,8 +357,8 @@ mod tests {
     fn respawn_replaces_the_previous_run() {
         let (tx, _rx) = mpsc::channel();
         let mut sup = Supervisor::new();
-        sup.spawn(cfg(5, 0), crate::ssh::known_hosts::HostKeyPolicy::AcceptNew, tx.clone()).unwrap();
-        sup.spawn(cfg(5, 0), crate::ssh::known_hosts::HostKeyPolicy::AcceptNew, tx).unwrap();
+        sup.spawn(cfg(5, 0), crate::ssh::known_hosts::HostKeyPolicy::AcceptNew, None, tx.clone()).unwrap();
+        sup.spawn(cfg(5, 0), crate::ssh::known_hosts::HostKeyPolicy::AcceptNew, None, tx).unwrap();
         assert_eq!(sup.running_count(), 1, "same id must not accumulate");
     }
 
@@ -458,7 +460,7 @@ mod tests {
         // The process is alive, so a *different* tunnel can still be supervised.
         let (tx2, _rx2) = mpsc::channel();
         let mut sup = Supervisor::new();
-        sup.spawn(cfg(12, 0), crate::ssh::known_hosts::HostKeyPolicy::AcceptNew, tx2)
+        sup.spawn(cfg(12, 0), crate::ssh::known_hosts::HostKeyPolicy::AcceptNew, None, tx2)
             .expect("spawning after a thread panic must still work");
         assert_eq!(sup.running_count(), 1);
         sup.stop(12);

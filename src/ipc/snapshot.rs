@@ -243,6 +243,7 @@ const ALL_FAILURE_KINDS: &[FailureKind] = &[
     FailureKind::HostKeyMismatch,
     FailureKind::RemoteForwardFailed,
     FailureKind::TargetUnreachable,
+    FailureKind::StaleConnection,
     FailureKind::SpawnFailed,
     FailureKind::Exited,
     FailureKind::Unsupported,

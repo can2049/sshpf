@@ -2,7 +2,7 @@
 
 > **这份文档回答**：一条隧道怎么从"用户按了 space"变成"真的通了"、失败后谁决定重试、UI 线程怎么拿到事件、退出时怎么收尾。
 > **不负责**：SSH 协议实现细节（见 [design.md](design.md) 与 `src/ssh/`）、渲染（见 [tui.md](tui.md)）、日志事件全表（见 [logging/events.md](logging/events.md)）。
-> **相关代码路径**：`src/app/runtime.rs`（启停编排）、`src/app/events.rs`（事件泵：事件→状态转移、重试）、`src/tunnel.rs`（监督 + `TunnelEvent`）、`src/ssh/client.rs`（驱动）、`src/main.rs`（事件循环）。
+> **相关代码路径**：`src/app/runtime.rs`（启停编排）、`src/app/events.rs`（事件泵：事件→状态转移、重试）、`src/tunnel.rs`（监督 + `TunnelEvent`）、`src/ssh/client.rs`（驱动）、`src/ssh/client/health.rs`（定时探活）、`src/main.rs`（事件循环）。
 
 ## 线程模型 / Threads
 
@@ -75,6 +75,24 @@ main 线程（同步）                        每条隧道一个后台线程
 
 `tunnel.failed` 与 `tunnel.retry_abandoned` 的区别、以及按 `kind` 统计失败分布，见 [logging.md](logging.md#排查配方--recipes)。
 
+## 健康检查 / Health checks
+
+**为什么需要**：`-L`/`-D` 的本地 listener 无法感知 SSH 会话已死——`accept()` 继续成功返回，端口却转不出去；Windows 休眠唤醒后就是这种半开连接，旧行为永远发现不了，界面一直 `●`。
+
+| 项 | 值 |
+|---|---|
+| 频率 | 每条 `Up` 隧道由**自己的后台线程**每 `defaults.health_check_secs` 探一次；`0` = 关闭 |
+| 探什么 | 向对端发 `keepalive@openssh.com` 全局请求（`want_reply=true`）并等回复 |
+| 超时 | `PING_TIMEOUT = 5s`（`src/ssh/client/health.rs`），不超过最短间隔 |
+| 判失效 | 探活超时 / 发送失败 / 会话已被 russh 关闭（`is_closed()`） |
+| 判活着 | 收到回复；对端回 `REQUEST_FAILURE`（`Err(RequestDenied)`）**也算活着**——字节通了 |
+| 失效后 | 线程以 `StaleConnection` 结束 → 既有 `Exited` → `was_up=true` → 退避重连（受 `auto_restart`） |
+| 日志 | 失效记 `tunnel.health_failed`（WARN，带 `cause`/`detail`/`interval_ms`）；**成功不记 INFO** |
+
+**判据必须留在隧道线程里**：探活的结论是一条"本次运行结束"的错误，`select!` 里哪个分支先返回，driver 就返回哪个——这才是既有 `Exited` 路径。另起一个 task 会让 serve 循环继续活着陪伴一个死会话，正是要修的 bug；而放在 UI 线程就把网络等待带进了 `poll(200ms)` 的同步循环。
+
+→ [design.md](design.md) D36 · `src/ssh/client/health.rs`、`src/ssh/client/driver.rs`
+
 ## 事件泵 / Event pump
 
 每帧的顺序（`src/app/events.rs` 头注释）：① 排空 channel（`MAX_EVENTS_PER_FRAME` 上限）② 回收 stderr EOF 与 exit 竞态的子进程 ③ 分类宽限期已过的延迟退出 ④ 触发到期重试 ⑤ 让临时状态消息过期。②–④ 各自还会产生状态变化，所以放在排空之后，不与排空交错。
@@ -128,6 +146,7 @@ Stopped ──start──▶ Starting ──Ready──▶ Up ──Exited(was_u
 | 启动 | `tunnel.start`、`tunnel.rejected`、`tunnel.spawn`、`tunnel.spawn_failed` |
 | 就绪 | `tunnel.ready`（含 `elapsed_ms`） |
 | 运行 | `tunnel.line`（DEBUG）、`tunnel.state`（DEBUG）、`forward.target_failed`、`socks5.rejected` |
+| 探活 | `tunnel.health_failed`（WARN，失败的探活才记） |
 | 结束 | `tunnel.exit`、`tunnel.failed`、`tunnel.retry_scheduled`、`tunnel.retry`、`tunnel.retry_abandoned` |
 | 停止 | `tunnel.stop`、`tunnel.stop_timeout` |
 | 异常 | `tunnel.thread_panic` |

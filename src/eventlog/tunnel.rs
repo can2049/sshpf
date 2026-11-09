@@ -259,6 +259,30 @@ pub fn forward_target_failed(id: TunnelId, target: &str, error: &str) {
     logging::warn("forward.target_failed", &[("tunnel", &id), ("target", &target), ("msg", &error)]);
 }
 
+/// A scheduled liveness probe found the SSH session dead.
+///
+/// `WARN`, not `ERROR`: the tunnel had been working and the retry chain will
+/// repair it on its own. This is the record that explains a `●` row which was
+/// silently broken — nothing else in the log would show it, because the local
+/// listener never failed.
+///
+/// `cause` is the stable ASCII verdict from `ssh::client::health`; `detail` is
+/// the sentence shown in the panel; `interval_ms` records how often the check
+/// was running, so "why did it take a minute to notice" is answerable.
+pub fn tunnel_health_failed(cfg: &TunnelConfig, cause: &str, detail: &str, interval_ms: u128) {
+    tunnel_health_failed_on(logging::logger(), cfg, cause, detail, interval_ms);
+}
+
+pub fn tunnel_health_failed_on(logger: &Logger, cfg: &TunnelConfig, cause: &str, detail: &str, interval_ms: u128) {
+    tunnel_event_on(
+        logger,
+        Level::Warn,
+        "tunnel.health_failed",
+        cfg,
+        &[("cause", cause.to_string()), ("detail", detail.to_string()), ("interval_ms", interval_ms.to_string())],
+    );
+}
+
 /// A SOCKS5 request was rejected or malformed.
 pub fn socks5_rejected(id: TunnelId, detail: &str) {
     logging::debug("socks5.rejected", &[("tunnel", &id), ("msg", &detail)]);
@@ -385,6 +409,19 @@ mod tests {
         assert!(text.contains("stage=preflight_bind"), "which check refused it: {text}");
         assert!(text.contains("short=本地端口被占用"), "{text}");
         assert!(text.contains("msg=\"127.0.0.1:8080 已被占用 (pid 42)\""), "the detail is quoted: {text}");
+    }
+
+    #[test]
+    fn a_failed_health_check_names_the_tunnel_the_cause_and_the_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = logger(dir.path());
+        tunnel_health_failed_on(&log, &sample(), "ping_timeout", "探活超时", 30_000);
+        let text = text(dir.path());
+        assert!(text.contains(" WARN "), "a healed-by-retry drop is a warning: {text}");
+        assert!(text.contains("event=tunnel.health_failed"), "{text}");
+        assert!(text.contains("tunnel=7 name=cloud-pc"), "identity fields come first: {text}");
+        assert!(text.contains("cause=ping_timeout"), "the ASCII verdict is greppable: {text}");
+        assert!(text.contains("interval_ms=30000"), "how often it was checked: {text}");
     }
 
     #[test]

@@ -5,6 +5,27 @@
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-09
+
+本次是 minor 版本，只有一件事：**定时连通性检测**。修的是「电脑休眠唤醒后 SSH 会话已死、
+界面却一直显示 `● 已连通`、端口其实不通」——旧实现的本地 listener 永远发现不了半开连接。
+无新增依赖；配置格式只多一个带默认值的字段，旧配置照旧载入。
+
+### 新增
+
+- **定时连通性检测：每条 `Up` 隧道自己探活，休眠/断网后的半开连接不再一直显示 `●`。** Windows
+  休眠唤醒后 SSH 会话已死，本地 `-L` 的 `accept()` 仍成功返回，界面一直 `● 已连通`、端口其实
+  不通，旧行为永远发现不了。现在每条隧道由自己的后台线程每隔 `health_check_secs` 发
+  `keepalive@openssh.com` 等回复；**超时（5s）/ 发送失败 / 会话已关闭**都判失效 → 线程以
+  `StaleConnection` 结束 → 既有 `Exited` → `was_up=true` → 退避重连（受 `auto_restart`）。
+  无新增状态机；探活成功**不写 INFO 日志**（否则每 30s 一条噪声）。
+- **新配置项 `defaults.health_check_secs`（默认 `30`，`0` = 关闭）。** 钳制：`0` 保持，`1..=4` 抬到
+  `5`，超过 24h 压到 24h；每次钳制记 `config.defaults_clamped`（`field=health_check_secs`）。
+- **新事件 `tunnel.health_failed`（WARN）**：隧道 6 个身份字段 + `cause`（`ping_timeout` /
+  `ping_error` / `session_closed`）+ `detail` + `interval_ms`。
+- **新失败分类 `FailureKind::StaleConnection`**（`kind=stale_connection`，「连接已失效」/
+  "Connection went stale"），网络类、可重试；表格 LAST ERROR 列显示中文短句。
+
 ## [0.6.0] - 2026-11-09
 
 本次是 minor 版本，只有一件事：为 **client-server 改造**落地协议层。**用户可见行为零变化**

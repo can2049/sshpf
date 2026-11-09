@@ -34,7 +34,7 @@
 | `config.deduped` | WARN | `kept` `dropped` | 载入时把「同一个转发」的多条已保存条目折成一条；`kept` 是留下的条目名，`dropped` 被移除的条数。每组一条 |
 | `config.save_failed` | ERROR | `path` `msg` | 写盘失败：改动只在内存里 |
 | `config.perms_tightened` | WARN / ERROR | `path` `ok` | 配置原先对同组/所有人可读，已收紧到 `0600`（`ok=false` 即收紧失败，记 ERROR） |
-| `config.defaults_clamped` | WARN | `field` `original` `used` | 手写的 `retry_initial_secs` / `retry_max_secs` 越界或倒挂，已钳制到 [1s, 24h] |
+| `config.defaults_clamped` | WARN | `field` `original` `used` | 手写的 `retry_initial_secs` / `retry_max_secs` 越界或倒挂，已钳制到 [1s, 24h]；`health_check_secs` 越界也会记这一条（`0` = 关闭，保持不变） |
 | `state.save_failed` | WARN | `path` `msg` | 运行状态文件写失败 |
 | `log.unavailable` | ERROR | `msg` | 日志打不开（同时进状态栏） |
 | `log.level_invalid` | WARN | `msg` | `SSHPF_LOG_LEVEL` 写错，回退到 `info` |
@@ -68,6 +68,7 @@
 | `host_key_mismatch` | 主机密钥校验失败 | ✗ |
 | `remote_forward_failed` | 远端转发失败 | ✗ |
 | `target_unreachable` | 目标不可达 | ✓ |
+| `stale_connection` | 连接已失效 | ✓ |
 | `spawn_failed` | 无法启动 ssh | ✗ |
 | `exited` | ssh 异常退出 | ✓ |
 | `unsupported` | 该类型暂未支持 | ✗ |
@@ -81,6 +82,7 @@
 | `tunnel.spawn_failed` | ERROR | 隧道字段 + `msg` | 线程都起不来 |
 | `tunnel.ready` | INFO | 隧道字段 + `elapsed_ms` | 转发真正就绪（`bind` 成功 / `tcpip_forward` 被接受） |
 | `tunnel.line` | DEBUG | 隧道字段 + `msg` | 驱动的一条进度行（只在这条隧道活着时有意义） |
+| `tunnel.health_failed` | WARN | 隧道字段 + `cause` `detail` `interval_ms` | 探活判定 SSH 会话已失效，本次运行随即以 `stale_connection` 结束。`cause` 是稳定 ASCII 值：`ping_timeout`（等不到回复）/ `ping_error`（请求发不出去）/ `session_closed`（russh 已关闭会话）；`interval_ms` 是当时的探活间隔。**探活成功不记日志**，所以没有这条事件不代表探活没跑 |
 | `tunnel.exit` | WARN / ERROR / INFO | 隧道字段 + `was_up` `code` `kind` `short` `msg`；干净退出是 `clean=true` | 会话结束；`was_up=true` 是掉线（WARN），否则 ERROR；用户主动停是 INFO + `clean=true` |
 | `tunnel.retry_scheduled` | WARN | 隧道字段 + `attempt` `delay_ms` `kind` `short` | 安排了退避重连 |
 | `tunnel.retry` | INFO | 隧道字段 + `attempt` | 重连到点，开始重试 |
@@ -149,6 +151,8 @@
 | `stage` | ASCII | `tunnel.rejected`、`tunnel.retry_abandoned` |
 | `trigger` | ASCII | `tunnel.start`、`tunnel.stop` |
 | `attempt` / `delay_ms` | int | 重试链 |
+| `cause` | ASCII | `tunnel.health_failed`：`ping_timeout` / `ping_error` / `session_closed`；`crash.log_reentrant` |
+| `interval_ms` | int | `tunnel.health_failed`（当时生效的探活间隔） |
 | `was_up` / `retryable` / `clean` | bool | `tunnel.exit`、`tunnel.failed` |
 | `elapsed_ms` | int | `tunnel.ready`、`ui.slow_frame` |
 | `path` / `msg` | string | 配置类、错误明细 |

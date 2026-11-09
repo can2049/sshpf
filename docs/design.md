@@ -265,3 +265,9 @@ D32 的守卫拦得住**新建**的重复，拦不住两种已经发生的重复
 痕迹，否则「没反应」无法与「没按」区分。
 
 → [keymap.md](keymap.md) · `src/keys.rs::is_save_key`、`src/keys/dropdown.rs`、`src/keys/import.rs`、`src/eventlog/user.rs`
+
+## D36 连通性靠主动探活，不靠 accept 循环
+
+`-L`/`-D` 的就绪判据是 `bind` 成功，而**已建立的 SSH 会话死亡对本地 listener 完全不可见**：内核照样让 `accept()` 返回，每条连接随后都失败，状态列永远是 `●`。Windows 电脑休眠唤醒后就是这种半开连接——旧实现没有任何一条路径会发现它，用户只能看到"显示已连通、端口不通"。修法是主动问一个传输层无法被动回答的问题：每 `health_check_secs` 发一个 `keepalive@openssh.com` 全局请求并等回复，超时/发送失败/会话已关闭即判失效。探活放在**隧道线程**里而不是另起 task——结论是一条"本次运行结束"的错误，`select!` 里先返回哪个分支 driver 就返回哪个，于是它顺着既有 `Exited` → `was_up=true` → 退避重连走完全程；另起 task 会让 serve 循环继续活着陪伴死会话，那正是要修的 bug。也**不新增状态机**：`StaleConnection` 只是一个普通的网络类失败分类，`auto_restart` 与 `retry_*` 对它的作用与其它掉线完全一致。
+
+→ [runtime.md](runtime.md#健康检查--health-checks) · `src/ssh/client/health.rs`、`src/ssh/client/driver.rs`、`src/model/failure.rs`

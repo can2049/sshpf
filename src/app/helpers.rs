@@ -54,6 +54,13 @@ pub fn sanitize_config(cfg: &mut ConfigFile) {
         eventlog::config_defaults_clamped("retry_max_secs", defaults.retry_max_secs, raised);
         defaults.retry_max_secs = raised;
     }
+    // `0` stays `0`: it is the documented "turn the check off" value, and
+    // clamping it up would re-enable a feature the user disabled.
+    let health = crate::config::normalize_health_check_secs(defaults.health_check_secs);
+    if health != defaults.health_check_secs {
+        eventlog::config_defaults_clamped("health_check_secs", defaults.health_check_secs, health);
+        defaults.health_check_secs = health;
+    }
 }
 
 /// Add `delay` to `now` without the panic `Instant + Duration` raises on
@@ -80,4 +87,45 @@ pub fn backoff(attempt: u32, initial: u64, max_secs: u64) -> Duration {
     let shift = attempt.saturating_sub(1).min(20);
     let secs = initial.saturating_mul(1u64 << shift).min(cap);
     Duration::from_secs(secs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{MAX_HEALTH_CHECK_SECS, MIN_HEALTH_CHECK_SECS};
+
+    fn cfg_with_health(secs: u64) -> ConfigFile {
+        let mut cfg = ConfigFile::default();
+        cfg.defaults.health_check_secs = secs;
+        cfg
+    }
+
+    #[test]
+    fn a_health_check_interval_is_repaired_only_when_it_is_unusable() {
+        // Hand-edited values arrive as input, not invariants: a `1` would probe
+        // every second, a `u64::MAX` would never probe, and both would look
+        // like "the feature is broken" instead of "the config is odd".
+        let mut too_fast = cfg_with_health(1);
+        sanitize_config(&mut too_fast);
+        assert_eq!(too_fast.defaults.health_check_secs, MIN_HEALTH_CHECK_SECS);
+
+        let mut too_slow = cfg_with_health(u64::MAX);
+        sanitize_config(&mut too_slow);
+        assert_eq!(too_slow.defaults.health_check_secs, MAX_HEALTH_CHECK_SECS);
+
+        // A usable value is left exactly as written.
+        let mut fine = cfg_with_health(45);
+        sanitize_config(&mut fine);
+        assert_eq!(fine.defaults.health_check_secs, 45);
+    }
+
+    #[test]
+    fn turning_the_health_check_off_survives_the_repair() {
+        // `0` is documented as "off". Reparing it up to the minimum would
+        // silently re-enable a feature the user disabled — a config that does
+        // not mean what it says is worse than no config.
+        let mut off = cfg_with_health(0);
+        sanitize_config(&mut off);
+        assert_eq!(off.defaults.health_check_secs, 0, "0 means off and must stay off");
+    }
 }

@@ -133,7 +133,7 @@
 
 | 文件 | 放什么 |
 |---|---|
-| `src/ipc.rs` | 模块地图 + re-export（client-server 协议的唯一定义处） |
+| `src/ipc/mod.rs` | 模块地图 + re-export（client-server 协议的唯一定义处） |
 | `src/ipc/frame.rs` | `u32` 大端长度前缀、`MAX_FRAME`（256 KiB）、读写一帧 |
 | `src/ipc/msg.rs` | `ClientMsg`/`ServerMsg`、`Op` 命令枚举、`WireError`、`PROTO_VERSION` |
 | `src/ipc/snapshot.rs` | `Snapshot`/`WireTunnel`/`WireStatus`；`Instant` → 毫秒时间戳 |
@@ -151,7 +151,8 @@
 | `src/ssh/client/handler.rs` | `SharedVerdict`、`Handler`（`check_server_key`、`forwarded-tcpip`） |
 | `src/ssh/client/auth.rs` | `Auth`、`load_auth`、`connect_agent`、`expand_path`、`authenticate` |
 | `src/ssh/client/connect.rs` | `timeout_connect`、`session()`、`connect()`（含 `ProxyJump` 链） |
-| `src/ssh/client/driver.rs` | `serve_local` / `serve_remote` / `serve_dynamic` |
+| `src/ssh/client/driver.rs` | `serve_local` / `serve_remote` / `serve_dynamic`；三个循环各自 race 探活 |
+| `src/ssh/client/health.rs` | 定时探活：`PING_TIMEOUT`（5s）、`StaleCause`（失效判据）、`watch`、失效 → `StaleConnection` |
 | `src/ssh/probe.rs` | 对端端口探测：`list_command`、`interpret`、`scan_listen_ports`、`ScanOutcome` |
 | `src/ssh/client/probe.rs` | 走隧道同一条 SSH 路径执行命令并取回 stdout |
 
@@ -218,6 +219,7 @@
 | 新的界面面板（浮层） | `src/app.rs` 的 `Overlay` 变体 + `src/ui/<name>.rs` + `src/keys/<name>.rs` | `HitTarget` 变体 + help section + keymap |
 | 新的导入列 | `src/model/import/row.rs` 的 `ImportColumn` | `src/ui/import/row.rs`、`src/keys/import.rs`、`src/model/import/filter.rs` |
 | 新的日志事件 | `src/eventlog/<族>.rs` 一个函数 | `docs/logging/events.md` 一行 |
+| 新的连通性判定 / 探活 | `src/ssh/client/health.rs`（判据与 `PING_TIMEOUT`） | `src/ssh/client/driver.rs` 的循环 race、`docs/runtime.md` |
 | 新的配置项 | `src/config.rs` `Defaults` | README 配置段、`config.defaults_clamped` 若需钳制 |
 | 新的字符串工具 | `src/text.rs`（唯一实现） | 单测放同文件尾部 |
 | 新的平台差异 | `src/sys/mod.rs` + `unix.rs`/`windows.rs` | Windows CI 必须仍能编译 |

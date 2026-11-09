@@ -29,6 +29,13 @@ pub enum FailureKind {
     RemoteForwardFailed,
     /// Target host:port behind the tunnel refused/reset on first use.
     TargetUnreachable,
+    /// The scheduled liveness probe found the SSH session gone: a keepalive
+    /// went unanswered, could not be sent, or the session was already closed.
+    ///
+    /// Distinct from `Exited` because the *socket* may look fine locally: a
+    /// resumed laptop's half-open connection still lets a local `-L` listener
+    /// accept, so only the probe can see this state.
+    StaleConnection,
     /// Could not spawn the `ssh` binary at all.
     SpawnFailed,
     /// ssh exited without a more specific classification.
@@ -52,6 +59,7 @@ impl FailureKind {
             FailureKind::HostKeyMismatch => "主机密钥校验失败",
             FailureKind::RemoteForwardFailed => "远端转发失败",
             FailureKind::TargetUnreachable => "目标不可达",
+            FailureKind::StaleConnection => "连接已失效",
             FailureKind::SpawnFailed => "无法启动 ssh",
             FailureKind::Exited => "ssh 异常退出",
             FailureKind::Unsupported => "该类型暂未支持",
@@ -71,6 +79,7 @@ impl FailureKind {
             FailureKind::HostKeyMismatch => "Host key verification failed",
             FailureKind::RemoteForwardFailed => "Remote forward rejected",
             FailureKind::TargetUnreachable => "Target unreachable",
+            FailureKind::StaleConnection => "Connection went stale",
             FailureKind::SpawnFailed => "Cannot start ssh",
             FailureKind::Exited => "ssh exited unexpectedly",
             FailureKind::Unsupported => "Not supported yet",
@@ -91,6 +100,7 @@ impl FailureKind {
             FailureKind::HostKeyMismatch => "host_key_mismatch",
             FailureKind::RemoteForwardFailed => "remote_forward_failed",
             FailureKind::TargetUnreachable => "target_unreachable",
+            FailureKind::StaleConnection => "stale_connection",
             FailureKind::SpawnFailed => "spawn_failed",
             FailureKind::Exited => "exited",
             FailureKind::Unsupported => "unsupported",
@@ -107,6 +117,7 @@ impl FailureKind {
                 | FailureKind::Timeout
                 | FailureKind::DnsFailure
                 | FailureKind::TargetUnreachable
+                | FailureKind::StaleConnection
                 | FailureKind::Exited
                 | FailureKind::Unknown
         )
@@ -150,6 +161,7 @@ mod tests {
             FailureKind::HostKeyMismatch,
             FailureKind::RemoteForwardFailed,
             FailureKind::TargetUnreachable,
+            FailureKind::StaleConnection,
             FailureKind::SpawnFailed,
             FailureKind::Exited,
             FailureKind::Unsupported,
@@ -169,6 +181,7 @@ mod tests {
             FailureKind::Timeout,
             FailureKind::DnsFailure,
             FailureKind::TargetUnreachable,
+            FailureKind::StaleConnection,
             FailureKind::Exited,
             FailureKind::Unknown,
         ] {

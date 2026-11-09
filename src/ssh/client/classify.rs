@@ -23,6 +23,14 @@ pub fn classify(err: &anyhow::Error) -> FailureInfo {
     let lower = text.to_lowercase();
     let resolution = is_resolution_error(err, &lower);
 
+    if let Some(stale) = find_stale_session(err) {
+        let detail = stale.to_string();
+        return FailureInfo {
+            kind: FailureKind::StaleConnection,
+            short: short_reason(FailureKind::StaleConnection, &detail),
+            detail,
+        };
+    }
     if let Some(rejected) = find_host_key_rejection(err) {
         let detail = rejected.to_string();
         return FailureInfo {
@@ -127,6 +135,15 @@ impl std::fmt::Display for HostKeyRejected {
 
 impl std::error::Error for HostKeyRejected {}
 
+/// Find a [`StaleSession`](super::health::StaleSession) anywhere in the chain.
+///
+/// Checked before the text fallback because its own wording ("探活超时…")
+/// would otherwise classify as a generic `Timeout`, which sends a reader looking
+/// at the last connection attempt instead of at the run that had been healthy.
+fn find_stale_session(err: &anyhow::Error) -> Option<&super::health::StaleSession> {
+    err.chain().find_map(|c| c.downcast_ref::<super::health::StaleSession>())
+}
+
 /// Find a [`HostKeyRejected`] anywhere in the error chain.
 fn find_host_key_rejection(err: &anyhow::Error) -> Option<&HostKeyRejected> {
     err.chain().find_map(|c| c.downcast_ref::<HostKeyRejected>())
@@ -154,6 +171,7 @@ fn short_reason(kind: FailureKind, text: &str) -> String {
         FailureKind::HostKeyMismatch => "主机密钥不匹配",
         FailureKind::RemoteForwardFailed => "远程转发失败",
         FailureKind::TargetUnreachable => "目标不可达",
+        FailureKind::StaleConnection => "连接已失效",
         FailureKind::SpawnFailed => "连接失败",
         FailureKind::Exited => "连接已断开",
         FailureKind::Unsupported => "暂不支持",

@@ -11,7 +11,7 @@
 | **单元** | 各模块尾部 `#[cfg(test)] mod tests` | 570+ | 无（不 spawn、不 I/O） | 状态机、判定、边界、渲染纯函数 |
 | **覆盖**（源码即断言） | `tests/help_coverage.rs`、`tests/safety_guards.rs` | 9 + 8 | 只读源码 | 帮助不得遗漏/不得撒谎；panic/`unsafe` 政策、模块文档、单文件 ≤400 行、单函数 ≤60 行、测试模块不得被平台 cfg 整段吞掉 |
 | **加固**（真二进制） | `tests/logging.rs`、`tests/panic_hardening.rs` | 21 + 13 | 真进程，必须 `--test-threads=1` | 日志全链路、崩溃、恶意输入不 panic |
-| **端到端** | `tests/e2e.rs` | 12 | 真 `sshd`，默认 `#[ignore]` | 三种转发真的通、主机密钥真的拒/真的可忽略、端口真的释放 |
+| **端到端** | `tests/e2e.rs` | 19 | 真 `sshd`，默认 `#[ignore]` | 三种转发真的通、主机密钥真的拒/真的可忽略、端口真的释放、探活真的发现失效会话 |
 | **策略矩阵** | `tests/host_key_policy.rs` | 10 | 无（真实 `known_hosts` / `~/.ssh/config` 夹具，不 spawn） | 主机密钥判定的完整矩阵：默认拒变更、`ignore` 接受但**不写盘**、`@revoked` 四策略恒拒；逐跳策略、全局开关优先 |
 
 单元测试**跟着被拆模块走**：`src/model/import/table.rs` 的测试就放该文件末尾，不放回 `src/model.rs`。跨模块共用的夹具放 `#[cfg(test)]` 的夹具文件（如 `src/model/fixtures.rs`、`src/ui/test_support.rs`）——不要把一个夹具复制三份。
