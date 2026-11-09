@@ -155,6 +155,21 @@ SSH 路径**去问对端正在监听哪些端口：
 的是服务端**已被占用**的端口，选一个必然在建立转发时撞车，所以只作参考（显示 `[–]`）。
 扫描在后台线程跑，列表随时可用；换主机或重扫时旧结果会被丢弃，不会套到新列表上。
 
+### 多个窗口共享同一份状态 / Several windows, one state
+
+在 Linux 上，**一份配置只有一个后台服务进程**（`sshpf --server`，由第一个窗口自动拉起），
+所有 `sshpf` 窗口都是它的客户端：
+
+- 开第二个窗口**不会再报「端口已被占用」**——它连上已有的服务进程，显示的就是第一个窗口的状态。
+- 任何一个窗口里的操作（启停、新建、编辑、删除、批量）都会广播给所有窗口，几秒内一致。
+- 标题栏显示 `客户端 2/client 2`；`--server` 前台运行时显示 `服务端/server`。
+- **关掉最后一个窗口 = 停掉所有转发**，所以只有它会在退出前提示「这是最后一个客户端」。
+  想让它常驻用 `--keep-server`。
+- 只有 `--check` / `--list-hosts` 不连服务进程（它们是打印后退出，不该有副作用）。
+
+`sshpf --server` 可直接前台跑（调试或交给 systemd）；`sshpf --keep-server` 则是「最后一个
+窗口退出后服务进程仍保留」。Windows 暂无 socket 传输，仍是每进程独立的旧行为。
+
 ### 从 `~/.ssh/config` 导入转发 / Import
 
 在 `SSH 主机` 字段上按 `space` 或 `i` 展开该主机已声明的 `LocalForward` / `RemoteForward` / `DynamicForward`。**默认全部勾选**，取消不要的再 `ctrl+s`；一条勾选行创建一条隧道。
@@ -255,6 +270,7 @@ note = ""
 | `SSHPF_CONFIG` | 配置文件路径（`state.toml` 与它同目录） |
 | `SSHPF_LOG_DIR` | 日志目录（默认 `~/.local/state/sshpf/logs`） |
 | `SSHPF_LOG_LEVEL` | `off\|error\|warn\|info\|debug`，默认 `info`；`off` 仍写崩溃记录 |
+| `SSHPF_SOCKET_DIR` | client-server 的 socket/lock 目录（默认 `$XDG_RUNTIME_DIR/sshpf`）；测试用它隔离 |
 | `SSHPF_SSH_CONFIG` | 只解析这个文件代替 `~/.ssh/config` |
 | `SSHPF_KNOWN_HOSTS` | 使用这个 known_hosts 文件 |
 | `NO_COLOR` | 关闭全部颜色（状态仍由符号和文字表达） |
@@ -271,7 +287,8 @@ tail -f ~/.local/state/sshpf/logs/sshpf.log   # 实时看结构化日志
 |---|---|
 | 主机密钥校验失败 | 见下方[「ssh 能连但 sshpf 报 host key verification failed」](#ssh-能连但-sshpf-报-host-key-verification-failed) |
 | 认证失败 | 先手动 `ssh <主机>` 确认能免密登录，或 `ssh-add` 加载密钥 |
-| 端口被占用 | 详情页会显示占用进程的 `pid/进程名` |
+| 端口被占用 | 详情页会显示占用进程的 `pid/进程名`。**如果占用者是 `sshpf` 自己**，说明有旧版本的单进程实例还在跑：退出它即可（新版本一份配置只有一个服务进程） |
+| 第二个窗口连不上 / 状态不一致 | 看日志里的 `client.attach_failed`、`server.election_lost`、`client.disconnected`；`SSHPF_SOCKET_DIR` 不同会让两个窗口连到不同的服务进程 |
 | 某条一直 `◌ 重试` | 网络类失败在退避；`grep 'event=tunnel.retry_scheduled'` 看排了几次，`tunnel.retry_abandoned` 表示已放弃 |
 | 显示 `● 已连通` 但端口不通 / 电脑休眠唤醒后不工作 | SSH 半开连接：先 `grep 'event=tunnel.health_failed'` 看 `cause`（`ping_timeout`/`ping_error`/`session_closed`），确认探活是否开着（`health_check_secs=0` 即人为关闭）；探活成功不写日志，所以**没有这条事件不等于探活没跑** |
 | 界面某块不见了 | `grep 'event=ui.render_degraded'`——渲染层主动跳过的块会留一条记录 |
@@ -352,6 +369,8 @@ cargo fmt --check
 ## 已知限制（v1）
 
 - **端口占用反查进程**仅 Linux 可用（依赖 `/proc`）。
+- **多窗口共享状态仅在 Linux/macOS（Unix socket）**：Windows 没有等价传输，仍是每进程独立的单进程模式。
+- 一份配置一个服务进程；用 `-c` 指向不同配置文件就是互相独立的两套状态（socket 路径由配置路径派生）。
 - 隧道既是 tokio task，杀进程即关闭 socket，会话随之结束——不需要孤儿回收；macOS 走 Unix 分支。
 - 只支持公钥 / ssh-agent 认证，TUI 内不接管密码输入。
 - 不统计流量（需按 channel 累计字节，留待后续）。

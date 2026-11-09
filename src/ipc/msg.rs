@@ -41,6 +41,18 @@ pub enum ClientMsg {
         /// Which config the client believes it is attaching to, so a hash
         /// collision between two configurations is detected rather than served.
         config_path: String,
+        /// The host-key policy this client was started with
+        /// (`--ignore-host-key-changes`), as a stable token.
+        ///
+        /// Optional and additive: an older client omits it and the server keeps
+        /// its own policy. It exists so a client whose flag cannot be honoured
+        /// can be *told* that, instead of silently getting the server's stricter
+        /// or looser behaviour. It cannot change the policy of a running server —
+        /// tunnels are dialled with one policy per server, and letting one client
+        /// loosen trust for everyone else's connections would be a security
+        /// defect, not a feature.
+        #[serde(default)]
+        host_key_policy: Option<String>,
     },
     /// A state-changing request.
     #[serde(rename = "command")]
@@ -219,7 +231,16 @@ mod tests {
     #[test]
     fn every_client_message_round_trips() {
         let messages = [
-            ClientMsg::Hello { proto_version: PROTO_VERSION, config_path: "/tmp/config.toml".into() },
+            ClientMsg::Hello {
+                proto_version: PROTO_VERSION,
+                config_path: "/tmp/config.toml".into(),
+                host_key_policy: None,
+            },
+            ClientMsg::Hello {
+                proto_version: PROTO_VERSION,
+                config_path: "/tmp/config.toml".into(),
+                host_key_policy: Some("ignore".into()),
+            },
             ClientMsg::Bye { last_exit: true },
             ClientMsg::Bye { last_exit: false },
             ClientMsg::Command { req_id: 1, expect_rev: Some(42), op: Op::Start { tunnel_id: 7 } },

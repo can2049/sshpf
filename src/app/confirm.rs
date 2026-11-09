@@ -145,9 +145,19 @@ impl App {
                 )
             }
             ConfirmAction::Quit => {
-                let running = self.supervisor.running_count();
+                // Counted from the rendered table, not from the supervisor: a
+                // client has no supervisor, and the snapshot's statuses are what
+                // the user is actually looking at.
+                let running = counts.up + counts.starting + counts.retrying;
                 if running == 0 {
                     help::bi("确认退出 sshpf？", "Quit sshpf?")
+                } else if self.is_last_client() {
+                    // The dangerous asymmetry: closing this window stops forwards
+                    // the user may have started from a window that is already gone.
+                    help::bi(
+                        &format!("这是最后一个客户端：退出后所有端口转发都会停止（{running} 条运行中）。确定退出？"),
+                        &format!("Last client: quitting stops every port forward ({running} running). Quit anyway?"),
+                    )
                 } else {
                     help::bi(
                         &format!("还有 {running} 条转发在运行，退出将全部停止。"),
@@ -215,9 +225,9 @@ impl App {
             }
             ConfirmAction::StopAll => self.stop_all(),
             ConfirmAction::Restart(id) => {
-                self.supervisor.stop(id);
-                self.forget_runtime_state(id);
-                self.start_tunnel(id);
+                // One helper for both modes: the authority bounces its own
+                // supervisor, a mirror sends `Restart` and lets the server do it.
+                self.restart_tunnel(id, "manual");
             }
             ConfirmAction::StartAll => self.start_all(),
             ConfirmAction::ApplyEdit(id) => self.commit_form_edit(id),
