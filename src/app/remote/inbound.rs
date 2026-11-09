@@ -42,9 +42,8 @@ impl App {
                 }
             }
         }
-        match latest {
-            Some(msg) => self.handle_server_msg(msg),
-            None => {}
+        if let Some(msg) = latest {
+            self.handle_server_msg(msg);
         }
     }
 

@@ -122,6 +122,9 @@ impl Sandbox {
                 let hello = ClientMsg::Hello {
                     proto_version: ipc::PROTO_VERSION,
                     config_path: ipc::endpoint_for(&self.config()).config_path.display().to_string(),
+                    // This test speaks the protocol directly, so it declares the
+                    // policy it would pass on a real command line.
+                    host_key_policy: Some("ignore".into()),
                 };
                 if ipc::write_message(&mut stream, &hello).is_ok()
                     && let Ok(Some(ServerMsg::Welcome { .. })) = ipc::read_server_msg(&mut stream)
@@ -199,6 +202,7 @@ fn a_second_client_attaches_to_the_same_server() {
     let hello = |sandbox: &Sandbox| ClientMsg::Hello {
         proto_version: ipc::PROTO_VERSION,
         config_path: ipc::endpoint_for(&sandbox.config()).config_path.display().to_string(),
+        host_key_policy: None,
     };
     let mut b = sandbox.try_connect().expect("the server must still be listening");
     b.set_read_timeout(Some(Duration::from_secs(5))).ok();
@@ -237,6 +241,7 @@ fn a_change_made_by_one_client_is_seen_by_the_other() {
         &ClientMsg::Hello {
             proto_version: ipc::PROTO_VERSION,
             config_path: ipc::endpoint_for(&sandbox.config()).config_path.display().to_string(),
+            host_key_policy: None,
         },
     )
     .expect("hello must be writable");
