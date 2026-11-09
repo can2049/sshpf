@@ -7,16 +7,16 @@
 
 ### 修复
 
-- **手填的「新建转发」不再被自动展开的导入面板吞掉**（未被动过的面板只是默认提议，完整的手填
-  表单才是明确指令）；**新增转发也不再重复堆积**，判定比意图不比端口，见 [docs/dedup.md](docs/dedup.md)。
+- **清空导入面板勾选后，手填的转发不再被「没有勾选任何转发」挡住**：勾选数为 0 的面板没有可执行
+  内容，让位给完整的手填表单（手填表单也不完整时才仍报该错）→ [import-save.md](docs/import-save.md#提交归属默认提议-vs-明确指令)
+- **手填的「新建转发」不再被自动展开的导入面板吞掉**；**新增转发也不再重复堆积**（判定比意图不比
+  端口，见 [docs/dedup.md](docs/dedup.md)）。
 
 ### 变更
 
-- **给 AI agent 的协作约束：一条改动一个 worktree。** 文档新增「一特性一 worktree」
-  一节（[`AGENTS.md`](AGENTS.md) + [`docs/agents.md`](docs/agents.md#一特性一-worktree--one-worktree-per-change)）：
-  开发新特性、修复问题一律在 `.agents/worktrees/<分支名>` 的独立 worktree + 独立分支里做，
-  不在共享 checkout 里改；**PR 合并后立即删除该 worktree 与本地/远端分支**，不留僵尸分支。
-  纯文档约定变更，无代码、无行为变化。
+- **AI agent 协作约束：一条改动一个 worktree**（[AGENTS.md](AGENTS.md) +
+  [agents.md](docs/agents.md#一特性一-worktree--one-worktree-per-change)）：改动一律在独立 worktree
+  + 独立分支里做，**合并后立即删除 worktree 与本地/远端分支**。
 - 新增事件 `action.duplicate_skipped`；`docs/import-forwards.md` 按职责拆为 import-pane /
   import-save / port-scan 三篇，`design.md` 加 D32/D33。
 
