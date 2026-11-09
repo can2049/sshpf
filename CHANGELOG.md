@@ -347,7 +347,8 @@ DNS 失败被错报为「未知错误」的分类。无新增依赖、无配置�
 - 不统计流量；同一主机多条转发各自建连，未做连接复用。
 - macOS 走 Unix 分支，未实测。
 
-[Unreleased]: https://github.com/can2049/sshpf/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/can2049/sshpf/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/can2049/sshpf/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/can2049/sshpf/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/can2049/sshpf/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/can2049/sshpf/compare/v0.2.1...v0.3.0
