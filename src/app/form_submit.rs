@@ -66,7 +66,10 @@ impl App {
     /// docs for the full rule; the short version is "a touched pane with rows to
     /// create, or an incomplete form ⇒ batch, else the typed one".
     pub fn submit_form(&mut self) {
+        let intent = self.save_intent_snapshot();
+
         if self.import_pane_wins_submit() {
+            intent.record("import");
             self.commit_form_create_from_import();
             return;
         }
@@ -81,6 +84,7 @@ impl App {
         // every box *unticked*, so an untouched list can never silently outrank a
         // typed forward. It has no "default offer" to protect against.
         if self.port_batch_intent() {
+            intent.record("port-batch");
             let configs = self.validated_port_batch();
             match configs {
                 Some(configs) if !configs.is_empty() => self.commit_port_batch(configs),
@@ -99,12 +103,14 @@ impl App {
         // (and therefore the count) exists: the create below closes the overlay.
         let offered = self.untouched_import_offer();
         let Some(cfg) = self.validated_form_config() else {
+            intent.record("refused");
             return;
         };
         match cfg.clone() {
             // Creating a tunnel is additive and easily undone by deleting it,
             // so it saves straight away and connects immediately.
             _ if matches!(self.form.as_ref().map(|f| f.mode), Some(FormMode::Create)) => {
+                intent.record("typed");
                 self.commit_form_create(cfg);
                 if let Some(n) = offered {
                     self.note_import_offer_not_taken(n);
@@ -112,10 +118,27 @@ impl App {
             }
             // Editing rewrites persisted config and bounces a live process.
             _ => {
+                intent.record("edit");
                 let id = cfg.id;
                 self.pending_form = Some(cfg);
                 self.ask_confirm(ConfirmAction::ApplyEdit(id));
             }
+        }
+    }
+
+    /// Snapshot of what the two interfaces were offering when a save key arrived.
+    ///
+    /// Captured once at entry to [`Self::submit_form`], because the branches below
+    /// mutate the form (a create closes the overlay), so reading the pane's state
+    /// after the fact would describe a state the user never saw.
+    fn save_intent_snapshot(&self) -> SaveIntent {
+        let form = self.form.as_ref();
+        SaveIntent {
+            pane_open: form.is_some_and(|f| f.import_open && !f.import.is_empty()),
+            rows: form.map(|f| f.import.len()).unwrap_or(0),
+            checked: form.map(|f| f.import.checked_count()).unwrap_or(0),
+            touched: form.is_some_and(|f| f.import.touched),
+            complete: form.is_some_and(|f| f.is_complete()),
         }
     }
 
@@ -336,6 +359,27 @@ impl App {
         }
     }
 }
+/// What a save key found on screen, frozen at the moment it was pressed.
+///
+/// The pair of records this produces (`form.save_attempted` here,
+/// `form.save_key_swallowed` at the dispatch layer) is what makes a save that
+/// produced nothing diagnosable: the tunnel count alone cannot tell "the key
+/// never arrived" from "it arrived and was refused".
+struct SaveIntent {
+    pane_open: bool,
+    rows: usize,
+    checked: usize,
+    touched: bool,
+    complete: bool,
+}
+
+impl SaveIntent {
+    /// Write the record for the branch that is about to run.
+    fn record(&self, route: &str) {
+        eventlog::save_attempted(route, self.pane_open, self.rows, self.checked, self.touched, self.complete);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::app::App;

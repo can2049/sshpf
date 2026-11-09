@@ -24,6 +24,13 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 /// rest still behave exactly as they do in the plain form — the pane is an
 /// addition, not a modal that swallows the form.
 pub(super) fn handle_import_key(app: &mut App, key: KeyEvent) -> bool {
+    // A save key that reaches the filter catch-all below becomes the letter `s`
+    // in whichever column is focused, so the save silently never happens — no
+    // tunnel, no error, no log line. Record which focus took it: that single line
+    // is what turns "ctrl+s did nothing" from a mystery into a diagnosis.
+    if crate::keys::is_save_key(key) {
+        crate::eventlog::save_key_swallowed("import_filter");
+    }
     // `f` outranks filter typing, so it means the same thing whether or not a
     // filter is active: advance to the next column. Handled before the delegation
     // below for exactly that reason — otherwise the second `f` would be typed
@@ -442,6 +449,18 @@ mod tests {
         assert_eq!(app.tunnels[0].cfg.name, "cloud_pc-3081");
         assert_eq!(app.tunnels[0].cfg.remote_port, 3081);
         assert!(matches!(app.overlay, Overlay::None), "the form closes on success");
+    }
+
+    #[test]
+    fn a_save_key_that_a_column_filter_would_eat_is_recorded() {
+        // The diagnostic half (this change): `ctrl+s` is a `Char('s')` whose char is
+        // not a control character, so the filter catch-all used to type it as `s`.
+        // The guard now records `event=form.save_key_swallowed focus=import_filter`,
+        // so an otherwise-empty log file explains itself. Making the save *succeed*
+        // in this state is the follow-up routing change.
+        assert!(crate::keys::is_save_key(ctrl('s')), "precondition: ctrl+s is the save key");
+        assert!(!crate::keys::is_save_key(ctrl('a')), "and an ordinary ctrl chord is not");
+        assert!(!crate::keys::is_save_key(ch('s')), "nor is a plain `s` typed into a filter");
     }
 
     #[test]

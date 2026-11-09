@@ -71,6 +71,26 @@ mod testkit;
 /// the two cannot disagree about how far the cursor can move before it scrolls.
 pub const IMPORT_ROWS_VISIBLE: usize = 8;
 
+/// Whether a key press is one of the two **save** bindings (`ctrl+s` / `f10`).
+///
+/// Shared by every owner that can see a form keystroke before [`handle_form_key`]
+/// does. The host dropdown and the import pane's column filters both end their
+/// dispatch with a `KeyCode::Char(c) if !c.is_control()` catch-all — and
+/// `ctrl+s` is a `Char('s')` whose `char` is not a control character, so that arm
+/// treats the save key as text and swallows it. A save key that never arrives is
+/// invisible: no tunnel, no error, no log line.
+///
+/// Keeping the predicate in one place means the owners cannot disagree about
+/// which keys count, and the diagnostic in each of them uses the same answer.
+///
+/// Deliberately **not** listed in `HANDLERS` in `tests/help_coverage.rs`: this is
+/// not a dispatcher (it binds no key of its own), and listing it would attribute
+/// these literals to a section that does not own them.
+pub(crate) fn is_save_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::F(10))
+        || (key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL))
+}
+
 /// Route one key press to the handler for the active overlay.
 ///
 /// This is the single entry point `main`'s event loop calls, which is what

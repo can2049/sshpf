@@ -13,6 +13,9 @@ use crossterm::event::{KeyCode, KeyEvent};
 
 /// Keys owned by the expanded host dropdown. Returns true when handled.
 pub(super) fn handle_dropdown_key(app: &mut App, key: KeyEvent) -> bool {
+    if crate::keys::is_save_key(key) {
+        crate::eventlog::save_key_swallowed("host_dropdown");
+    }
     match key.code {
         KeyCode::Down | KeyCode::Char('j') => {
             app.picker_move(1);
@@ -95,6 +98,29 @@ mod tests {
         handle_key(&mut app, key(KeyCode::Enter));
         assert!(!app.host_picker_open(), "accepting collapses the list");
         assert_eq!(app.form.as_ref().unwrap().ssh_host.value(), "testhost");
+    }
+
+    #[test]
+    fn a_save_key_taken_by_the_dropdown_still_becomes_a_filter_query() {
+        // The other half of the same defect: with the host dropdown open,
+        // `ctrl+s` reaches `Char(c) if !c.is_control()` and is typed into the
+        // filter box as `s`, so the save never happens and nothing is created.
+        //
+        // This change instruments it (`event=form.save_key_swallowed
+        // focus=host_dropdown`); the follow-up fix makes the save win instead.
+        let (_d, mut app) = form_app();
+        app.form.as_mut().unwrap().field = FormField::SshHost;
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert!(app.host_picker_open(), "precondition: the dropdown is open");
+
+        handle_key(&mut app, ctrl('s'));
+
+        assert_eq!(
+            app.picker.as_ref().map(|p| p.query.clone()),
+            Some("s".to_string()),
+            "today the save key is appended to the dropdown query — this is the bug being instrumented"
+        );
+        assert!(app.tunnels.is_empty(), "and therefore no tunnel is created");
     }
 
     #[test]
