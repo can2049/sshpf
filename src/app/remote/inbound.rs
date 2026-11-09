@@ -20,8 +20,8 @@ use crate::app::App;
 use crate::ipc::{PROTO_VERSION, ServerMsg, Snapshot, WireError};
 use crate::model::{StatusMsg, TunnelView};
 
-use super::{ConnState, help_bi};
 use super::wire_to_live::live_view;
+use super::{ConnState, help_bi};
 
 impl App {
     // -- snapshot → screen -------------------------------------------------
@@ -71,10 +71,8 @@ impl App {
                         // Both sides are the same binary; a mismatch means an old
                         // instance is still running. Say so instead of rendering a
                         // table that may be silently wrong.
-                        let reason = crate::ipc::check_version(proto_version)
-                            .err()
-                            .map(|e| e.error.zh)
-                            .unwrap_or_default();
+                        let reason =
+                            crate::ipc::check_version(proto_version).err().map(|e| e.error.zh).unwrap_or_default();
                         remote.conn = ConnState::Lost(reason.clone());
                         self.status = Some(StatusMsg::error(reason));
                         return;

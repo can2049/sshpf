@@ -46,7 +46,7 @@ pub mod msg;
 pub mod snapshot;
 
 pub use codec::{ProtocolError, check_config, check_version, read_client_msg, read_server_msg, write_message};
-pub use endpoint::{Endpoint, endpoint_for};
+pub use endpoint::{Endpoint, endpoint_for, endpoint_in};
 pub use frame::{MAX_FRAME, read_frame, write_frame};
 pub use msg::{ClientMsg, Op, PROTO_VERSION, ServerMsg, WireError, WirePort};
 pub use snapshot::{

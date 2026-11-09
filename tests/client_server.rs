@@ -106,30 +106,42 @@ impl Sandbox {
         ChildGuard { child, _sandbox: () }
     }
 
+    /// The endpoint the child processes will use.
+    ///
+    /// Computed with the sandbox's own socket dir rather than by reading
+    /// `SSHPF_SOCKET_DIR`: this process does not (and must not) mutate its own
+    /// environment to match a child's, so the two would otherwise disagree about
+    /// where the socket lives and never meet.
+    fn endpoint(&self) -> ipc::Endpoint {
+        ipc::endpoint_in(&self.config(), self.socket_dir())
+    }
+
     /// Connect to this sandbox's server, or `None` when it is not listening yet.
     fn try_connect(&self) -> Option<std::os::unix::net::UnixStream> {
-        let endpoint = ipc::endpoint_for(&self.config());
-        std::os::unix::net::UnixStream::connect(&endpoint.socket_path).ok()
+        std::os::unix::net::UnixStream::connect(&self.endpoint().socket_path).ok()
     }
 
     /// Wait until the server for this sandbox accepts a connection and the
-    /// handshake succeeds. Returns the socket, already past `Welcome`.
-    fn wait_for_server(&self, budget: Duration) -> std::os::unix::net::UnixStream {
+    /// handshake succeeds.
+    ///
+    /// Returns the socket (already past `Welcome`) and the server's pid, which is
+    /// what lets a test prove two clients reached *one* process.
+    fn wait_for_server(&self, budget: Duration) -> (std::os::unix::net::UnixStream, u32) {
         let deadline = Instant::now() + budget;
         while Instant::now() < deadline {
             if let Some(mut stream) = self.try_connect() {
                 stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
                 let hello = ClientMsg::Hello {
                     proto_version: ipc::PROTO_VERSION,
-                    config_path: ipc::endpoint_for(&self.config()).config_path.display().to_string(),
+                    config_path: self.endpoint().config_path.display().to_string(),
                     // This test speaks the protocol directly, so it declares the
                     // policy it would pass on a real command line.
                     host_key_policy: Some("ignore".into()),
                 };
                 if ipc::write_message(&mut stream, &hello).is_ok()
-                    && let Ok(Some(ServerMsg::Welcome { .. })) = ipc::read_server_msg(&mut stream)
+                    && let Ok(Some(ServerMsg::Welcome { server_pid, .. })) = ipc::read_server_msg(&mut stream)
                 {
-                    return stream;
+                    return (stream, server_pid);
                 }
             }
             std::thread::sleep(Duration::from_millis(25));
@@ -192,16 +204,17 @@ fn a_second_client_attaches_to_the_same_server() {
     // Let the first client start the server (and hold the election lock while it
     // waits for its own connect — the exact window a second client must survive).
     let first = sandbox.spawn_client();
-    let mut a = sandbox.wait_for_server(Duration::from_secs(20));
+    // `a` stays open so the server keeps a client attached while `b` joins.
+    let (_a, pid_a) = sandbox.wait_for_server(Duration::from_secs(20));
 
-    // Both handshakes report the same server process: one server, not two.
+    // Both handshakes must name the same server process: one server, not two.
     let pid_of = |msg: &ServerMsg| match msg {
         ServerMsg::Welcome { server_pid, .. } => Some(*server_pid),
         _ => None,
     };
     let hello = |sandbox: &Sandbox| ClientMsg::Hello {
         proto_version: ipc::PROTO_VERSION,
-        config_path: ipc::endpoint_for(&sandbox.config()).config_path.display().to_string(),
+        config_path: sandbox.endpoint().config_path.display().to_string(),
         host_key_policy: None,
     };
     let mut b = sandbox.try_connect().expect("the server must still be listening");
@@ -210,15 +223,12 @@ fn a_second_client_attaches_to_the_same_server() {
     let welcome_b = ipc::read_server_msg(&mut b).expect("must decode").expect("must be a frame");
     let pid_b = pid_of(&welcome_b).expect("the second connection must get a Welcome");
 
-    let welcome_a = ipc::read_server_msg(&mut a).expect("must decode");
-    let pid_a = welcome_a.as_ref().and_then(pid_of);
-    assert_eq!(pid_a, Some(pid_b), "both clients must be served by one server process");
+    assert_eq!(pid_a, pid_b, "both clients must be served by one server process");
 
     // And the server counts both of them, which is what drives the
     // "last client" warning.
-    let snap = read_until(&mut b, Duration::from_secs(10), |m| {
-        matches!(m, ServerMsg::Snapshot(s) if s.client_count >= 2)
-    });
+    let snap =
+        read_until(&mut b, Duration::from_secs(10), |m| matches!(m, ServerMsg::Snapshot(s) if s.client_count >= 2));
     assert!(snap.is_some(), "the server must count both attached clients");
     drop(first);
 }
@@ -231,7 +241,7 @@ fn a_change_made_by_one_client_is_seen_by_the_other() {
     sandbox.write_config(&[("web", 18082)]);
 
     let _first = sandbox.spawn_client();
-    let mut a = sandbox.wait_for_server(Duration::from_secs(20));
+    let (mut a, _pid) = sandbox.wait_for_server(Duration::from_secs(20));
 
     // Second client, attached to the same server.
     let mut b = sandbox.try_connect().expect("the server must be listening");
@@ -240,7 +250,7 @@ fn a_change_made_by_one_client_is_seen_by_the_other() {
         &mut b,
         &ClientMsg::Hello {
             proto_version: ipc::PROTO_VERSION,
-            config_path: ipc::endpoint_for(&sandbox.config()).config_path.display().to_string(),
+            config_path: sandbox.endpoint().config_path.display().to_string(),
             host_key_policy: None,
         },
     )
@@ -275,7 +285,7 @@ fn the_server_refuses_an_invalid_definition() {
     sandbox.write_config(&[]);
 
     let _first = sandbox.spawn_client();
-    let mut a = sandbox.wait_for_server(Duration::from_secs(20));
+    let (mut a, _pid) = sandbox.wait_for_server(Duration::from_secs(20));
 
     let mut bad = sshpf::model::TunnelConfig {
         id: 0,
@@ -313,24 +323,21 @@ fn a_delete_with_a_stale_revision_is_refused() {
     sandbox.write_config(&[("web", 18084)]);
 
     let _first = sandbox.spawn_client();
-    let mut a = sandbox.wait_for_server(Duration::from_secs(20));
+    let (mut a, _pid) = sandbox.wait_for_server(Duration::from_secs(20));
 
     // Nonsense revision: the server has certainly moved past it.
-    let msg = ClientMsg::Command {
-        req_id: 7,
-        expect_rev: Some(0),
-        op: ipc::Op::Delete { tunnel_id: 1 },
-    };
+    let msg = ClientMsg::Command { req_id: 7, expect_rev: Some(0), op: ipc::Op::Delete { tunnel_id: 1 } };
     ipc::write_message(&mut a, &msg).expect("must be writable");
-    let reply = read_until(&mut a, Duration::from_secs(10), |m| {
-        matches!(m, ServerMsg::Stale { req_id, .. } if *req_id == 7)
-    });
+    let reply =
+        read_until(&mut a, Duration::from_secs(10), |m| matches!(m, ServerMsg::Stale { req_id, .. } if *req_id == 7));
     assert!(reply.is_some(), "a stale expect_rev must produce Stale, not a silent delete");
 
     // The tunnel must still be there.
-    let snap = read_until(&mut a, Duration::from_secs(10), |m| {
-        matches!(m, ServerMsg::Snapshot(s) if s.tunnels.iter().any(|t| t.cfg.id == 1))
-    });
+    let snap = read_until(
+        &mut a,
+        Duration::from_secs(10),
+        |m| matches!(m, ServerMsg::Snapshot(s) if s.tunnels.iter().any(|t| t.cfg.id == 1)),
+    );
     assert!(snap.is_some(), "a refused delete must not have removed the definition");
 }
 
@@ -343,14 +350,14 @@ fn the_last_client_leaving_stops_the_server() {
     sandbox.write_config(&[]);
 
     let first = sandbox.spawn_client();
-    let mut a = sandbox.wait_for_server(Duration::from_secs(20));
+    let (mut a, _pid) = sandbox.wait_for_server(Duration::from_secs(20));
 
     // Say goodbye as the only client: the server must recount and shut down.
     ipc::write_message(&mut a, &ClientMsg::Bye { last_exit: true }).expect("bye must be writable");
     drop(a);
     drop(first);
 
-    let endpoint = ipc::endpoint_for(&sandbox.config());
+    let endpoint = sandbox.endpoint();
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut gone = false;
     while Instant::now() < deadline {
@@ -385,10 +392,7 @@ fn an_unreachable_server_is_an_error_not_a_silent_single_process_start() {
     let out = cmd.output().expect("the binary must run");
     assert!(!out.status.success(), "failing to attach must be a failure: {out:?}");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("错误") || stderr.contains("Error"),
-        "the user must be told what happened: {stderr:?}"
-    );
+    assert!(stderr.contains("错误") || stderr.contains("Error"), "the user must be told what happened: {stderr:?}");
 }
 
 /// Two servers cannot both own one config. A second `--server` for the same
@@ -400,7 +404,7 @@ fn a_second_server_for_the_same_config_steps_aside() {
 
     // First server, started the way a client would.
     let first = sandbox.spawn_client();
-    let _stream = sandbox.wait_for_server(Duration::from_secs(20));
+    let (_stream, _pid) = sandbox.wait_for_server(Duration::from_secs(20));
 
     // Second server: it must exit on its own, reasonably quickly, without
     // killing or replacing the first.
@@ -426,7 +430,7 @@ fn a_second_server_for_the_same_config_steps_aside() {
     assert!(exited, "a second server for one config must stand down, not compete");
 
     // The original server is still serving.
-    let endpoint = ipc::endpoint_for(&sandbox.config());
+    let endpoint = sandbox.endpoint();
     assert!(
         std::os::unix::net::UnixStream::connect(&endpoint.socket_path).is_ok(),
         "the first server must be unaffected by the second one exiting"
@@ -445,7 +449,7 @@ fn check_mode_never_starts_a_server() {
     let out = sandbox.command().arg("--check").output().expect("the binary must run");
     assert!(out.status.success(), "--check must succeed: {out:?}");
 
-    let endpoint = ipc::endpoint_for(&sandbox.config());
+    let endpoint = sandbox.endpoint();
     assert!(!endpoint.socket_path.exists(), "a print-and-exit mode must not leave a socket behind");
     assert!(
         std::os::unix::net::UnixStream::connect(&endpoint.socket_path).is_err(),

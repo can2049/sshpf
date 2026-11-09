@@ -282,13 +282,6 @@ fn run_tui(paths: Paths, args: &cli::Args, started: Instant) -> std::io::Result<
     let received = Arc::new(AtomicUsize::new(0));
     install_signal_flags(&quit, &received);
 
-    // Terminal first, tunnels second: if there is no tty there is nothing to
-    // clean up yet (see `take_terminal`).
-    let mut terminal = take_terminal()?;
-    // From here on the crash handler must release the alternate screen before the
-    // message lands in the user's shell.
-    logging::set_tui_active(true);
-
     if config::perms_too_open(&paths.config) {
         // Group/world readable config: it names hosts and key paths, so this is a
         // real (if small) exposure and worth a record either way.
@@ -297,9 +290,24 @@ fn run_tui(paths: Paths, args: &cli::Args, started: Instant) -> std::io::Result<
     }
 
     let mut app = App::with_host_key_policy(paths.clone(), args.host_key_policy());
-    // Attach *before* the terminal is taken so a failure is a plain message and a
-    // non-zero exit, not a TUI the user has to read a status line to understand.
-    let attached = attach_client(&mut app, &paths, args, &mut terminal)?;
+    // Attach **before** the terminal is taken, and the order is load-bearing in
+    // both directions:
+    //
+    // * attaching needs no terminal (it is one socket handshake), so a failure
+    //   here is a plain stderr message and a normal non-zero exit instead of a
+    //   TUI the user has to open to read a status line;
+    // * taking the terminal first would make every headless invocation
+    //   (`sshpf < /dev/null`, a CI step, `ssh host sshpf` without `-t`) die with
+    //   a tty error before it ever tried to attach — the client would never start
+    //   the server, and `--check`-style automation would look broken.
+    let attached = attach_client(&mut app, &paths, args)?;
+    // Terminal now: with no client link to establish, a missing tty is the only
+    // thing that can still fail, and it is reported as the environment problem it
+    // is (see `take_terminal`).
+    let mut terminal = take_terminal()?;
+    // From here on the crash handler must release the alternate screen before the
+    // message lands in the user's shell.
+    logging::set_tui_active(true);
     prepare_app(&mut app, args.no_restore, !attached);
 
     // Mouse capture is on for the whole session: the import table's filtering and
@@ -331,12 +339,7 @@ fn run_tui(paths: Paths, args: &cli::Args, started: Instant) -> std::io::Result<
 /// end up fighting over the same local ports — the very defect this mode removes.
 /// So the reason is reported (log + stderr) and the process exits non-zero.
 #[cfg(unix)]
-fn attach_client(
-    app: &mut App,
-    paths: &Paths,
-    args: &cli::Args,
-    terminal: &mut DefaultTerminal,
-) -> std::io::Result<bool> {
+fn attach_client(app: &mut App, paths: &Paths, args: &cli::Args) -> std::io::Result<bool> {
     match sshpf::client::attach(paths, args.host_key_policy(), args.keep_server) {
         Ok((out, incoming)) => {
             app.attach_remote(out, incoming);
@@ -344,12 +347,10 @@ fn attach_client(
             Ok(true)
         }
         Err(e) => {
+            // No terminal has been taken yet, so there is nothing to restore:
+            // this message goes straight to the user's shell.
             eventlog::client_attach_failed(&e.zh);
-            // Leave the terminal clean before printing: the message must land in
-            // the user's shell, not in an alternate screen that is about to vanish.
-            ratatui::restore();
             let _ = writeln!(std::io::stderr(), "错误 / Error: {} / {}", e.zh, e.en);
-            let _ = terminal.clear();
             Err(std::io::Error::other(format!("{} / {}", e.zh, e.en)))
         }
     }
@@ -357,12 +358,7 @@ fn attach_client(
 
 /// Windows: no client-server transport yet, so this process owns the tunnels.
 #[cfg(not(unix))]
-fn attach_client(
-    _app: &mut App,
-    _paths: &Paths,
-    _args: &cli::Args,
-    _terminal: &mut DefaultTerminal,
-) -> std::io::Result<bool> {
+fn attach_client(_app: &mut App, _paths: &Paths, _args: &cli::Args) -> std::io::Result<bool> {
     Ok(false)
 }
 

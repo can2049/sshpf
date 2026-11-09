@@ -20,11 +20,11 @@
 //! Unix-only: Windows still runs the single-process path.
 
 pub mod app;
+pub mod cli;
 /// The client half of the client-server runtime: attach to the server for this
 /// config, starting it first when none is running.
 #[cfg(unix)]
 pub mod client;
-pub mod cli;
 pub mod config;
 pub mod eventlog;
 pub mod help;

@@ -135,6 +135,12 @@ fn read_first(socket: &mut UnixStream, config_path: &str, within: Duration) -> R
         // A read timeout surfaces as `WouldBlock` (SO_RCVTIMEO) or `TimedOut`,
         // depending on the platform; both mean "the server said nothing".
         Err(e) if is_timeout(&e) => Err(timeout_error(config_path, within)),
+        // The peer closed *while* we were reading. Depending on when the kernel
+        // noticed, that is a clean EOF (handled above) or a reset — the same event,
+        // and it must produce the same sentence, or the user sees a bare
+        // `os error 104` for the most ordinary failure there is (a server that was
+        // just killed).
+        Err(e) if peer_is_gone(&e) => Err(eof_error(config_path)),
         Err(e) => Err(read_error(config_path, &e)),
     }
 }

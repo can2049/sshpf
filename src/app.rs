@@ -20,6 +20,7 @@ use crate::model::{
 use crate::ssh::SshHost;
 use crate::tunnel::{Supervisor, TunnelEvent};
 
+pub mod authority;
 pub mod confirm;
 pub mod duplicate;
 pub mod events;

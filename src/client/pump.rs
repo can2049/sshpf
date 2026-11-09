@@ -38,6 +38,8 @@
 //! ([`super::spawn`]), or what the messages mean ([`crate::app::remote`]).
 
 use std::os::unix::net::UnixStream;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread::JoinHandle;
 
@@ -66,8 +68,11 @@ pub fn start(
     // The writer gets its own handle: it needs `shutdown` to wake the blocked
     // reader, and that is the only reason the socket is shared at all.
     let reader_socket = socket.try_clone().map_err(|e| clone_error(&e))?;
-    spawn_reader(reader_socket, in_tx);
-    spawn_writer(socket, out_rx);
+    // Set by whoever ends the session first, so the other half's exit is recorded
+    // as the consequence it is instead of being blamed on the server.
+    let closing = Arc::new(AtomicBool::new(false));
+    spawn_reader(reader_socket, in_tx, closing.clone());
+    spawn_writer(socket, out_rx, closing);
     Ok((out_tx, in_rx))
 }
 
@@ -75,7 +80,7 @@ pub fn start(
 ///
 /// Dropping `in_tx` on the way out is the signal the app relies on: it is how a
 /// mirror learns the transport died (see [`crate::app::remote::inbound`]).
-fn spawn_reader(mut socket: UnixStream, in_tx: Sender<ServerMsg>) -> JoinHandle<()> {
+fn spawn_reader(mut socket: UnixStream, in_tx: Sender<ServerMsg>, closing: Arc<AtomicBool>) -> JoinHandle<()> {
     std::thread::spawn(move || {
         loop {
             match ipc::read_server_msg(&mut socket) {
@@ -86,15 +91,19 @@ fn spawn_reader(mut socket: UnixStream, in_tx: Sender<ServerMsg>) -> JoinHandle<
                         break;
                     }
                 }
+                // Every remaining path ends the session. Claim the "first to notice"
+                // flag: if the writer set it, this thread was woken by our own
+                // shutdown and there is nothing to report.
                 Ok(None) => {
-                    eventlog::client_disconnected("eof");
+                    if !closing.swap(true, Ordering::Relaxed) {
+                        eventlog::client_disconnected("eof");
+                    }
                     break;
                 }
                 Err(e) => {
-                    // A read cut short by the writer's `shutdown` is the app quitting,
-                    // already logged as a normal disconnect; anything else is a broken
-                    // link worth a record.
-                    eventlog::client_disconnected(&format!("read: {e}"));
+                    if !closing.swap(true, Ordering::Relaxed) {
+                        eventlog::client_disconnected(&format!("read: {e}"));
+                    }
                     break;
                 }
             }
@@ -104,19 +113,26 @@ fn spawn_reader(mut socket: UnixStream, in_tx: Sender<ServerMsg>) -> JoinHandle<
 
 /// Write every `ClientMsg` until the outbound channel closes, then stop the
 /// reader by shutting the socket down.
-fn spawn_writer(mut socket: UnixStream, out_rx: Receiver<ClientMsg>) -> JoinHandle<()> {
+fn spawn_writer(mut socket: UnixStream, out_rx: Receiver<ClientMsg>, closing: Arc<AtomicBool>) -> JoinHandle<()> {
     std::thread::spawn(move || {
         // `recv()` blocks with no timeout: an idle client costs nothing, and the
         // thread wakes the moment there is intent to send.
         while let Ok(msg) = out_rx.recv() {
             if ipc::write_message(&mut socket, &msg).is_err() {
-                // The link is already broken; the reader will report the same
-                // failure on the next frame. Both halves are done.
+                // The link is already broken; record it here and let the reader
+                // notice the same thing without a second, duplicate record.
+                if !closing.swap(true, Ordering::Relaxed) {
+                    eventlog::client_disconnected("write");
+                }
                 break;
             }
         }
-        // The app has quit (or the connection failed). Unblock the reader, which
-        // is parked in `read` and cannot notice a dropped Sender on its own.
+        // The app has quit, or the link failed. Either way this side ends the
+        // session deliberately; claim the flag so the reader's wake-up is not
+        // recorded as "the server went away".
+        closing.store(true, Ordering::Relaxed);
+        // Unblock the reader, which is parked in `read` and cannot notice a
+        // dropped Sender on its own.
         let _ = socket.shutdown(std::net::Shutdown::Both);
     })
 }
@@ -306,5 +322,35 @@ mod tests {
         let (outbound, inbound) = start(socket, None).expect("pump");
         assert!(next_msg(&inbound, Duration::from_millis(100)).is_none(), "nothing was sent, so nothing may arrive");
         drop(outbound);
+    }
+
+    #[test]
+    fn quitting_locally_is_not_recorded_as_the_server_going_away() {
+        // The user pressing `q` closes `outbound`; the writer then shuts the
+        // socket down and the reader wakes with an error. Attributing that to the
+        // server would put "client.disconnected reason=eof" in the log of every
+        // normal exit and make the one case that matters (a real server death)
+        // impossible to find.
+        //
+        // This is asserted through the only observable the test can reach: a
+        // session that the app closes must still close `inbound` promptly and
+        // cleanly. The reason string is a log line; the flag that decides it is
+        // what keeps the two apart.
+        let (_peer, socket) = UnixStream::pair().expect("pair");
+        let (outbound, inbound) = start(socket, None).expect("pump");
+        drop(outbound);
+        let started = Instant::now();
+        loop {
+            match inbound.recv_timeout(Duration::from_millis(50)) {
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    assert!(
+                        started.elapsed() < PATIENCE,
+                        "a local quit must end the pump without waiting for the peer"
+                    );
+                }
+                Ok(msg) => panic!("no frame was sent, got {msg:?}"),
+            }
+        }
     }
 }

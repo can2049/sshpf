@@ -141,12 +141,7 @@ pub fn orphan_event(event: &str, id: TunnelId) {
 pub fn server_start(config_path: &str, socket: &str, keep_server: bool) {
     logging::info(
         "server.start",
-        &[
-            ("pid", &std::process::id()),
-            ("config", &config_path),
-            ("socket", &socket),
-            ("keep_server", &keep_server),
-        ],
+        &[("pid", &std::process::id()), ("config", &config_path), ("socket", &socket), ("keep_server", &keep_server)],
     );
 }
 
@@ -182,10 +177,7 @@ pub fn server_grace_cancelled(count: u32) {
 
 /// Shutdown began: why, and what is about to be stopped.
 pub fn server_shutdown_begin(count: u32, active: usize, trigger: &str) {
-    logging::info(
-        "server.shutdown_begin",
-        &[("count", &count), ("active", &active), ("trigger", &trigger)],
-    );
+    logging::info("server.shutdown_begin", &[("count", &count), ("active", &active), ("trigger", &trigger)]);
 }
 
 /// This process attached to a server instead of owning the tunnels.
@@ -207,7 +199,6 @@ pub fn client_disconnected(reason: &str) {
 pub fn client_attach_failed(reason: &str) {
     logging::error("client.attach_failed", &[("msg", &reason)]);
 }
-
 
 #[cfg(test)]
 mod tests {

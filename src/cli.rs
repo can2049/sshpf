@@ -200,16 +200,15 @@ fn parse_args_from<I>(args: I) -> Result<Option<Args>, String>
 where
     I: IntoIterator<Item = std::ffi::OsString>,
 {
-    let mut parsed =
-        Args {
-            config: None,
-            no_restore: false,
-            list_hosts: false,
-            check: false,
-            server: false,
-            keep_server: false,
-            ignore_host_key_changes: false,
-        };
+    let mut parsed = Args {
+        config: None,
+        no_restore: false,
+        list_hosts: false,
+        check: false,
+        server: false,
+        keep_server: false,
+        ignore_host_key_changes: false,
+    };
     let mut it = args.into_iter();
     while let Some(arg) = it.next() {
         // Lossy only for the *match*; a path is stored untouched below.

@@ -47,8 +47,19 @@ pub struct Endpoint {
 /// Does no I/O: the caller decides when to create the directory, so a `--check`
 /// run never leaves a socket directory behind.
 pub fn endpoint_for(config_path: &Path) -> Endpoint {
+    endpoint_in(config_path, socket_dir())
+}
+
+/// Derive the endpoint under an explicitly chosen directory.
+///
+/// The directory is normally `$XDG_RUNTIME_DIR/sshpf` (or `$SSHPF_SOCKET_DIR`).
+/// Passing it explicitly exists for callers that must agree on a location without
+/// reading process-global environment — a test that starts a server *as a child
+/// process* computes the socket path for the child's env, and cannot rely on
+/// mutating its own environment to match. Two processes that disagree about the
+/// directory are two processes that will never meet.
+pub fn endpoint_in(config_path: &Path, dir: PathBuf) -> Endpoint {
     let config_path = normalize(config_path);
-    let dir = socket_dir();
     let key = short_hash(&config_path);
     Endpoint {
         socket_path: dir.join(format!("{key}.sock")),

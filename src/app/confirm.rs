@@ -156,9 +156,7 @@ impl App {
                     // the user may have started from a window that is already gone.
                     help::bi(
                         &format!("这是最后一个客户端：退出后所有端口转发都会停止（{running} 条运行中）。确定退出？"),
-                        &format!(
-                            "Last client: quitting stops every port forward ({running} running). Quit anyway?"
-                        ),
+                        &format!("Last client: quitting stops every port forward ({running} running). Quit anyway?"),
                     )
                 } else {
                     help::bi(

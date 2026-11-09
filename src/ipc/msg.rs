@@ -231,7 +231,11 @@ mod tests {
     #[test]
     fn every_client_message_round_trips() {
         let messages = [
-            ClientMsg::Hello { proto_version: PROTO_VERSION, config_path: "/tmp/config.toml".into(), host_key_policy: None },
+            ClientMsg::Hello {
+                proto_version: PROTO_VERSION,
+                config_path: "/tmp/config.toml".into(),
+                host_key_policy: None,
+            },
             ClientMsg::Hello {
                 proto_version: PROTO_VERSION,
                 config_path: "/tmp/config.toml".into(),
