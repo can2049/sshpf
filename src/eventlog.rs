@@ -49,10 +49,10 @@ pub use ssh::{
 };
 pub use tunnel::{
     forward_target_failed, kind_name, socks5_rejected, tunnel_created, tunnel_deleted, tunnel_event, tunnel_event_on,
-    tunnel_exit, tunnel_exit_on, tunnel_failed, tunnel_failed_on, tunnel_fields, tunnel_line, tunnel_line_on,
-    tunnel_ready, tunnel_ready_on, tunnel_retry_abandoned, tunnel_retry_abandoned_on, tunnel_retry_fired,
-    tunnel_retry_scheduled, tunnel_spawn_failed, tunnel_spawned, tunnel_start_rejected, tunnel_start_rejected_on,
-    tunnel_start_requested, tunnel_stopped, tunnel_updated,
+    tunnel_exit, tunnel_exit_on, tunnel_failed, tunnel_failed_on, tunnel_fields, tunnel_health_failed,
+    tunnel_health_failed_on, tunnel_line, tunnel_line_on, tunnel_ready, tunnel_ready_on, tunnel_retry_abandoned,
+    tunnel_retry_abandoned_on, tunnel_retry_fired, tunnel_retry_scheduled, tunnel_spawn_failed, tunnel_spawned,
+    tunnel_start_rejected, tunnel_start_rejected_on, tunnel_start_requested, tunnel_stopped, tunnel_updated,
 };
 pub use user::{
     action_applied, action_batch, action_cancelled, action_duplicate_skipped, action_duplicate_skipped_on,

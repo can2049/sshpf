@@ -24,6 +24,7 @@
 //! | [`auth`] | credential loading (IdentityFile / ssh-agent) and `authenticate` |
 //! | [`connect`] | TCP connect with deadline, `session()`, the `ProxyJump` chain |
 //! | [`driver`] | `serve_local` / `serve_remote` / `serve_dynamic` |
+//! | [`health`] | periodic liveness probe of a live session, its verdicts |
 //! | [`probe`] | run one command on the host and capture its stdout (port scan) |
 //!
 //! The public entry point is [`run`]; [`Options`] and [`classify`] are
@@ -49,6 +50,7 @@ mod classify;
 mod connect;
 mod driver;
 mod handler;
+mod health;
 pub mod probe;
 
 pub use classify::classify;
@@ -75,9 +77,12 @@ pub async fn run(
     let handle = connect(&endpoint, opts, id, tx.clone(), local_target).await?;
     let _ = tx.send(TunnelEvent::Line { id, line: format!("已连接 {}", endpoint.hostname) });
 
+    // The probe interval travels with the run: it is a per-run setting, and the
+    // drivers are the only place that can race it against the serve loop.
+    let health_check = opts.health_check;
     match cfg.kind {
-        ForwardKind::Local => serve_local(cfg, handle, id, tx, ready).await,
-        ForwardKind::Remote => serve_remote(cfg, handle, id, tx, ready).await,
-        ForwardKind::Dynamic => serve_dynamic(cfg, handle, id, tx, ready).await,
+        ForwardKind::Local => serve_local(cfg, handle, id, tx, ready, health_check).await,
+        ForwardKind::Remote => serve_remote(cfg, handle, id, tx, ready, health_check).await,
+        ForwardKind::Dynamic => serve_dynamic(cfg, handle, id, tx, ready, health_check).await,
     }
 }

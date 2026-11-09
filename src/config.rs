@@ -17,6 +17,29 @@ use crate::model::{ForwardKind, TunnelConfig, TunnelId, now_unix};
 
 pub const CONFIG_VERSION: u32 = 1;
 
+/// Shortest `defaults.health_check_secs` that is actually useful.
+///
+/// A probe is one round trip for the whole session, so even one second would
+/// not hurt locally — but on a loaded link a sub-second-triggered flood of
+/// probes is indistinguishable from a broken tunnel. Five seconds is well below
+/// any human-noticeable recovery time and above any plausible probe latency.
+pub const MIN_HEALTH_CHECK_SECS: u64 = 5;
+
+/// Longest `defaults.health_check_secs` the app will honour (one day).
+///
+/// Beyond this the check no longer answers "did the session die?", because a
+/// resumed laptop has already been unusable for hours.
+pub const MAX_HEALTH_CHECK_SECS: u64 = 24 * 60 * 60;
+
+/// Coerce a hand-written `health_check_secs` into the range the app operates in.
+///
+/// `0` is a meaningful value — "the user turned the check off" — so it passes
+/// through untouched rather than being clamped up to [`MIN_HEALTH_CHECK_SECS`],
+/// which would silently re-enable a feature the user disabled.
+pub fn normalize_health_check_secs(secs: u64) -> u64 {
+    if secs == 0 { 0 } else { secs.clamp(MIN_HEALTH_CHECK_SECS, MAX_HEALTH_CHECK_SECS) }
+}
+
 /// Global defaults, editable by hand.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Defaults {
@@ -35,6 +58,15 @@ pub struct Defaults {
     /// Reconnect delay ceiling in seconds.
     #[serde(default = "Defaults::default_retry_max")]
     pub retry_max_secs: u64,
+    /// How often an `Up` tunnel probes the SSH session for liveness, in
+    /// seconds. `0` disables the check.
+    ///
+    /// A local `-L`/`-D` listener never learns that the SSH session died — the
+    /// `accept()` loop keeps returning connections that then fail, so the
+    /// status stays `●` while nothing forwards. That is what a Windows machine
+    /// looks like after sleep/resume, and it is why the probe exists at all.
+    #[serde(default = "Defaults::default_health_check")]
+    pub health_check_secs: u64,
 }
 
 impl Defaults {
@@ -50,6 +82,9 @@ impl Defaults {
     fn default_retry_max() -> u64 {
         30
     }
+    fn default_health_check() -> u64 {
+        30
+    }
 }
 
 impl Default for Defaults {
@@ -60,6 +95,7 @@ impl Default for Defaults {
             auto_restart: true,
             retry_initial_secs: 2,
             retry_max_secs: 30,
+            health_check_secs: Defaults::default_health_check(),
         }
     }
 }
@@ -555,6 +591,44 @@ mod tests {
         // Backoff starts small and is capped, so one bad host cannot spin.
         assert!(d.retry_initial_secs >= 1);
         assert!(d.retry_max_secs >= d.retry_initial_secs);
+        // The health check is on by default: a tunnel that shows `●` must
+        // actually still work, which a local listener alone cannot tell us.
+        assert_eq!(d.health_check_secs, 30);
+    }
+
+    #[test]
+    fn a_health_check_interval_is_only_corrected_when_it_is_actually_unusable() {
+        // `0` means "off" and must stay off: clamping it up would re-enable a
+        // feature the user deliberately disabled.
+        assert_eq!(normalize_health_check_secs(0), 0);
+        // Too frequent floods the session; too rare answers a question nobody
+        // asks any more.
+        assert_eq!(normalize_health_check_secs(1), MIN_HEALTH_CHECK_SECS);
+        assert_eq!(normalize_health_check_secs(4), MIN_HEALTH_CHECK_SECS);
+        assert_eq!(normalize_health_check_secs(5), 5);
+        assert_eq!(normalize_health_check_secs(30), 30);
+        assert_eq!(normalize_health_check_secs(MAX_HEALTH_CHECK_SECS), MAX_HEALTH_CHECK_SECS);
+        assert_eq!(normalize_health_check_secs(u64::MAX), MAX_HEALTH_CHECK_SECS);
+    }
+
+    #[test]
+    fn a_health_check_interval_survives_a_config_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = ConfigFile::default();
+        cfg.defaults.health_check_secs = 90;
+        save(&path, &cfg).unwrap();
+        assert_eq!(load(&path).unwrap().defaults.health_check_secs, 90);
+    }
+
+    #[test]
+    fn an_old_config_without_a_health_check_interval_still_loads() {
+        // Every `config.toml` written before this field existed must keep
+        // working: the new setting is additive, not a format change.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "[defaults]\nbind = \"127.0.0.1\"\nauto_restart = false\n").unwrap();
+        assert_eq!(load(&path).unwrap().defaults.health_check_secs, 30, "the default must fill in");
     }
 
     #[test]

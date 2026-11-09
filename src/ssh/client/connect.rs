@@ -48,6 +48,13 @@ pub struct Options {
     /// settings: a host whose `~/.ssh/config` asks for `Ignore` stays ignored
     /// even if this is `AcceptNew`. See [`Options::policy_for`].
     pub host_key_policy: known_hosts::HostKeyPolicy,
+    /// How often to probe the live session for liveness, or `None` when the
+    /// check is disabled (`defaults.health_check_secs = 0`).
+    ///
+    /// Part of `Options` because it is a per-run setting like the policy: the
+    /// connector does not use it, but every hop of a run is created with the
+    /// same options and the driver needs it.
+    pub health_check: Option<Duration>,
 }
 
 impl Options {
@@ -232,7 +239,7 @@ mod tests {
     /// weaken it, because the user asked for it globally.
     #[test]
     fn the_global_flag_is_not_weakened_by_a_stricter_host() {
-        let opts = Options { host_key_policy: known_hosts::HostKeyPolicy::Ignore };
+        let opts = Options { host_key_policy: known_hosts::HostKeyPolicy::Ignore, ..Options::default() };
         for per_host in [
             known_hosts::HostKeyPolicy::Strict,
             known_hosts::HostKeyPolicy::AcceptNew,
@@ -251,7 +258,7 @@ mod tests {
     /// to `Ignore` for a host that says nothing.
     #[test]
     fn the_default_options_do_not_upgrade_a_host_to_ignore() {
-        let opts = Options { host_key_policy: known_hosts::HostKeyPolicy::AcceptNew };
+        let opts = Options { host_key_policy: known_hosts::HostKeyPolicy::AcceptNew, ..Options::default() };
         let resolved = opts.policy_for(&endpoint_with(known_hosts::HostKeyPolicy::AcceptNew));
         assert_eq!(resolved, known_hosts::HostKeyPolicy::AcceptNew);
         assert!(!known_hosts::accepts_changed(resolved), "the default must refuse a changed key");

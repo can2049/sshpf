@@ -162,6 +162,20 @@ grep -E 'event=crash\.|event=tunnel\.thread_panic' "$L"; tail -5 "$L"
 
 一句话：`tunnel.failed` 是"这次没成"，`tunnel.retry_abandoned` 是"别等了"。排查重连风暴时数 `tunnel.retry_scheduled`，看它最后落在哪个。
 
+### 「界面显示已连通，但端口其实不通」（休眠唤醒 / 半开连接）
+
+```bash
+grep 'event=tunnel.health_failed' "$L"
+```
+
+本地 `-L`/`-D` 的 listener 感知不到 SSH 会话已死（`accept()` 照样成功），所以 `●` 不代表通。探活是唯一的证据来源：有这条事件说明**探活已经发现会话失效**，`cause` 指出死法——`ping_timeout`（等 5s 没回复，休眠/断网最常见）、`ping_error`（请求发不出去）、`session_closed`（russh 已关闭）。随后本次运行以 `stale_connection` 结束并走退避重连。
+
+| 看到 | 结论 / 下一步 |
+|---|---|
+| 有 `health_failed`，随后有 `tunnel.retry_scheduled` | 正常自愈路径，等下一次重连即可 |
+| 有 `health_failed`，但停在 `✗ 失败` | `auto_restart = false`（该条或 `defaults`）：重连被关掉了，按 `r` 或改配置 |
+| **完全没有**这条事件 | 先确认探活没被关：`health_check_secs = 0` 表示人为关闭。**探活成功不写 INFO 日志**（否则每 30s 一条噪声），所以"没有日志"不等于探活没跑 |
+
 ### 「配置被谁改了」
 
 ```bash
@@ -169,7 +183,7 @@ grep -E 'event=(config\.repaired|config\.defaults_clamped|config\.perms_tightene
 ```
 
 - `config.repaired` → 载入时修了重复 id / 缺 `created_at`（`entries` 是条数）。你写的 id 与日志里的 id 不一致时先说这条。
-- `config.defaults_clamped` → `retry_initial_secs` / `retry_max_secs` 被钳到 [1s, 24h]。`original` 是你写的值，`used` 是实际用的。**`retry_initial_secs = 0` 会变成每帧重连**，所以它被钳而不是被照做。
+- `config.defaults_clamped` → `retry_initial_secs` / `retry_max_secs` / `health_check_secs` 被钳制。`original` 是你写的值，`used` 是实际用的。**`retry_initial_secs = 0` 会变成每帧重连**，所以它被钳而不是被照做；`health_check_secs = 0` 是例外，它表示「关闭探活」，原样保留。
 - `config.perms_tightened` → 文件原先对同组/所有人可读，已收紧到 `0600`（`ok=false` 说明收紧失败）。
 
 ### 「命令行没输出，退出码却是 0」

@@ -252,7 +252,7 @@ Host accept_new_host
   StrictHostKeyChecking accept-new
 ";
     with_ssh_config(config, || {
-        let ignoring = Options { host_key_policy: HostKeyPolicy::Ignore };
+        let ignoring = Options { host_key_policy: HostKeyPolicy::Ignore, ..Options::default() };
         for alias in ["strict_host", "accept_new_host"] {
             let endpoint = Endpoint::resolve(alias).unwrap();
             // `yes` must not become `Strict` (sshpf's default is accept-new), and

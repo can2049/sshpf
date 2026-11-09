@@ -117,7 +117,7 @@ pub fn interpret(stdout: &str) -> ScanOutcome {
 /// Async because it runs on an SSH session; the app calls it from a dedicated
 /// thread (see `crate::app::port_scan`), never from the UI thread.
 pub async fn scan_listen_ports(ssh_host: &str, policy: HostKeyPolicy) -> Result<ScanOutcome> {
-    let opts = crate::ssh::client::Options { host_key_policy: policy };
+    let opts = crate::ssh::client::Options { host_key_policy: policy, ..crate::ssh::client::Options::default() };
     let raw = crate::ssh::client::probe::exec_capture(ssh_host, &opts, list_command()).await?;
     // Remote output is bytes, not necessarily UTF-8: a locale or a binary banner
     // can put invalid sequences in it, and `String::from_utf8` would throw the

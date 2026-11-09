@@ -196,7 +196,11 @@ impl App {
     /// Step 3 of a start: spawn the background session and report the outcome.
     fn launch(&mut self, cfg: &TunnelConfig, id: TunnelId) {
         let policy = self.host_key_policy;
-        match self.supervisor.spawn(cfg.clone(), policy, self.event_tx.clone()) {
+        // `0` means the user turned the check off; `None` is how that reaches
+        // the driver, which then has no probe branch to select on.
+        let secs = self.cfg.defaults.health_check_secs;
+        let health_check = (secs > 0).then(|| std::time::Duration::from_secs(secs));
+        match self.supervisor.spawn(cfg.clone(), policy, health_check, self.event_tx.clone()) {
             Ok(()) => {
                 self.set_status(StatusMsg::info(help::bi(
                     &format!("{} 正在连接…", cfg.name),

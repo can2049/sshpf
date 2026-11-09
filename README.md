@@ -51,6 +51,7 @@ SSH 端口转发管理器，命令行 TUI 表格界面。Linux 与 Windows 均�
 | 转发定义 | 由 sshpf 自己管理，**从不写** `~/.ssh/config` |
 | 状态可见 | 每条转发实时显示状态符号 + 失败原因短句，详情页有完整日志 |
 | 自动重连 | 网络类失败指数退避（2s→…→30s），配置类失败直接停下并说明原因 |
+| 定时连通性检测 | 每 30s 主动探活，休眠/断网后半开连接被发现并自动重连 |
 | 导入 | 主机在 `~/.ssh/config` 里声明的转发可直接导入，默认全勾 |
 | 风险控制 | 破坏性/有副作用的操作一律先弹确认框 |
 | 双语 | 界面文案、帮助浮层、`--help` 全部中英并列 |
@@ -228,6 +229,7 @@ restore_on_start = true   # 启动时恢复 enabled = true 的条目
 auto_restart = true       # 网络类失败自动退避重连（2s→4s→…→30s）
 retry_initial_secs = 2
 retry_max_secs = 30
+health_check_secs = 30    # 每 30s 主动探活一次；0 = 关闭
 
 [[tunnels]]
 id = 1
@@ -244,7 +246,7 @@ ssh_options = []          # 额外 ssh -o 选项，如 ["Compression=yes"]
 note = ""
 ```
 
-**不存任何密码或密钥口令。** `retry_initial_secs` / `retry_max_secs` 越界会被钳制到 `[1s, 24h]` 并记 `config.defaults_clamped`（`0` 会变成每帧重连，所以不能照做）。
+**不存任何密码或密钥口令。** `retry_initial_secs` / `retry_max_secs` 越界会被钳制到 `[1s, 24h]` 并记 `config.defaults_clamped`（`0` 会变成每帧重连，所以不能照做）。`health_check_secs` 同样记 `config.defaults_clamped`：`0` 保持不变（**0 = 关闭探活**），`1..=4` 抬到 `5`（低于 5s 的探活会把网络抖动放大成一串探活），超过 24h 压到 24h（唤醒后的机器已经坏了好几个小时，再长就问不出答案了）。
 
 ## 环境变量 / Environment
 
@@ -271,6 +273,7 @@ tail -f ~/.local/state/sshpf/logs/sshpf.log   # 实时看结构化日志
 | 认证失败 | 先手动 `ssh <主机>` 确认能免密登录，或 `ssh-add` 加载密钥 |
 | 端口被占用 | 详情页会显示占用进程的 `pid/进程名` |
 | 某条一直 `◌ 重试` | 网络类失败在退避；`grep 'event=tunnel.retry_scheduled'` 看排了几次，`tunnel.retry_abandoned` 表示已放弃 |
+| 显示 `● 已连通` 但端口不通 / 电脑休眠唤醒后不工作 | SSH 半开连接：先 `grep 'event=tunnel.health_failed'` 看 `cause`（`ping_timeout`/`ping_error`/`session_closed`），确认探活是否开着（`health_check_secs=0` 即人为关闭）；探活成功不写日志，所以**没有这条事件不等于探活没跑** |
 | 界面某块不见了 | `grep 'event=ui.render_degraded'`——渲染层主动跳过的块会留一条记录 |
 | 进程崩了 / 卡死 | `grep -E 'event=crash\.|tunnel.thread_panic'`，判据见下 |
 

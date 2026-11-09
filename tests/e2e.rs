@@ -22,7 +22,8 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use sshpf::app::App;
@@ -81,6 +82,30 @@ impl TestSshd {
         self.dir.path().join("user_key")
     }
 
+    /// Route the SSH *session* through `port` instead of the sshd directly.
+    ///
+    /// The health check probes the session, not the forwarded target, so a test
+    /// that wants to break the session has to sit in its path. `~/.ssh/config`
+    /// is what pins the endpoint port (`remote_port` is the target *inside* the
+    /// tunnel), so this is the file to rewrite. `accept-new` then learns the
+    /// relay's endpoint as a separate host entry, which is harmless here.
+    fn route_through(&self, port: u16) -> bool {
+        let Ok(text) = std::fs::read_to_string(self.ssh_config()) else {
+            return false;
+        };
+        let mut out = String::with_capacity(text.len());
+        for line in text.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("Port ") {
+                out.push_str(&format!("  Port {port}\n"));
+            } else {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        std::fs::write(self.ssh_config(), out).is_ok()
+    }
+
     /// Point the process-global overrides at this fixture.
     ///
     /// SAFETY: every caller holds `env_lock()`, and Rust 2024 requires these to
@@ -89,6 +114,115 @@ impl TestSshd {
         unsafe {
             std::env::set_var("SSHPF_KNOWN_HOSTS", self.known_hosts());
             std::env::set_var("SSHPF_SSH_CONFIG", self.ssh_config());
+        }
+    }
+}
+
+/// A TCP relay in front of the sshd whose behaviour the test controls.
+///
+/// This is how "the peer stopped answering" is simulated without signals: the
+/// relay owns both sockets, so it can hold them open while forwarding nothing
+/// ([`RelayMode::Blackhole`]) — precisely a slept machine, whose TCP connection
+/// stays established and whose packets go nowhere — or close them
+/// ([`RelayMode::Close`]) — a peer that went away.
+///
+/// Signals were tried first and rejected: `sshd` forks per session and rewrites
+/// its process title, so neither the pid file nor `pkill -f <config>` reliably
+/// reaches the child that serves our tunnel. A relay is exact, synchronous and
+/// needs no privileges.
+struct Relay {
+    port: u16,
+    mode: Arc<AtomicU8>,
+}
+
+/// Forward traffic; then the two failure shapes the probe must tell apart.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RelayMode {
+    /// Normal operation: bytes cross in both directions.
+    Forward,
+    /// Keep both sockets open, drop everything: a black-holed link.
+    Blackhole,
+    /// Close both sockets: the peer went away.
+    Close,
+}
+
+impl RelayMode {
+    fn code(self) -> u8 {
+        match self {
+            RelayMode::Forward => 0,
+            RelayMode::Blackhole => 1,
+            RelayMode::Close => 2,
+        }
+    }
+}
+
+impl Relay {
+    fn start(target: u16) -> Option<Relay> {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).ok()?;
+        let port = listener.local_addr().ok()?.port();
+        let mode = Arc::new(AtomicU8::new(RelayMode::Forward.code()));
+        let mode_for_thread = mode.clone();
+        std::thread::spawn(move || {
+            for inbound in listener.incoming().flatten() {
+                let mode = mode_for_thread.clone();
+                std::thread::spawn(move || {
+                    let Ok(outbound) = TcpStream::connect(("127.0.0.1", target)) else {
+                        return;
+                    };
+                    let Ok(inbound2) = inbound.try_clone() else {
+                        return;
+                    };
+                    let Ok(outbound2) = outbound.try_clone() else {
+                        return;
+                    };
+                    let a = mode.clone();
+                    let b = mode;
+                    std::thread::spawn(move || pump(inbound2, outbound, a));
+                    pump(outbound2, inbound, b);
+                });
+            }
+        });
+        Some(Relay { port, mode })
+    }
+
+    fn set(&self, mode: RelayMode) {
+        self.mode.store(mode.code(), Ordering::SeqCst);
+    }
+}
+
+/// Relay one direction, obeying the current mode.
+///
+/// Reads are polled rather than blocked so a mode change takes effect within one
+/// read timeout even while the sockets are idle — which is the state a sleeping
+/// peer leaves them in.
+fn pump(mut from: TcpStream, mut to: TcpStream, mode: Arc<AtomicU8>) {
+    let _ = from.set_read_timeout(Some(Duration::from_millis(50)));
+    let mut buf = [0u8; 8192];
+    loop {
+        match mode.load(Ordering::SeqCst) {
+            m if m == RelayMode::Close.code() => {
+                // Closing both ends is what the client sees when a peer vanishes.
+                let _ = from.shutdown(std::net::Shutdown::Both);
+                let _ = to.shutdown(std::net::Shutdown::Both);
+                return;
+            }
+            m if m == RelayMode::Blackhole.code() => {
+                // Drain and drop: the sender's writes still succeed, so nothing
+                // upstream can tell the difference from a slow link.
+                let _ = from.read(&mut buf);
+                continue;
+            }
+            _ => {}
+        }
+        match from.read(&mut buf) {
+            Ok(0) => return,
+            Ok(n) => {
+                if to.write_all(&buf[..n]).is_err() {
+                    return;
+                }
+            }
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => continue,
+            Err(_) => return,
         }
     }
 }
@@ -186,6 +320,16 @@ fn start_sshd() -> Option<TestSshd> {
         std::thread::sleep(Duration::from_millis(50));
     }
     None
+}
+
+/// [`app_with`] with an explicit health-check interval, so the probe can be
+/// exercised without waiting the 30 s default.
+fn app_with_health(dir: &Path, tunnels: Vec<TunnelConfig>, health_check_secs: u64) -> App {
+    let paths = Paths { config: dir.join("config.toml"), state: dir.join("state.toml") };
+    let mut cfg = config::ConfigFile { tunnels, ..Default::default() };
+    cfg.defaults.health_check_secs = health_check_secs;
+    config::save(&paths.config, &cfg).unwrap();
+    App::new(paths)
 }
 
 fn app_with(dir: &Path, tunnels: Vec<TunnelConfig>) -> App {
@@ -605,6 +749,156 @@ fn unresolvable_host_fails_without_hanging() {
         std::env::remove_var("SSHPF_SSH_CONFIG");
         std::env::remove_var("SSHPF_KNOWN_HOSTS");
     }
+}
+
+// ---------------------------------------------------------------------------
+// periodic health checks (sleep/resume, half-open connections)
+// ---------------------------------------------------------------------------
+
+/// A healthy tunnel must stay `Up` across several probe intervals.
+///
+/// This is the guard against killing working sessions: a stock `sshd` answers
+/// `keepalive@openssh.com` with `REQUEST_FAILURE`, which `russh` surfaces as
+/// `Err(RequestDenied)`. Treating that "no" as a death certificate would tear
+/// down every perfectly good tunnel once per interval, so the probe counts any
+/// *answer* as alive.
+#[test]
+#[ignore = "needs a working sshd"]
+fn a_healthy_tunnel_survives_repeated_health_checks() {
+    let _guard = env_lock();
+    let Some(sshd) = start_sshd() else { return };
+    sshd.activate();
+
+    let mut t = tunnel(1, "healthy", free_port(), "testhost");
+    t.remote_port = sshd.port;
+    t.auto_restart = false;
+
+    let dir = tempfile::tempdir().unwrap();
+    // The five-second minimum, so two probes land inside the wait below.
+    let mut app = app_with_health(dir.path(), vec![t], sshpf::config::MIN_HEALTH_CHECK_SECS);
+    app.start_tunnel(1);
+    assert!(
+        wait_for(&mut app, 30, |a| matches!(status_of(a, 1), TunnelStatus::Up { .. })),
+        "tunnel never came up: {:?}",
+        status_of(&app, 1)
+    );
+
+    // Two full intervals plus the probe timeout: at least one probe has been
+    // sent and answered by now.
+    std::thread::sleep(Duration::from_secs(2 * sshpf::config::MIN_HEALTH_CHECK_SECS + 2));
+    app.drain_events();
+    assert!(
+        matches!(status_of(&app, 1), TunnelStatus::Up { .. }),
+        "a healthy tunnel must not be failed by its own health check: {:?}",
+        status_of(&app, 1)
+    );
+
+    let local = app.tunnels[0].cfg.local_port;
+    let mut conn = TcpStream::connect(("127.0.0.1", local)).expect("the forward must still work");
+    conn.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut buf = [0u8; 64];
+    let n = conn.read(&mut buf).expect("read through the tunnel after the probes");
+    assert!(String::from_utf8_lossy(&buf[..n]).starts_with("SSH-2.0-"), "a probed tunnel must still forward");
+}
+
+/// The case this feature exists for: the SSH session dies while the local
+/// listener keeps accepting. Without the probe the row would stay `●` forever.
+///
+/// The relay fronting the sshd simply closes its sockets, which is what a peer
+/// that went away looks like to us. What must NOT happen is the old behaviour:
+/// the local listener keeps `accept`ing, so nothing surfaces the loss on its
+/// own.
+#[test]
+#[ignore = "needs a working sshd"]
+fn a_dead_session_behind_a_live_listener_is_detected() {
+    let _guard = env_lock();
+    let Some(sshd) = start_sshd() else { return };
+    sshd.activate();
+    let Some(relay) = Relay::start(sshd.port) else { return };
+    assert!(sshd.route_through(relay.port), "could not route the session through the relay");
+
+    let local = free_port();
+    let mut t = tunnel(1, "zombie", local, "testhost");
+    t.remote_port = sshd.port;
+    // No automatic retry, so the final state is readable instead of flapping.
+    t.auto_restart = false;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with_health(dir.path(), vec![t], sshpf::config::MIN_HEALTH_CHECK_SECS);
+    app.cfg.defaults.auto_restart = false;
+    app.start_tunnel(1);
+    assert!(
+        wait_for(&mut app, 30, |a| matches!(status_of(a, 1), TunnelStatus::Up { .. })),
+        "tunnel never came up: {:?}",
+        status_of(&app, 1)
+    );
+
+    // The peer vanishes; the local listener stays bound and keeps accepting, so
+    // the app has no way to learn this passively — that is the bug's shape.
+    relay.set(RelayMode::Close);
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(TcpStream::connect(("127.0.0.1", local)).is_ok(), "the listener is still bound (this is the bug's shape)");
+
+    assert!(
+        wait_for(&mut app, 40, |a| !matches!(status_of(a, 1), TunnelStatus::Up { .. })),
+        "a dead session must not stay Up: {:?}",
+        status_of(&app, 1)
+    );
+    match status_of(&app, 1) {
+        TunnelStatus::Failed { reason } => assert_eq!(
+            reason.kind,
+            FailureKind::StaleConnection,
+            "a lost session is a stale connection, not a generic failure: {reason:?}"
+        ),
+        // With `auto_restart` on, the retry path carries the same reason.
+        TunnelStatus::Retrying { reason, .. } => assert_eq!(reason.kind, FailureKind::StaleConnection, "{reason:?}"),
+        other => panic!("expected Failed/Retrying after a lost session, got {other:?}"),
+    }
+}
+
+/// The exact sleep/resume scenario: the peer stops answering but its socket
+/// stays open, so only a probe that *waits* can tell the session is gone.
+///
+/// A `Timeout`-classified failure would mean the probe never ran and the run
+/// died through some other path; `stale_connection` is the proof that the
+/// keepalive reply is what went missing.
+#[test]
+#[ignore = "needs a working sshd"]
+fn a_half_open_session_is_detected_by_the_probe_timeout() {
+    let _guard = env_lock();
+    let Some(sshd) = start_sshd() else { return };
+    sshd.activate();
+    let Some(relay) = Relay::start(sshd.port) else { return };
+    assert!(sshd.route_through(relay.port), "could not route the session through the relay");
+
+    let mut t = tunnel(1, "asleep", free_port(), "testhost");
+    t.remote_port = sshd.port;
+    t.auto_restart = false;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with_health(dir.path(), vec![t], sshpf::config::MIN_HEALTH_CHECK_SECS);
+    app.cfg.defaults.auto_restart = false;
+    app.start_tunnel(1);
+    assert!(
+        wait_for(&mut app, 30, |a| matches!(status_of(a, 1), TunnelStatus::Up { .. })),
+        "tunnel never came up: {:?}",
+        status_of(&app, 1)
+    );
+
+    // Black-hole the link: the TCP connection is not closed, the peer just never
+    // replies — a sleeping machine, not a crashed one.
+    relay.set(RelayMode::Blackhole);
+
+    let detected = wait_for(&mut app, 40, |a| {
+        matches!(status_of(a, 1), TunnelStatus::Failed { .. } | TunnelStatus::Retrying { .. })
+    });
+    assert!(detected, "a paused peer must be detected as a stale session: {:?}", status_of(&app, 1));
+    let reason = match status_of(&app, 1) {
+        TunnelStatus::Failed { reason } => reason.clone(),
+        TunnelStatus::Retrying { reason, .. } => reason.clone(),
+        other => panic!("expected Failed/Retrying, got {other:?}"),
+    };
+    assert_eq!(reason.kind, FailureKind::StaleConnection, "{reason:?}");
 }
 
 // ---------------------------------------------------------------------------
