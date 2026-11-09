@@ -39,6 +39,7 @@ mod import;
 mod r#match;
 mod msg;
 mod picker;
+mod portscan;
 mod status;
 mod tunnel;
 
@@ -59,5 +60,9 @@ pub use import::{
 pub use r#match::fuzzy_match;
 pub use msg::{StatusMsg, now_hms, now_unix};
 pub use picker::HostPicker;
+pub use portscan::{
+    PORT_ROWS_VISIBLE, PortPick, PortRow, PortScanState, RemotePort, declared_ports, filter_declared,
+    parse_listen_ports,
+};
 pub use status::{LogLevel, LogLine, LogRing, TunnelStatus, TunnelView};
 pub use tunnel::{ForwardKind, TunnelConfig};

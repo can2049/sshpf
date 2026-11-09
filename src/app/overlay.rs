@@ -47,5 +47,9 @@ impl App {
         self.overlay = Overlay::None;
         self.form = None;
         self.picker = None;
+        // The port list belongs to the form: leaving it behind would let a later
+        // form (for another host) show stale rows.
+        self.ports = None;
+        self.port_rx = None;
     }
 }

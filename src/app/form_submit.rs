@@ -49,6 +49,26 @@ impl App {
             return;
         }
 
+        // The port list is the other batch source: while it is on screen with
+        // rows ticked, saving means "one tunnel per ticked port". It is checked
+        // after the import pane because the two cannot both be open (opening one
+        // closes the other), and only while *visible* — a user who collapsed it
+        // to type by hand must get the single tunnel they are looking at.
+        if self.port_batch_intent() {
+            let configs = self.validated_port_batch();
+            match configs {
+                Some(configs) if !configs.is_empty() => self.commit_port_batch(configs),
+                Some(_) | None => {
+                    if self.form.as_ref().is_some_and(|f| f.errors.is_empty())
+                        && let Some(f) = self.form.as_mut()
+                    {
+                        f.errors = vec![help::bi("没有勾选任何端口", "No port is ticked")];
+                    }
+                }
+            }
+            return;
+        }
+
         let Some(cfg) = self.validated_form_config() else {
             return;
         };

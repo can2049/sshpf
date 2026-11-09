@@ -70,6 +70,8 @@
 | `src/app/form.rs` | 表单**状态** + 校验（纯状态机，不 spawn、不落盘） | `app`、`keys::form` | 表单字段与校验规则 |
 | `src/app/form_submit.rs` | 表单**提交**：校验 → 持久化 → supervisor（create 直接保存，edit 确认后重建） | `keys`、`app` | 提交顺序与副作用 |
 | `src/app/import.rs` | 导入的**提交**半边：发现主机转发、批量校验、`config_from_forward`、建隧道 | `app` | 导入语义与校验 |
+| `src/app/port_scan.rs` | 对端端口扫描的**交互**半边：`p` 打开、扫描线程/代次、光标与勾选 | `keys::ports`、`app` | 扫描状态与面板交互 |
+| `src/app/port_batch.rs` | 对端端口批量的**提交**半边：勾选端口 → 每条一条 `-L` 隧道（全有或全无） | `app::form_submit` | 批量提交语义与命名 |
 | `src/app/confirm.rs` | 确认闸：`ask_confirm`、文案、`apply` | `app`、`keys::misc` | 新受保护操作 → `ConfirmAction` 一个变体 |
 | `src/app/select.rs` | 多选模式：标记集合、批量派发 | `app`、`keys::select` | 新批量动作 → `BatchAction` |
 | `src/app/mouse.rs` | 鼠标：查 `HitMap` → 调与键盘同一批 `App` 方法 | `main` | 新的可点语义 |
@@ -111,6 +113,7 @@
 | `src/ui/detail.rs` | 详情 + 完整日志 |
 | `src/ui/filter.rs` | 过滤输入行 |
 | `src/ui/import.rs` | 导入面板根 + `draw_pane` + `draw_empty` |
+| `src/ui/ports.rs` | 对端监听端口面板（扫描中/失败/空/行列表 + 页脚键位） |
 | `src/ui/import/body.rs` | 行渲染、滚动窗口 |
 | `src/ui/import/header.rs` | 列头、chips、按钮 |
 | `src/ui/import/footer.rs` | 页脚：勾选统计、hint 打包折行 |
@@ -137,6 +140,8 @@
 | `src/ssh/client/auth.rs` | `Auth`、`load_auth`、`connect_agent`、`expand_path`、`authenticate` |
 | `src/ssh/client/connect.rs` | `timeout_connect`、`session()`、`connect()`（含 `ProxyJump` 链） |
 | `src/ssh/client/driver.rs` | `serve_local` / `serve_remote` / `serve_dynamic` |
+| `src/ssh/probe.rs` | 对端端口探测：`list_command`、`interpret`、`scan_listen_ports`、`ScanOutcome` |
+| `src/ssh/client/probe.rs` | 走隧道同一条 SSH 路径执行命令并取回 stdout |
 
 ### 叶子层 / Leaves
 
@@ -148,6 +153,9 @@
 | `src/model/import/row.rs` | `ImportColumn`、`ImportRow`（一行怎么显示、怎么勾） | 可筛选列 / 每行标志 |
 | `src/model/import/table.rs` | `ImportTable`：候选行、光标、滚动、选中 | 行与选中状态 |
 | `src/model/import/filter.rs` | `ImportTable` 的逐列筛选 + 撤销栈 | 筛选/撤销行为 |
+| `src/model/portscan.rs` | `RemotePort`、`PortRow`、`PortPick`、`PortScanState` | 对端端口与选择器状态 |
+| `src/model/portscan/parse.rs` | `ss` / `netstat` 文本 → `RemotePort`（不可信输入） | 端口解析规则 |
+| `src/model/portscan/declared.rs` | `declared_ports` / `filter_declared`：排除 ssh config 已列出的端口 | 端口去重规则 |
 | `src/model/fixtures.rs` | `#[cfg(test)]` 专用共享夹具（不进 release） | 测试夹具 |
 | `src/model/batch.rs` | `MultiSelect`、`BatchAction` | 批量动作 |
 | `src/model/failure.rs` | `FailureKind`、`FailureInfo` | 新失败分类（同步 `kind()`/`short()`/`displays`） |

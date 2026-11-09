@@ -24,6 +24,7 @@
 //! | [`auth`] | credential loading (IdentityFile / ssh-agent) and `authenticate` |
 //! | [`connect`] | TCP connect with deadline, `session()`, the `ProxyJump` chain |
 //! | [`driver`] | `serve_local` / `serve_remote` / `serve_dynamic` |
+//! | [`probe`] | run one command on the host and capture its stdout (port scan) |
 //!
 //! The public entry point is [`run`]; [`Options`] and [`classify`] are
 //! re-exported so `crate::ssh::client::{run, classify, Options}` keeps working.
@@ -48,6 +49,7 @@ mod classify;
 mod connect;
 mod driver;
 mod handler;
+pub mod probe;
 
 pub use classify::classify;
 pub use connect::Options;

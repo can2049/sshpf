@@ -10,6 +10,7 @@
 //! ```text
 //! config       ~/.ssh/config → hosts + effective endpoints (ssh2-config)
 //! forwards     ~/.ssh/config → LocalForward/RemoteForward/DynamicForward rows
+//! probe        ask the peer which ports are listening (the remote-port picker)
 //! known_hosts  server key verification (self-written; russh's has holes)
 //! socks5       SOCKS5 server for -D
 //! client       connect/auth/ProxyJump + the -L/-R/-D drivers (russh)
@@ -25,6 +26,7 @@
 //!
 //! known_hosts::{verify, learn, HostKeyVerdict, HostKeyPolicy}
 //! client::{run, classify, Options}
+//! probe::{scan_listen_ports, list_command, interpret, ScanOutcome}
 //!
 //! fn port_available(addr, port) -> bool
 //! fn suggest_free_port(addr, start) -> Option<u16>
@@ -45,6 +47,7 @@ pub mod config;
 pub mod forwards;
 pub mod hostkey_conf;
 pub mod known_hosts;
+pub mod probe;
 pub mod socks5;
 
 pub use client::{Options, classify};

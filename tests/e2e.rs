@@ -738,3 +738,114 @@ fn tunnel_lifecycle_is_written_to_the_log_file() {
     // makes the file enough to reconstruct a session without the TUI.
     assert!(log.contains("event=tunnel.line"), "progress lines missing:\n{log}");
 }
+
+// ---------------------------------------------------------------------------
+// remote-port picker: probing the peer for listening ports
+// ---------------------------------------------------------------------------
+
+/// The peer scan must find a port that really is listening, over the same SSH
+/// path a tunnel uses.
+///
+/// This is the end-to-end proof of the feature: the unit tests cover the parser
+/// and the picker state, but only a real `ss`/`netstat` on a real host proves the
+/// command, the channel plumbing and the ssh-config/`ProxyJump` reuse are right.
+#[test]
+#[ignore = "needs a working sshd"]
+fn the_port_scan_finds_a_listening_service() {
+    let _guard = env_lock();
+    let Some(sshd) = start_sshd() else { return };
+    sshd.activate();
+
+    // A service on a port we chose, so the assertion cannot be satisfied by
+    // whatever else the machine happens to listen on.
+    let service = TcpListener::bind(("127.0.0.1", 0)).expect("bind a service to find");
+    let service_port = service.local_addr().unwrap().port();
+    // Keep it alive for the duration of the scan.
+    std::thread::spawn(move || for _ in service.incoming() {});
+
+    let outcome = tokio_scan("testhost");
+    let ports: Vec<u16> = outcome.iter().map(|p| p.port).collect();
+    assert!(ports.contains(&service_port), "the scan must report {service_port}: {ports:?}");
+    assert!(ports.contains(&sshd.port), "the sshd's own listener must be listed: {ports:?}");
+}
+
+/// A host with neither `ss` nor `netstat` must be distinguishable from a host with
+/// nothing listening — the two answers lead a user in opposite directions.
+#[test]
+#[ignore = "needs a working sshd"]
+fn a_peer_without_a_tool_is_reported_not_shown_as_empty() {
+    // Pure assertion on the interpreter: the sshd fixture cannot uninstall `ss`
+    // from the machine, and this is the exact string the remote side prints.
+    let outcome = sshpf::ssh::probe::interpret(&format!("{}\n", sshpf::ssh::probe::NO_TOOL_SENTINEL));
+    assert_eq!(outcome, sshpf::ssh::probe::ScanOutcome::NoTool);
+    assert_eq!(sshpf::ssh::probe::interpret(""), sshpf::ssh::probe::ScanOutcome::Found(Vec::new()));
+}
+
+/// The same scan through the `App`: `p` on the remote-port field fills the pane.
+#[test]
+#[ignore = "needs a working sshd"]
+fn the_port_picker_is_populated_through_the_app() {
+    let _guard = env_lock();
+    let Some(sshd) = start_sshd() else { return };
+    sshd.activate();
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with(dir.path(), vec![]);
+    app.open_form_create();
+    app.form.as_mut().unwrap().ssh_host.set("testhost");
+    app.open_port_picker();
+    assert!(app.port_picker_open(), "the pane opens immediately, showing the scan is running");
+
+    let found = wait_for_port_rows(&mut app, 30);
+    assert!(found, "the scan never produced rows; state: {:?}", app.ports.as_ref().map(|p| p.state.clone()));
+    let ports: Vec<u16> = app.ports.as_ref().unwrap().rows.iter().map(|r| r.port.port).collect();
+    assert!(ports.contains(&sshd.port), "the sshd's listener must be offered: {ports:?}");
+    assert_eq!(app.ports.as_ref().unwrap().checked_count(), 0, "nothing is ticked until the user ticks it");
+}
+
+/// `enter` on a row writes the port into the form field.
+#[test]
+#[ignore = "needs a working sshd"]
+fn accepting_a_scanned_port_fills_the_field() {
+    let _guard = env_lock();
+    let Some(sshd) = start_sshd() else { return };
+    sshd.activate();
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with(dir.path(), vec![]);
+    app.open_form_create();
+    app.form.as_mut().unwrap().ssh_host.set("testhost");
+    app.open_port_picker();
+    assert!(wait_for_port_rows(&mut app, 30), "no rows to accept");
+
+    // Put the cursor on the sshd's own port so the assertion is deterministic.
+    let pick = app.ports.as_mut().unwrap();
+    if let Some(i) = pick.rows.iter().position(|r| r.port.port == sshd.port) {
+        pick.cursor = i;
+    }
+    let expected = app.ports.as_ref().unwrap().cursor_row().unwrap().port.port;
+    app.port_accept_cursor();
+    assert_eq!(app.form.as_ref().unwrap().remote_port.value(), expected.to_string());
+    assert!(!app.port_picker_open(), "accepting collapses the list");
+    // The local port is *suggested* from the port just picked. It is not always
+    // the same number: this fixture's sshd holds its own port on loopback, so
+    // `plan_local_port` walks upwards to the next free one. Either is right; what
+    // would be wrong is an empty field or a port that did not come from the pick.
+    let local: u16 = app.form.as_ref().unwrap().local_port.value().parse().expect("a local port is suggested");
+    assert!(local >= expected, "the suggestion must not go below the picked port: {local} < {expected}");
+    assert!(local - expected <= 200, "the suggestion must stay near the picked port, got {local} for {expected}");
+}
+
+/// Scan `ssh_host` on a private runtime and return the ports it reported.
+fn tokio_scan(ssh_host: &str) -> Vec<sshpf::model::RemotePort> {
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+    let outcome = rt
+        .block_on(sshpf::ssh::probe::scan_listen_ports(ssh_host, sshpf::ssh::known_hosts::HostKeyPolicy::AcceptNew))
+        .expect("the scan should succeed against a live sshd");
+    outcome.ports().to_vec()
+}
+
+/// Poll the app until the port scan has produced rows (or failed).
+fn wait_for_port_rows(app: &mut App, secs: u64) -> bool {
+    wait_for(app, secs, |a| a.ports.as_ref().is_some_and(|p| !p.is_empty() || p.state.is_failed()))
+}

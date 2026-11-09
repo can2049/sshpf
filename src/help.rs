@@ -18,6 +18,7 @@
 //! | [`main`] | `Main`, `Selection` | the key works on the dashboard or in `v` mode |
 //! | [`form`] | `Form`, `FormEditing`, `HostPicker` | the key works in the create/edit form or its host dropdown |
 //! | [`import`] | `ImportPane`, `ImportFilter` | the key works in the `~/.ssh/config` import pane |
+//! | [`ports`] | `PortPicker` | the key works in the peer's listening-port list (`p`) |
 //! | [`dialogs`] | `Confirm`, `Detail`, `FilterBar`, `HelpOverlay` | the key works in a modal |
 //! | [`notes`] | `Mouse`, `Status`, `Safety` | it is prose about gestures, glyphs or the safety rules |
 //!
@@ -45,6 +46,7 @@ pub mod form;
 pub mod import;
 pub mod main;
 pub mod notes;
+pub mod ports;
 
 /// navigable and lets the coverage test map a dispatch function to exactly one
 /// section.
@@ -64,6 +66,8 @@ pub enum SectionId {
     ImportPane,
     /// A column filter of the import pane being typed into.
     ImportFilter,
+    /// The peer's listening-port list (`p` on the 远端端口 field).
+    PortPicker,
     /// Confirmation dialog.
     Confirm,
     /// Detail/log overlay.
@@ -82,12 +86,13 @@ pub enum SectionId {
 
 impl SectionId {
     /// Sections in display order inside the overlay.
-    pub const ALL: [SectionId; 14] = [
+    pub const ALL: [SectionId; 15] = [
         SectionId::Main,
         SectionId::Selection,
         SectionId::Form,
         SectionId::FormEditing,
         SectionId::HostPicker,
+        SectionId::PortPicker,
         SectionId::ImportPane,
         SectionId::ImportFilter,
         SectionId::Confirm,
@@ -109,6 +114,7 @@ impl SectionId {
             SectionId::HostPicker => "host_picker",
             SectionId::ImportPane => "import_pane",
             SectionId::ImportFilter => "import_filter",
+            SectionId::PortPicker => "port_picker",
             SectionId::Confirm => "confirm",
             SectionId::Detail => "detail",
             SectionId::FilterBar => "filter_bar",
@@ -170,6 +176,7 @@ pub const SECTIONS: &[HelpSection] = &[
     form::FORM,
     form::FORM_EDITING,
     form::HOST_PICKER,
+    ports::PORT_PICKER,
     import::IMPORT_PANE,
     import::IMPORT_FILTER,
     dialogs::CONFIRM,
@@ -256,7 +263,7 @@ mod tests {
 
     /// The catalog's order *is* the overlay's order, and every id must be
     /// reachable exactly once. This is the assertion that lets [`section`] fall
-    /// back instead of panicking: with 14 unique ids and a 14-row table, the
+    /// back instead of panicking: with 15 unique ids and a 15-row table, the
     /// lookup can never miss.
     #[test]
     fn sections_are_listed_in_order_and_each_appears_once() {

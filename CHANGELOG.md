@@ -3,6 +3,38 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.4.1] - 2026-11-09
+
+本次是 patch 版本：把「新建 / 编辑转发」里最靠记忆的一步——填远端端口——变成可以
+直接从对端正在监听的端口里挑。无新增依赖、无配置格式变化。
+
+### 新增
+
+- **远端端口可以直接从对端监听端口里选**。把光标放在表单的 `远端端口` 上按 `p`，
+  sshpf 会通过**隧道同一条 SSH 路径**（同样的 `~/.ssh/config` endpoint、`ProxyJump` 链、
+  `IdentityFile`/ssh-agent 认证与主机密钥策略）在对端执行 `ss -ltnH`（没有则
+  `netstat -ltn`），把正在监听的端口列成面板：
+  - `enter` 把光标行的端口填进字段（本地端口随之重新推荐），列表收起；
+  - `space` 勾选多个后用 `ctrl+s` 保存，**每个勾选端口创建一条 `-L` 转发**，
+    整批先校验、全过才写（不会出现"建了三条例、第四条报错"的半成品状态）；
+  - `a` / `U` / `I` 全选 / 清空 / 反选，`r` 重扫，`esc` / `i` 收起。
+
+  设计上的几条取舍：勾选**默认全空**（发现一个服务不等于要转发它，一次按键不该开出多个
+  监听）；`~/.ssh/config` 已为该主机声明过的端口**不重复列出**（它们已由导入面板提供，
+  面板上写明隐藏了几个）；`-R` 下列表是**只读**的（那里的端口已被占用，选一个必然
+  在建立远程转发时撞车）；对端既没有 `ss` 也没有 `netstat` 时明确报告，而不是显示成
+  "没有监听"；命令是写死的固定文本，不插入主机名或任何用户输入。扫描在独立线程 +
+  `current_thread` runtime 上跑，带代次号，换主机或重扫时旧结果被丢弃。
+
+### 变更
+
+- 帮助目录新增 `对端端口` 分区（`SectionId::PortPicker`），表单分区补 `p` 一行；
+  `docs/keymap.md`、`docs/import-forwards.md`、`docs/tui.md`、`docs/architecture.md`、
+  `docs/index.md`、`docs/logging/events.md` 同步更新。
+- 新增日志事件 `portscan.started` / `portscan.finished` / `portscan.failed`（它另外开一条
+  SSH 连接，需要给对端的认证日志一个本地解释），以及 `portscan.stale` / `portscan.dropped` /
+  `portscan.batch_rejected`。
+
 ## [0.4.0] - 2026-11-09
 
 本次是 minor 版本：新增主机密钥变更的忽略能力。默认行为不变（密钥变了仍然拒绝），

@@ -37,6 +37,7 @@ pub(super) const FORM: HelpSection = HelpSection {
             "Cycle Type, toggle auto-restart, toggle the import pane on SSH host",
         ),
         HelpItem::new("i", "SSH 主机字段：展开 / 收起导入面板", "On SSH host: toggle the import pane"),
+        HelpItem::new("p", "远端端口字段：扫描对端正在监听的端口", "On Remote port: list the peer's listening ports"),
         HelpItem::new("f2 / ctrl+h / ctrl+o", "SSH 主机字段：打开主机下拉", "On SSH host: open the host list"),
         HelpItem::new(
             "ctrl+s / f10",

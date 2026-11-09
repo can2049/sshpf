@@ -2,8 +2,8 @@
 //!
 //! [`super::main::handle_main_key`] never reaches here; the form is
 //! `Overlay::Form`, so [`handle_form_key`] is the entry point. It first offers
-//! the key to the host dropdown and the import pane — each only claims what it
-//! really owns — then dispatches on the two stages:
+//! the key to the host dropdown, the peer port list and the import pane — each
+//! only claims what it really owns — then dispatches on the two stages:
 //!
 //! * not editing → [`handle_field_navigating`] (arrows move the highlight,
 //!   `enter` commits to editing, enum fields cycle);
@@ -16,6 +16,7 @@
 
 use super::dropdown::handle_dropdown_key;
 use super::import::handle_import_key;
+use super::ports::handle_port_key;
 use crate::app::App;
 use crate::model::FormField;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -26,15 +27,31 @@ pub(super) fn handle_form_key(app: &mut App, key: KeyEvent) {
     if app.host_picker_open() && handle_dropdown_key(app, key) {
         return;
     }
-    // The import pane owns its row/filter keys, but *not* while a text field is
-    // being edited: the pane is open by default as soon as a host is committed,
-    // and `j`/`a`/`i` are ordinary letters in a tunnel name. Without this guard,
-    // typing `api` into 名称 would tick every row (`a`), leave the letters that
-    // are not bindings, and close the pane (`i`).
+    // The peer port list comes *before* the import pane on purpose. The two can
+    // never be open together (`App::open_port_picker` collapses the import pane,
+    // and opening the pane means the user is on the SSH HOST field), so the order
+    // is not load-bearing — but it is written down rather than left to accident:
+    // the list the user most recently asked for is the one whose keys win.
+    //
+    // Neither pane claims a key while a text field is being edited: `j`/`a`/`i`
+    // are ordinary letters in a tunnel name. Without this guard, typing `api`
+    // into 名称 would tick every row (`a`) and close the pane (`i`).
+    if !app.form.as_ref().is_some_and(|f| f.is_editing_field()) && app.port_picker_open() && handle_port_key(app, key) {
+        return;
+    }
+    // The import pane owns its row/filter keys with the same "not while typing"
+    // guard, and the same reason.
     if !app.form.as_ref().is_some_and(|f| f.is_editing_field()) && app.import_pane_open() && handle_import_key(app, key)
     {
         return;
     }
+
+    // Whatever the key was — claimed above or not — a host or kind change made in
+    // the previous frame may have left a port list that belongs to a host the
+    // form no longer holds. One cheap string compare per press (the function
+    // returns immediately when no list is open) is what keeps "these rows are the
+    // host I am looking at" true without a callback in every editing path.
+    app.sync_port_picker();
 
     // The form has two stages with different key semantics; dispatch on stage.
     if app.form.as_ref().is_some_and(|f| f.is_editing_field()) {
@@ -225,6 +242,15 @@ fn adjust_field(app: &mut App, field: FormField, key: KeyEvent) {
             KeyCode::Char(' ') | KeyCode::Char('i') => app.toggle_import_pane(),
             _ => {}
         },
+        // `p` asks the peer what it is listening on and offers the answer for this
+        // field. It is dispatched here rather than in the editing stage on
+        // purpose: `p` must stay an ordinary letter while a field is being typed,
+        // and `adjust_field` only runs while navigating.
+        FormField::RemotePort => {
+            if let KeyCode::Char('p') = key.code {
+                app.open_port_picker();
+            }
+        }
         _ => {}
     }
 }

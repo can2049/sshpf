@@ -108,6 +108,12 @@
 | `import.committed` | INFO | `host` `created` | 从 `~/.ssh/config` 导入成功 |
 | `import.rejected` | WARN | `problems` `msg` | 导入校验失败，一条都没建 |
 | `import.click_stale` | DEBUG | `row` | 鼠标命中的导入行已不在当前筛选视图内（hit 图比点击早一帧），本次点击丢弃 |
+| `portscan.started` | INFO | `host` `multi` | 请求扫描对端监听端口（`multi` = 勾选可批量建隧道）。它**另外开一条 SSH 连接**，所以给对端的认证日志一个本地解释 |
+| `portscan.finished` | INFO | `host` `found` `excluded` | 扫描成功；`found` 是可选的端口数，`excluded` 是因 `~/.ssh/config` 已列出而隐藏的个数 |
+| `portscan.failed` | WARN | `host` `msg` | 扫描失败（连不上、没有 `ss`/`netstat`、输出无法解析），`msg` 是面板上显示的那句话 |
+| `portscan.stale` | DEBUG | `seq` `current` | 结果属于已被替换的代次：用户换主机/重扫时旧探测才返回，答案丢弃而不是套到新列表上 |
+| `portscan.dropped` | DEBUG | `from` `to` | 主机或转发类型变了，旧列表被丢弃（`to` 是当前字段里的主机） |
+| `portscan.batch_rejected` | WARN | `problems` `msg` | 勾选端口的批量校验失败，一条都没建 |
 
 ## 界面降级 / UI degradation
 

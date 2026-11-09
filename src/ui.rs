@@ -44,7 +44,7 @@
 //! | [`table`] | the tunnel table | you change a row/column |
 //! | [`selection`] | the `v`-mode action bar | you add a batch action |
 //! | [`help`] | the `?` overlay | you change help layout |
-//! | [`form`] | the create/edit form | you add a field |
+//! | [`form`] | the create/edit form and which sub-pane it shows | you add a field or a form sub-pane |
 //! | [`dropdown`] | the inline host list | you change host picking |
 //! | [`confirm`] | the confirmation dialog | you change the delete gate |
 //! | [`detail`] | the detail/log overlay | you change what a tunnel reports |
@@ -52,6 +52,7 @@
 //! | [`hit`] | the mouse hit map | you add a clickable thing |
 //! | [`layout`] | table column widths (pure arithmetic) | you change column degradation |
 //! | [`import`] | the import pane and its four parts | you change importing |
+//! | [`ports`] | the peer listening-ports pane of the form | you change port scanning's screen |
 //!
 //! New keys are **not** here: they are dispatched in `crate::keys` and documented
 //! in `crate::help`.
@@ -166,6 +167,7 @@ pub mod hit;
 pub mod import;
 pub mod layout;
 pub mod palette;
+pub mod ports;
 pub mod selection;
 pub mod table;
 pub mod text;

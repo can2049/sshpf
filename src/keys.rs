@@ -19,6 +19,7 @@
 //! | `keys/select.rs` | selection mode (`v`) | `main::handle_main_key` | it re-binds a table key while marking rows |
 //! | `keys/form.rs` | create/edit form, both stages | `handle_key` | it navigates fields or types into one |
 //! | `keys/import.rs` | import pane and its column filters | `form::handle_form_key` | it moves, ticks or filters import rows |
+//! | `keys/ports.rs` | peer port list (`p` on 远端端口) | `form::handle_form_key` | it moves, ticks or accepts a scanned port |
 //! | `keys/dropdown.rs` | `SSH HOST` dropdown | `form::handle_form_key` | it drives the host list |
 //! | `keys/misc.rs` | help / detail / confirm / `/` filter | `handle_key` | it belongs to one small overlay |
 //!
@@ -59,6 +60,7 @@ mod form;
 mod import;
 mod main;
 mod misc;
+mod ports;
 mod select;
 #[cfg(test)]
 mod testkit;
