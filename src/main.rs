@@ -6,10 +6,30 @@
 //! # The map
 //!
 //! ```text
-//! main()        logging → args (src/cli.rs) → paths → one of the three modes
+//! main()        logging → args (src/cli.rs) → paths → one of the modes
 //! run_tui()     signals → terminal → App → event_loop → shutdown → restore
 //! event_loop()  drain events, draw one frame, read one key — repeat until quit
 //! ```
+//!
+//! # The process modes (Unix)
+//!
+//! One config has exactly one **server**, which owns every tunnel, and any number
+//! of **clients**, which render that server's state and send it commands. This is
+//! what makes a second terminal show the first one's tunnels instead of fighting
+//! it for the same local ports.
+//!
+//! | invocation | role |
+//! |---|---|
+//! | `sshpf` | client; starts the server first if none is running |
+//! | `sshpf --server` | the server itself (debugging, or a supervisor) |
+//! | `sshpf --keep-server` | client; the server survives the last client |
+//! | `sshpf --check` / `--list-hosts` | neither — they never touch the socket |
+//!
+//! The last row matters: turning a print-and-exit mode into a client would start
+//! a background server as a side effect of `sshpf --check`.
+//!
+//! On Windows this collapses to the single process it always was: there is no
+//! Unix socket transport there yet (see `docs/research/client-server.md` §10).
 //!
 //! What lives where:
 //!
@@ -82,6 +102,12 @@ fn main() -> ExitCode {
     if args.check {
         eventlog::cli_mode("check");
         return cli::check_config(&paths);
+    }
+
+    #[cfg(unix)]
+    if args.server {
+        eventlog::cli_mode("server");
+        return sshpf::server::run(paths, args.keep_server, args.no_restore, args.host_key_policy());
     }
 
     match run_tui(paths, &args, started) {
@@ -160,7 +186,12 @@ fn take_terminal() -> std::io::Result<ratatui::DefaultTerminal> {
 }
 
 /// The per-session setup that must happen before the first frame.
-fn prepare_app(app: &mut App, no_restore: bool) {
+///
+/// `authoritative` is whether this process owns the tunnels (`--server`, or the
+/// single-process Windows path). A **client** must not restore: the `enabled`
+/// flag is already restored by the server, and doing it again from every client
+/// would restart every tunnel once per attached window.
+fn prepare_app(app: &mut App, no_restore: bool, authoritative: bool) {
     if let Some(reason) = logging::init_error() {
         // Silent logging loss is the worst failure mode for a diagnostic feature;
         // the user finds out through the status line instead of an empty file.
@@ -172,6 +203,12 @@ fn prepare_app(app: &mut App, no_restore: bool) {
     // folded into one (see `model::dedup`). A shorter table on start-up with no
     // explanation reads as data loss, so it is said out loud — after `load_hosts`
     // so `--no-restore`'s own notice does not overwrite it.
+    //
+    // A client skips both: its table is replaced by the server's first snapshot,
+    // so announcing a repair of a file it will not display would be a lie.
+    if !authoritative {
+        return;
+    }
     announce_folded(app);
     if no_restore {
         logging::info("app.restore_skipped", &[("reason", &"no-restore")]);
@@ -206,6 +243,18 @@ fn announce_folded(app: &mut App) {
 fn shut_down(app: &mut App, mouse: bool, started: Instant, result: std::io::Result<()>) -> ExitCode {
     logging::set_tui_active(false);
     let was_quit = app.should_quit;
+    // A client tells the server it is leaving and touches nothing else: the
+    // server decides whether this was the last one, and owns every file. `App::shutdown`
+    // on a mirror would try to stop tunnels it does not own.
+    if app.is_mirror() {
+        app.send_bye(was_quit);
+        eventlog::app_exit(if was_quit { "user" } else { "signal" }, started.elapsed().as_millis(), 0);
+        if mouse {
+            let _ = execute!(std::io::stdout(), DisableMouseCapture);
+        }
+        ratatui::restore();
+        return if result.is_ok() { ExitCode::SUCCESS } else { ExitCode::FAILURE };
+    }
     app.shutdown();
     eventlog::app_exit(
         if was_quit { "user" } else { "signal" },
@@ -247,8 +296,11 @@ fn run_tui(paths: Paths, args: &cli::Args, started: Instant) -> std::io::Result<
         eventlog::config_perms_tightened(&config::display_path(&paths.config), ok);
     }
 
-    let mut app = App::with_host_key_policy(paths, args.host_key_policy());
-    prepare_app(&mut app, args.no_restore);
+    let mut app = App::with_host_key_policy(paths.clone(), args.host_key_policy());
+    // Attach *before* the terminal is taken so a failure is a plain message and a
+    // non-zero exit, not a TUI the user has to read a status line to understand.
+    let attached = attach_client(&mut app, &paths, args, &mut terminal)?;
+    prepare_app(&mut app, args.no_restore, !attached);
 
     // Mouse capture is on for the whole session: the import table's filtering and
     // the table's row selection are click-driven, and terminals cannot report a
@@ -266,6 +318,52 @@ fn run_tui(paths: Paths, args: &cli::Args, started: Instant) -> std::io::Result<
         logging::info("app.signal", &[("signal", &sys::signal_name(signal as i32))]);
     }
     Ok(shut_down(&mut app, mouse, started, result))
+}
+
+/// Turn this process into a client of the server for this config.
+///
+/// Returns whether it did. `Ok(false)` means "stay authoritative": on Windows,
+/// where there is no transport yet, and that is the only remaining case — so the
+/// behaviour there is exactly what it was before client-server existed.
+///
+/// A failure is **not** a fallback to single-process mode. Silently becoming the
+/// owner of the tunnels after failing to reach the server is how two processes
+/// end up fighting over the same local ports — the very defect this mode removes.
+/// So the reason is reported (log + stderr) and the process exits non-zero.
+#[cfg(unix)]
+fn attach_client(
+    app: &mut App,
+    paths: &Paths,
+    args: &cli::Args,
+    terminal: &mut DefaultTerminal,
+) -> std::io::Result<bool> {
+    match sshpf::client::attach(paths, args.host_key_policy(), args.keep_server) {
+        Ok((out, incoming)) => {
+            app.attach_remote(out, incoming);
+            logging::info("client.attach", &[("config", &config::display_path(&paths.config))]);
+            Ok(true)
+        }
+        Err(e) => {
+            eventlog::client_attach_failed(&e.zh);
+            // Leave the terminal clean before printing: the message must land in
+            // the user's shell, not in an alternate screen that is about to vanish.
+            ratatui::restore();
+            let _ = writeln!(std::io::stderr(), "错误 / Error: {} / {}", e.zh, e.en);
+            let _ = terminal.clear();
+            Err(std::io::Error::other(format!("{} / {}", e.zh, e.en)))
+        }
+    }
+}
+
+/// Windows: no client-server transport yet, so this process owns the tunnels.
+#[cfg(not(unix))]
+fn attach_client(
+    _app: &mut App,
+    _paths: &Paths,
+    _args: &cli::Args,
+    _terminal: &mut DefaultTerminal,
+) -> std::io::Result<bool> {
+    Ok(false)
 }
 
 fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, quit: &Arc<AtomicBool>) -> std::io::Result<()> {

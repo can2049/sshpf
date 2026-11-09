@@ -41,6 +41,12 @@ sshpf — SSH 端口转发 TUI 管理器 / SSH port-forward manager for the term
                         Print the hosts in ~/.ssh/config, then exit
       --check           校验配置文件后退出（不启动 UI）
                         Validate the config file, then exit (no UI)
+      --server          作为后台服务进程运行：持有全部隧道，供多个客户端共享
+                        Run as the background server that owns every tunnel so
+                        several clients can share one state (a client does this
+                        automatically when none is running)
+      --keep-server     最后一个客户端退出后仍保留服务端
+                        Keep the server running after the last client exits
       --ignore-host-key-changes
                         接受已改变的主机密钥（不写入 known_hosts，仅告警）
                         Accept a changed host key (warns; known_hosts is untouched)
@@ -143,6 +149,10 @@ pub struct Args {
     pub no_restore: bool,
     pub list_hosts: bool,
     pub check: bool,
+    /// Run as the authoritative server for this config instead of as a client.
+    pub server: bool,
+    /// Keep the server alive after the last client leaves.
+    pub keep_server: bool,
     /// Accept a changed server host key instead of refusing the connection.
     pub ignore_host_key_changes: bool,
 }
@@ -191,7 +201,15 @@ where
     I: IntoIterator<Item = std::ffi::OsString>,
 {
     let mut parsed =
-        Args { config: None, no_restore: false, list_hosts: false, check: false, ignore_host_key_changes: false };
+        Args {
+            config: None,
+            no_restore: false,
+            list_hosts: false,
+            check: false,
+            server: false,
+            keep_server: false,
+            ignore_host_key_changes: false,
+        };
     let mut it = args.into_iter();
     while let Some(arg) = it.next() {
         // Lossy only for the *match*; a path is stored untouched below.
@@ -214,6 +232,8 @@ where
             "--no-restore" => parsed.no_restore = true,
             "--list-hosts" => parsed.list_hosts = true,
             "--check" => parsed.check = true,
+            "--server" => parsed.server = true,
+            "--keep-server" => parsed.keep_server = true,
             "--ignore-host-key-changes" => parsed.ignore_host_key_changes = true,
             other => {
                 return Err(format!("未知参数 / Unknown option: {other}\n\n{USAGE}"));
