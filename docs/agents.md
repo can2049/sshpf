@@ -6,12 +6,65 @@
 
 ## 先做什么 / Start here
 
-1. 读 [index.md](index.md) 找到你的任务对应的文档。
-2. 读目标文件的 `//!` 模块文档——**每个源文件都必须有**（`tests/safety_guards.rs` 强制）。
-3. `grep` 你要改的函数名，读上下文，再动手。
-4. 改完跑自检（本文末），再向 Lead / 用户汇报。
+1. **开 worktree**（见下节）——只要会产生提交，就不在共享 checkout 里改。
+2. 读 [index.md](index.md) 找到你的任务对应的文档。
+3. 读目标文件的 `//!` 模块文档——**每个源文件都必须有**（`tests/safety_guards.rs` 强制）。
+4. `grep` 你要改的函数名，读上下文，再动手。
+5. 改完跑自检（本文末），再向 Lead / 用户汇报。
 
 **代码是唯一事实来源。** 文档与代码冲突时以代码为准，并回头修文档。
+
+## 一特性一 worktree / One worktree per change
+
+开发新特性、修复问题，**一律在独立 worktree 的独立分支里做**，不在仓库根（主 checkout）里直接改。要改代码就先开 worktree；纯文档改动同理，没有例外路径。
+
+理由是共享 checkout 的每样东西都是共享的：未提交改动、git index、`target/`。两个人（人 + agent，或两个 agent）在同一棵树里并行，任一方 `git checkout`、`git stash`、`cargo fmt --all` 就会打断另一方，且没有任何提示。
+
+**一条改动的完整生命周期：**
+
+```bash
+git fetch origin
+# 1) 开 worktree + 分支：目录 = 分支名，统一放 .agents/worktrees/（已 gitignore）
+git worktree add .agents/worktrees/feat/my-feature -b feat/my-feature origin/main
+cd .agents/worktrees/feat/my-feature
+
+# 2) 开发 → 自检（本文末）→ 提交 → push → PR
+git push -u origin feat/my-feature
+gh pr create --fill
+
+# 3) CI 全绿 + 评审通过 → 合并（merge commit，与既有 PR 一致）
+
+# 4) 合并后清理：worktree、本地分支、远端分支都不留（见下）
+```
+
+| 项 | 约定 |
+|---|---|
+| 分支名 | 前缀与提交前缀一致：`feat/…`、`fix/…`、`docs/…`、`refactor/…`、`release/…` |
+| worktree 路径 | `.agents/worktrees/<分支名>`，与分支同名；`.agents/` 在 `.gitignore` 里，不会被误提交 |
+| 基线 | 从刚 `fetch` 的 `origin/main` 开；落后就 `rebase` 到 `origin/main`，不要把 main merge 进分支 |
+| git 写操作 | 只在自己 worktree 里 `add`/`commit`/`push`；不要在主 checkout 切换分支或 stash |
+| 合并方式 | PR（不直接 push `main`）；`main` 上 CI 必须绿 |
+| 收尾 | 合并后**立即**删 worktree 和分支（见下），不留「僵尸分支」 |
+
+### 合并后清理 / Clean up after merge
+
+**PR 合并即这条线结束。** 残留的分支和 worktree 会让后来者（尤其是 agent）以为任务还在进行——`git worktree list` 和 `git branch` 是它们判断「谁在做什么」的唯一线索。
+
+```bash
+# 回到主 checkout 执行（在将被删除的 worktree 里执行会失败）
+git worktree remove .agents/worktrees/<分支名>   # 有未提交改动会拒绝删除；别用 --force 掩盖
+git branch -d <分支名>                           # -d 校验已合并；报「未合并」说明合并没到位
+git push origin --delete <分支名>
+git fetch --prune
+```
+
+| 检查 | 期望 |
+|---|---|
+| `git worktree list` | 只剩主 checkout（和别的**进行中**的线） |
+| `git branch --merged origin/main` | 不含刚删的分支 |
+| `gh pr view --json state` | `MERGED`，且远端分支已消失 |
+
+例外只有一个：`release/vX.Y.Z` 由发版流程保留，不随合并删除；`main` 永不删除。
 
 ## 六条改码约定 / Six rules
 

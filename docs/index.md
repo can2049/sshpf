@@ -16,6 +16,7 @@
 
 | 我想… / I want to… | 读哪篇 / Read | 看哪个文件 / Code |
 |---|---|---|
+| **要动代码（新特性 / 修 bug）** | [agents.md](agents.md#一特性一-worktree--one-worktree-per-change) — 先开 worktree，合并后清理 | `.agents/worktrees/` |
 | 了解整体分层、有哪些模块 | [architecture.md](architecture.md) | `src/lib.rs` |
 | 决定「新功能该放哪」 | [architecture.md](architecture.md#新功能放哪--where-does-new-code-go) | `src/*/mod.rs` 头注释 |
 | 加一个按键 / 改键位 | [agents.md](agents.md#加按键--add-a-key) → [keymap.md](keymap.md) | `src/keys/`、`src/help.rs` |

@@ -3,6 +3,16 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### 变更
+
+- **给 AI agent 的协作约束：一条改动一个 worktree。** 文档新增「一特性一 worktree」
+  一节（[`AGENTS.md`](AGENTS.md) + [`docs/agents.md`](docs/agents.md#一特性一-worktree--one-worktree-per-change)）：
+  开发新特性、修复问题一律在 `.agents/worktrees/<分支名>` 的独立 worktree + 独立分支里做，
+  不在共享 checkout 里改；**PR 合并后立即删除该 worktree 与本地/远端分支**，不留僵尸分支。
+  纯文档约定变更，无代码、无行为变化。
+
 ## [0.5.0] - 2026-11-09
 
 本次是 minor 版本，两件事：把「新建 / 编辑转发」里最靠记忆的一步——填远端端口——
