@@ -39,8 +39,8 @@ pub mod tunnel;
 pub mod user;
 
 pub use process::{
-    app_exit, app_start, cli_error, cli_mode, config_defaults_clamped, config_defaults_clamped_on, config_load_failed,
-    config_loaded, config_perms_tightened, config_repaired, config_save_failed, id_space_exhausted,
+    app_exit, app_start, cli_error, cli_mode, config_deduped, config_defaults_clamped, config_defaults_clamped_on,
+    config_load_failed, config_loaded, config_perms_tightened, config_repaired, config_save_failed, id_space_exhausted,
     id_space_exhausted_on, orphan_event, state_save_failed,
 };
 pub use ssh::{
@@ -60,5 +60,6 @@ pub use user::{
     form_kind_index_invalid_on, import_click_stale, import_committed, import_rejected, mouse_capture_failed,
     port_batch_rejected, port_batch_rejected_on, port_picker_dropped, port_picker_dropped_on, port_scan_closed,
     port_scan_failed, port_scan_failed_on, port_scan_finished, port_scan_finished_on, port_scan_stale,
-    port_scan_stale_on, port_scan_started, port_scan_started_on, slow_frame,
+    port_scan_stale_on, port_scan_started, port_scan_started_on, save_attempted, save_attempted_on, save_key_swallowed,
+    save_key_swallowed_on, slow_frame,
 };

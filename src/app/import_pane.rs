@@ -17,8 +17,10 @@
 //! * The auto-open is an *offer*, not an instruction. Everything the user does to
 //!   the pane deliberately — opening it by hand, focusing a column filter, ticking
 //!   or unticking rows — marks the table
-//!   `touched`, and only a touched table outranks a complete hand-filled form on
-//!   `ctrl+s`. See `form_submit`'s module docs for the routing rule.
+//!   `touched`, and only a touched table *with at least one row still ticked*
+//!   outranks a complete hand-filled form on `ctrl+s` (unticking every row is an
+//!   instruction to create none of them, which leaves the pane nothing to carry
+//!   out). See `form_submit`'s module docs for the routing rule.
 
 use crate::app::{App, FormMode};
 use crate::eventlog;
@@ -87,11 +89,20 @@ impl App {
     /// Only a *changed* host reaches this (see `refresh_import_table`), so
     /// re-committing the same alias cannot undo a deliberate collapse.
     pub(crate) fn install_import_rows(&mut self, host: impl Into<String>, forwards: Vec<SshForward>) {
-        let table = ImportTable::new(forwards);
-        let importable = table.importable_count();
+        // Rows whose forward is already a saved tunnel start unticked and stay
+        // that way: see `ImportTable::with_existing`. This is the fix for "every
+        // new port also re-adds cloud_pc's two forwards" — the pane used to offer
+        // them as ticked defaults on every open, so `ctrl+s` re-created them.
+        let existing: Vec<Option<String>> = forwards.iter().map(|f| self.saved_forward_name(f)).collect();
+        let table = ImportTable::with_existing(forwards, existing);
+        // Auto-open still keys off rows that can be *created*: a pane whose every
+        // row is already saved has no default to offer, so opening it
+        // automatically would cover the fields the user just reached for. It stays
+        // one key away (`space`/`i`), where it explains the dimmed rows.
+        let creatable = table.importable_count();
         if let Some(form) = self.form.as_mut() {
             form.set_import_table(host, table);
-            form.import_open = importable > 0;
+            form.import_open = creatable > 0;
         }
     }
 
@@ -359,6 +370,93 @@ mod tests {
         app.form.as_mut().unwrap().set_import_table("dev-box", table);
         app.form.as_mut().unwrap().import_open = true;
         (dir, app)
+    }
+
+    /// A discovered `-L` row with its own target port, so two rows are genuinely
+    /// two forwards. [`show`] keeps a fixed target — two rows that differ only in
+    /// their local listen port are *one* forward by design (see `app::duplicate`),
+    /// and a fixture that collapsed them would test the wrong thing.
+    fn show_to(listen_port: u16, target_port: u16) -> SshForward {
+        SshForward { target_port, ..show(listen_port) }
+    }
+
+    /// A saved `-L` tunnel for `dev-box`, used as the "already have it" side.
+    fn saved(id: crate::model::TunnelId, name: &str, local_port: u16) -> TunnelConfig {
+        TunnelConfig {
+            id,
+            name: name.into(),
+            kind: ForwardKind::Local,
+            ssh_host: "dev-box".into(),
+            local_addr: "127.0.0.1".into(),
+            local_port,
+            remote_host: "10.0.0.1".into(),
+            remote_port: 80,
+            enabled: false,
+            auto_restart: false,
+            ssh_options: vec![],
+            note: String::new(),
+            created_at: 1,
+        }
+    }
+
+    #[test]
+    fn a_forward_that_is_already_saved_is_listed_but_never_ticked() {
+        // The reported bug: every "add a new port" pass also re-offered cloud_pc's
+        // two `~/.ssh/config` forwards as *ticked* defaults, so ctrl+s re-created
+        // them (and the local-port planner bumped each copy, producing the 18789 /
+        // 18790 / 18791 ladder). The pane must still list them — they really are
+        // in the file, and hiding them would look like sshpf lost a directive —
+        // but "already saved" cannot be a *default to create*.
+        let port = free_port();
+        let (_d, mut app) = app_with_import(vec![show(port)]);
+        // Already saved, with a local port bumped by an earlier run — the shape the
+        // duplicate check exists for (`-L`'s local port is not identity).
+        app.cfg.tunnels = vec![saved(9, "dev-box-L-80", port + 1)];
+        app.tunnels = crate::app::build_views(&app.cfg);
+
+        app.install_import_rows("dev-box", vec![show(port)]);
+
+        let form = app.form.as_ref().unwrap();
+        assert_eq!(form.import.len(), 1, "the row stays visible: it is in ~/.ssh/config");
+        assert_eq!(form.import.rows[0].existing.as_deref(), Some("dev-box-L-80"), "and names the tunnel it is");
+        assert!(!form.import.rows[0].checked, "an existing forward must not be a ticked default");
+        assert_eq!(form.import.checked_count(), 0);
+        assert_eq!(form.import.existing_count(), 1);
+        // No creatable row left, so the pane does not cover the form by itself —
+        // `space`/`i` still opens it to explain the dimmed line.
+        assert!(!app.import_pane_open(), "nothing to create, so nothing auto-opens");
+    }
+
+    #[test]
+    fn an_existing_row_cannot_be_ticked_back_on_by_any_key() {
+        // Every route to a tick has to skip it: `space`, `a` (select all) and `I`
+        // (invert). A keyboard path to a known duplicate would undo the whole fix,
+        // and "select all" is the one users reach for by reflex.
+        let (existing_port, new_port) = (free_port(), free_port());
+        // Two *distinct* targets: the saved one and one new forward, so "which row
+        // is creatable" is a real question rather than a same-identity artefact.
+        let rows = vec![show_to(existing_port, 80), show_to(new_port, 8080)];
+        let (_d, mut app) = app_with_import(rows.clone());
+        app.cfg.tunnels = vec![saved(9, "dev-box-L-80", existing_port + 1)];
+        app.tunnels = crate::app::build_views(&app.cfg);
+        app.install_import_rows("dev-box", rows);
+
+        app.import_uncheck_all();
+        for action in ["space-on-row", "check-all", "invert"] {
+            app.import_uncheck_all();
+            match action {
+                "space-on-row" => app.import_toggle_at(0),
+                "check-all" => app.import_check_all(),
+                _ => app.import_invert(),
+            }
+            let rows = &app.form.as_ref().unwrap().import.rows;
+            assert!(!rows[0].checked, "{action} must not tick an existing forward");
+            assert_eq!(
+                app.form.as_ref().unwrap().import.checked_count(),
+                if action == "space-on-row" { 0 } else { 1 },
+                "{action}: only the genuinely new row can be ticked"
+            );
+        }
     }
 
     #[test]

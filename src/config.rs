@@ -262,8 +262,19 @@ pub fn display_path(p: &Path) -> String {
 /// A malformed file is a hard error: we never silently overwrite a config the
 /// user may have hand-edited.
 pub fn load(path: &Path) -> Result<ConfigFile> {
+    load_with_report(path).map(|(cfg, _)| cfg)
+}
+
+/// [`load`], plus what the duplicate repair did to the file.
+///
+/// The report exists because a folded entry is a *visible* change to the user's
+/// data: their table is shorter than what `config.toml` said. The log records it
+/// either way, but a start-up that quietly loses two rows is the kind of silence
+/// that gets read as a bug in the other direction ("sshpf forgot my forwards"), so
+/// the caller can put it on the status bar too.
+pub fn load_with_report(path: &Path) -> Result<(ConfigFile, Vec<crate::model::Folded>)> {
     if !path.exists() {
-        return Ok(ConfigFile::default());
+        return Ok((ConfigFile::default(), Vec::new()));
     }
     let text = fs::read_to_string(path).with_context(|| format!("读取配置失败: {}", path.display()))?;
     let mut cfg: ConfigFile = toml::from_str(&text).with_context(|| format!("解析配置失败: {}", path.display()))?;
@@ -295,7 +306,17 @@ pub fn load(path: &Path) -> Result<ConfigFile> {
         // any id mentioned in a bug report would otherwise look wrong.
         crate::logging::warn("config.repaired", &[("path", &path.display().to_string()), ("entries", &repaired)]);
     }
-    Ok(cfg)
+    // Entries that describe the *same forward* fold into one. Done here, on the
+    // parsed list, because this is the layer that owns `config.toml`: the table the
+    // user sees, the tunnels that get dialled and the duplicate guard all read
+    // through here, so one repair fixes every consumer at once. See `model::dedup`
+    // for which entry survives.
+    let (tunnels, folded) = crate::model::fold_duplicates(cfg.tunnels);
+    cfg.tunnels = tunnels;
+    for group in &folded {
+        crate::eventlog::config_deduped(&group.kept, group.dropped.len());
+    }
+    Ok((cfg, folded))
 }
 
 /// Atomic save: write a temp file in the same directory, fsync, rename.
@@ -379,7 +400,7 @@ mod tests {
             local_addr: "127.0.0.1".into(),
             local_port: port,
             remote_host: "127.0.0.1".into(),
-            remote_port: 22,
+            remote_port: port,
             enabled: false,
             auto_restart: false,
             ssh_options: vec![],
@@ -441,6 +462,67 @@ mod tests {
         assert_ne!(back.tunnels[0].id, back.tunnels[1].id);
         assert_eq!(back.unique_name("a", None), "a-2");
         assert_eq!(back.next_id(), back.max_id() + 1);
+    }
+
+    /// The same forward as `tmp_cfg(.., target)` but listening elsewhere: exactly
+    /// what a bumped local port produces, and the shape the duplicate repair has to
+    /// recognise (`-L`'s local port is not identity).
+    fn tmp_cfg_bumped(id: TunnelId, name: &str, local_port: u16, target_port: u16) -> TunnelConfig {
+        TunnelConfig { local_port, ..tmp_cfg(id, name, target_port) }
+    }
+
+    #[test]
+    fn loading_folds_entries_that_are_the_same_forward() {
+        // The user's `config.toml` already held three entries for `cloud_pc`'s
+        // 18789 forward (one per historical import, each on a bumped local port).
+        // The create-time guard cannot help them — they are already on disk — so
+        // the load repairs the list. Without this, the duplicate rows are
+        // permanent: the table shows three, three SSH connections are dialled, and
+        // deleting two only holds until the next scan.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = ConfigFile::default();
+        cfg.tunnels.push(tmp_cfg_bumped(3, "cloud_pc-L-18789-2", 18789, 18789));
+        cfg.tunnels.push(tmp_cfg_bumped(5, "cloud_pc-L-18789", 18790, 18789));
+        cfg.tunnels.push(tmp_cfg_bumped(7, "cloud_pc-L-18789-3", 18791, 18789));
+        save(&path, &cfg).unwrap();
+
+        let back = load(&path).unwrap();
+        assert_eq!(back.tunnels.len(), 1, "one intent, one entry");
+        assert_eq!(back.tunnels[0].name, "cloud_pc-L-18789-2", "the first row survives");
+        assert_eq!(back.tunnels[0].local_port, 18789, "and keeps its persisted port");
+    }
+
+    #[test]
+    fn a_clean_config_loads_without_a_repair_report() {
+        // The common case must be side-effect free, or every start-up would warn.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = ConfigFile::default();
+        cfg.tunnels.push(tmp_cfg(1, "a", 8001));
+        cfg.tunnels.push(tmp_cfg(2, "b", 8002));
+        save(&path, &cfg).unwrap();
+        let (back, report) = load_with_report(&path).unwrap();
+        assert_eq!(back.tunnels.len(), 2);
+        assert!(report.is_empty());
+    }
+
+    #[test]
+    fn the_repair_report_names_the_survivor_and_the_count() {
+        // The status bar says "merged N duplicates of X", so the report has to
+        // carry both halves.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = ConfigFile::default();
+        cfg.tunnels.push(tmp_cfg_bumped(1, "kept", 8001, 80));
+        cfg.tunnels.push(tmp_cfg_bumped(2, "gone-a", 8002, 80));
+        cfg.tunnels.push(tmp_cfg_bumped(3, "gone-b", 8003, 80));
+        save(&path, &cfg).unwrap();
+        let (back, report) = load_with_report(&path).unwrap();
+        assert_eq!(back.tunnels.len(), 1);
+        assert_eq!(report.len(), 1);
+        assert_eq!(report[0].kept, "kept");
+        assert_eq!(report[0].dropped.len(), 2);
     }
 
     #[test]

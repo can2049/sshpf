@@ -153,6 +153,9 @@ const HANDLERS: &[(&str, SectionId)] = &[
     ("handle_field_editing", SectionId::FormEditing),
     ("edit_field", SectionId::FormEditing),
     ("handle_dropdown_key", SectionId::HostPicker),
+    // Movement half of the dropdown, split out for length only: same context, so
+    // the same section, and its keys stay attributed to `host_picker`.
+    ("handle_dropdown_move_key", SectionId::HostPicker),
     ("handle_import_key", SectionId::ImportPane),
     // `handle_import_key` delegates its row half to a helper: same context, so the
     // same section. Listing it is what keeps the moved keys attributed to

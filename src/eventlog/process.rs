@@ -79,6 +79,21 @@ pub fn state_save_failed(path: &str, error: &str) {
     logging::warn("state.save_failed", &[("path", &path), ("msg", &error)]);
 }
 
+/// Saved entries that meant the same forward were folded into one on load.
+///
+/// `kept` names the entry that survived, `dropped` how many were removed. A WARN
+/// for the same reason `config.repaired` is one: the user's `config.toml` is not
+/// what they wrote, their table just got shorter on start-up, and the log is where
+/// "why are two of my forwards gone?" has an answer. Emitted once per folded
+/// group, so the text can name the survivor.
+pub fn config_deduped(kept: &str, dropped: usize) {
+    config_deduped_on(logging::logger(), kept, dropped);
+}
+
+pub fn config_deduped_on(logger: &Logger, kept: &str, dropped: usize) {
+    logger.event(Level::Warn, "config.deduped", &[("kept", &kept), ("dropped", &dropped)]);
+}
+
 /// A hand-edited default in `config.toml` was out of range and has been replaced.
 ///
 /// `field` is the stable config key (`retry_initial_secs` / `retry_max_secs`),
@@ -140,6 +155,21 @@ mod tests {
         assert!(text.contains("field=retry_initial_secs"), "{text}");
         assert!(text.contains("original=0"), "{text}");
         assert!(text.contains("used=1"), "{text}");
+    }
+
+    #[test]
+    fn a_folded_duplicate_names_the_survivor_and_the_count() {
+        // The line has to answer both halves of "what happened to my forwards?":
+        // which entry was kept, and how many went away. A bare count would leave
+        // the user unable to tell whether the right one survived.
+        let dir = tempfile::tempdir().unwrap();
+        let log = logger(dir.path());
+        config_deduped_on(&log, "cloud_pc-L-18789-2", 2);
+        let text = text(dir.path());
+        assert!(text.contains(" WARN "), "{text}");
+        assert!(text.contains("event=config.deduped"), "{text}");
+        assert!(text.contains("kept=cloud_pc-L-18789-2"), "{text}");
+        assert!(text.contains("dropped=2"), "{text}");
     }
 
     #[test]

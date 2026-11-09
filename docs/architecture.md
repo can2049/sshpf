@@ -63,7 +63,7 @@
 | `src/app/query.rs` | 只读查询：选中、过滤后可见行、计数器 | `app`、`ui` | 新的纯读取访问器 |
 | `src/app/overlay.rs` | `open_*` / `close_overlay`（浮层唯一开关） | `keys`、`app` | 新的浮层打开/关闭 |
 | `src/app/helpers.rs` | 无 `App` 依赖的纯函数：视图构造、config repair、`backoff` | `app`、`main` | 纯计算 |
-| `src/app/import_pane.rs` | 导入面板的**交互**半边：展开/收起、列筛选、光标、勾选 | `keys::import`、`ui::import` | 面板交互规则 |
+| `src/app/import_pane.rs` | 导入面板的**交互**半边：展开/收起、列筛选、光标、勾选、「已存在」标记的来源 | `keys::import`、`ui::import` | 面板交互规则 |
 | `src/app/runtime.rs` | 启停/重启、`start_tunnel_with`（`preflight()` + `launch()`） | `app` | 隧道"启动/停止"这一侧 |
 | `src/app/events.rs` | 事件泵的**读**侧：`drain_events`、`on_ready`/`on_line`/`on_exit`、`flush_pending_exits`、`tick_retries`/`arm_retry` | `app` | 事件 → 状态转移、退避规则 |
 | `src/app/persist.rs` | `persist`（config.toml）、`save_state`（state.toml）、`persist_quietly` | `app` | 落盘策略 |
@@ -149,10 +149,11 @@
 | 文件 | 放什么 | 加东西放哪 |
 |---|---|---|
 | `src/model.rs` | 模块地图 + `mod`/`pub use`（63 行，只做导航） | 新类型 → 下表对应文件 |
-| `src/model/tunnel.rs` | `ForwardKind`、`TunnelConfig`（含 `forward_identity`：转发意图身份，去重的唯一判据） | 隧道定义字段、身份规则 |
-| `src/model/import.rs` | `SshForward`、`LocalPortReason`、`PORT_SCAN_LIMIT`、`plan_local_port`、`col_match` | 导入的发现规则与端口规则 |
-| `src/model/import/row.rs` | `ImportColumn`、`ImportRow`（一行怎么显示、怎么勾） | 可筛选列 / 每行标志 |
-| `src/model/import/table.rs` | `ImportTable`：候选行、光标、滚动、选中 | 行与选中状态 |
+| `src/model/tunnel.rs` | `ForwardKind`、`TunnelConfig`（含 `forward_identity`）、`identity_of`（唯一身份算法，`SshForward` 也用它） | 隧道定义字段、身份规则 |
+| `src/model/dedup.rs` | `fold_duplicates`、`Folded`：载入时把「同一个转发」的多条已保存条目折成一条 | 折叠规则（哪条留下、怎么报告） |
+| `src/model/import.rs` | `SshForward`（含 `ends` / `forward_identity`：未规划端口的转发身份）、`ForwardEnds`、`LocalPortReason`、`PORT_SCAN_LIMIT`、`plan_local_port`、`col_match` | 导入的发现规则、方向映射与端口规则 |
+| `src/model/import/row.rs` | `ImportColumn`、`ImportRow`（一行怎么显示、怎么勾，含 `existing` / `creatable`：已保存的转发列出但不可创建） | 可筛选列 / 每行标志 |
+| `src/model/import/table.rs` | `ImportTable`：候选行、光标、滚动、选中、`touched`、`with_existing` | 行与选中状态 |
 | `src/model/import/filter.rs` | `ImportTable` 的逐列筛选 + 撤销栈 | 筛选/撤销行为 |
 | `src/model/portscan.rs` | `RemotePort`、`PortRow`、`PortPick`、`PortScanState` | 对端端口与选择器状态 |
 | `src/model/portscan/parse.rs` | `ss` / `netstat` 文本 → `RemotePort`（不可信输入） | 端口解析规则 |

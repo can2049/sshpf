@@ -31,6 +31,7 @@
 | `config.invalid` | WARN | `path` `msg` | 每条校验问题的明细 |
 | `config.load_failed` | ERROR | `path` `msg` `fallback` | 配置读不进来，以空配置启动 |
 | `config.repaired` | WARN | `path` `entries` | 载入时修正了重复 id / 缺失时间戳 |
+| `config.deduped` | WARN | `kept` `dropped` | 载入时把「同一个转发」的多条已保存条目折成一条；`kept` 是留下的条目名，`dropped` 被移除的条数。每组一条 |
 | `config.save_failed` | ERROR | `path` `msg` | 写盘失败：改动只在内存里 |
 | `config.perms_tightened` | WARN / ERROR | `path` `ok` | 配置原先对同组/所有人可读，已收紧到 `0600`（`ok=false` 即收紧失败，记 ERROR） |
 | `config.defaults_clamped` | WARN | `field` `original` `used` | 手写的 `retry_initial_secs` / `retry_max_secs` 越界或倒挂，已钳制到 [1s, 24h] |
@@ -107,6 +108,8 @@
 | `action.target_missing` | WARN | `action` | 确认框的目标隧道已不存在：删除被判过期、或按 id 操作时条目已被删。确认框仍会弹，但里面没有名字 |
 | `action.duplicate_skipped` | INFO | `source` `name` `existing` | 一次创建被跳过：候选转发与 `existing` 是同一个转发（见 [../dedup.md](../dedup.md)）。`source` 是 `form` / `import` / `port-scan`。INFO 而非 WARN：跳过冗余正是预期结果，但这行解释了「勾了 3 条怎么只建了 2 条」 |
 | `import.committed` | INFO | `host` `created` | 从 `~/.ssh/config` 导入成功 |
+| `form.save_attempted` | INFO | `route` `pane_open` `rows` `checked` `touched` `complete` | `ctrl+s`/`f10` **到达了表单**并进入某条保存分支。`route` 是稳定 ASCII 值：`import`（`~/.ssh/config` 批量）/`port-batch`（勾选的对端端口）/`typed`（手填单条）/`edit`（编辑已有条目，会走确认闸）/`refused`（校验拒绝）。这是「我的保存到底做了什么」唯一的正面证据——**没有这一行就说明保存键根本没到表单**（见下一条） |
+| `form.save_key_swallowed` | WARN | `focus` | 保存键被某个子焦点吃掉，表单没收到。`focus` 是 `host_dropdown` / `import_filter`。**这两条是一对**：有 `save_attempted` 无隧道 ⇒ 保存被拒（看 `route`）；两条都没有 ⇒ 键没到表单；只有 `save_key_swallowed` ⇒ 就是它吃掉的那一次。这条为 WARN 而非 DEBUG：用户明确要求保存却没保存、也没出现隧道 |
 | `import.rejected` | WARN | `problems` `msg` | 导入校验失败，一条都没建 |
 | `import.click_stale` | DEBUG | `row` | 鼠标命中的导入行已不在当前筛选视图内（hit 图比点击早一帧），本次点击丢弃 |
 | `portscan.started` | INFO | `host` `multi` | 请求扫描对端监听端口（`multi` = 勾选可批量建隧道）。它**另外开一条 SSH 连接**，所以给对端的认证日志一个本地解释 |

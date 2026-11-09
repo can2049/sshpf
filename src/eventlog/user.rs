@@ -66,6 +66,69 @@ pub fn action_duplicate_skipped_on(logger: &Logger, source: &str, name: &str, ex
     );
 }
 
+/// A `ctrl+s` / `f10` reached the form and a save was attempted.
+///
+/// Called by the **form router** (`App::submit_form`) exactly once per save key,
+/// before any branch runs, so the file answers the two questions a missing
+/// tunnel raises and nothing else on disk can:
+///
+/// * *did the key arrive at all?* — a save key that a sub-focus swallowed (a
+///   column filter or the host dropdown treating `s` as text) leaves **no**
+///   record here, which is what separates "never saved" from "saved and
+///   refused";
+/// * *which of the two interfaces was in charge?* — `route` is the branch that
+///   ran, `pane` says whether the import pane was on screen, and
+///   `rows`/`checked`/`touched` describe the offer it was making.
+///
+/// `route` is a stable ASCII value: `import` (the `~/.ssh/config` batch),
+/// `port-batch` (ticked remote ports), `typed` (the hand-filled single tunnel)
+/// and `none` (validation refused it / the form was not savable).
+pub fn save_attempted(route: &str, pane_open: bool, rows: usize, checked: usize, touched: bool, complete: bool) {
+    save_attempted_on(logging::logger(), route, pane_open, rows, checked, touched, complete);
+}
+
+pub fn save_attempted_on(
+    logger: &Logger,
+    route: &str,
+    pane_open: bool,
+    rows: usize,
+    checked: usize,
+    touched: bool,
+    complete: bool,
+) {
+    logger.event(
+        Level::Info,
+        "form.save_attempted",
+        &[
+            ("route", &route),
+            ("pane_open", &pane_open),
+            ("rows", &rows),
+            ("checked", &checked),
+            ("touched", &touched),
+            ("complete", &complete),
+        ],
+    );
+}
+
+/// A save key was pressed while a sub-focus owned the keyboard, so the form
+/// never saw it.
+///
+/// `focus` is the owner that swallowed the key: `host_dropdown`,
+/// `import_filter` or `port_picker`. This is the counterpart of
+/// [`save_attempted`]: the pair tells "the user pressed save and a panel ate it"
+/// apart from "the user never pressed save", which used to be indistinguishable
+/// because both left the log empty.
+///
+/// `warn`, not `debug`: the user explicitly asked to save and got no save, and
+/// no tunnel appeared. That is a defect to fix, not chatter.
+pub fn save_key_swallowed(focus: &str) {
+    save_key_swallowed_on(logging::logger(), focus);
+}
+
+pub fn save_key_swallowed_on(logger: &Logger, focus: &str) {
+    logger.event(Level::Warn, "form.save_key_swallowed", &[("focus", &focus)]);
+}
+
 /// A confirmation was armed for a tunnel id that is no longer in the table.
 ///
 /// The dialog still opens with a fallback sentence, so the user is not stuck;
@@ -234,6 +297,39 @@ mod tests {
         assert!(text.contains("event=form.kind_index_invalid"), "{text}");
         assert!(text.contains("index=99"), "{text}");
         assert!(text.contains("len=3"), "{text}");
+    }
+
+    #[test]
+    fn a_save_attempt_records_the_route_and_the_pane_offer() {
+        // The record that answers "did my ctrl+s do anything?": which branch ran,
+        // and what the import pane was offering at that moment.
+        let dir = tempfile::tempdir().unwrap();
+        let log = logger(dir.path());
+        save_attempted_on(&log, "typed", true, 2, 2, false, true);
+        let text = text(dir.path());
+        assert!(text.contains(" INFO "), "{text}");
+        assert!(text.contains("event=form.save_attempted"), "{text}");
+        let after = text.split("event=form.save_attempted").nth(1).unwrap_or_default();
+        for field in ["route=typed", "pane_open=true", "rows=2", "checked=2", "touched=false", "complete=true"] {
+            assert!(after.contains(field), "missing {field}: {text}");
+        }
+        // Field order is part of the contract: route first, then the pane offer.
+        assert!(after.find("route=") < after.find("pane_open="), "{text}");
+        assert!(after.find("checked=") < after.find("touched="), "{text}");
+    }
+
+    #[test]
+    fn a_swallowed_save_key_is_a_warning_naming_the_focus() {
+        // The counterpart record. Together the pair separates "the key never
+        // arrived" from "it arrived and was refused", which both used to look
+        // like an empty log file.
+        let dir = tempfile::tempdir().unwrap();
+        let log = logger(dir.path());
+        save_key_swallowed_on(&log, "import_filter");
+        let text = text(dir.path());
+        assert!(text.contains(" WARN "), "{text}");
+        assert!(text.contains("event=form.save_key_swallowed"), "{text}");
+        assert!(text.contains("focus=import_filter"), "{text}");
     }
 
     #[test]

@@ -146,16 +146,7 @@ impl TunnelConfig {
     /// serialises fields. A *listen-port* conflict is a different question,
     /// answered by `config::listen_endpoint`.
     pub fn forward_identity(&self) -> String {
-        let ssh_host = self.ssh_host.trim();
-        let local_addr = self.local_addr.trim();
-        let remote_host = self.remote_host.trim();
-        match self.kind {
-            ForwardKind::Local => format!("L|{ssh_host}|{local_addr}|{remote_host}:{}", self.remote_port),
-            ForwardKind::Remote => {
-                format!("R|{ssh_host}|{remote_host}:{}|{local_addr}:{}", self.remote_port, self.local_port)
-            }
-            ForwardKind::Dynamic => format!("D|{ssh_host}|{local_addr}:{}", self.local_port),
-        }
+        identity_of(self.kind, &self.ssh_host, &self.local_addr, self.local_port, &self.remote_host, self.remote_port)
     }
 
     /// 0..=33 are privileged ports on Linux.
@@ -165,6 +156,40 @@ impl TunnelConfig {
             ForwardKind::Remote => self.remote_port,
         };
         listen_port <= 1023
+    }
+}
+
+/// The one identity recipe, usable on inputs that are not a `TunnelConfig` yet.
+///
+/// Two production callers, and they must agree or the duplicate guard is
+/// meaningless:
+///
+/// * [`TunnelConfig::forward_identity`] — a saved or freshly built definition;
+/// * `model::import::SshForward::forward_identity` — a *discovered* directive,
+///   which must answer "is this already mine?" **without** planning a local port.
+///   Planning probes sockets and may bump the number, so two runs could answer
+///   differently and the answer would depend on what happens to be listening.
+///
+/// A detector that disagrees with the duplicate *definition* is worse than none,
+/// which is why the formatting lives here rather than being written twice.
+///
+/// Trimmed: `~/.ssh/config` values are whitespace-sensitive in parsing but not in
+/// meaning, and a hand-edited `config.toml` can carry a trailing space.
+pub fn identity_of(
+    kind: ForwardKind,
+    ssh_host: &str,
+    local_addr: &str,
+    local_port: u16,
+    remote_host: &str,
+    remote_port: u16,
+) -> String {
+    let ssh_host = ssh_host.trim();
+    let local_addr = local_addr.trim();
+    let remote_host = remote_host.trim();
+    match kind {
+        ForwardKind::Local => format!("L|{ssh_host}|{local_addr}|{remote_host}:{remote_port}"),
+        ForwardKind::Remote => format!("R|{ssh_host}|{remote_host}:{remote_port}|{local_addr}:{local_port}"),
+        ForwardKind::Dynamic => format!("D|{ssh_host}|{local_addr}:{local_port}"),
     }
 }
 
