@@ -91,6 +91,16 @@ jobs:
       - name: Safety & size policy
         run: cargo test --test safety_guards
 
+      # Host-key *policy* behaviour that needs neither a service nor a
+      # subprocess: real `known_hosts` files, real `~/.ssh/config` fixtures, and
+      # the `--ignore-host-key-changes` escape hatch (a changed key is refused by
+      # default and accepted only under the flag; a `@revoked` key is refused
+      # under both). Listed here for the same reason as the two steps above —
+      # `cargo test --lib` does not execute `tests/*.rs` targets, so without this
+      # line the whole contract would live in a file CI never runs.
+      - name: Host-key policy
+        run: cargo test --test host_key_policy
+
       - name: Build (release)
         run: cargo build --release
 

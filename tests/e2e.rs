@@ -195,6 +195,15 @@ fn app_with(dir: &Path, tunnels: Vec<TunnelConfig>) -> App {
     App::new(paths)
 }
 
+/// [`app_with`] with an explicit process-wide host-key policy, for the escape
+/// hatch (`--ignore-host-key-changes`) which is not a per-tunnel setting.
+fn app_with_policy(dir: &Path, tunnels: Vec<TunnelConfig>, policy: sshpf::ssh::known_hosts::HostKeyPolicy) -> App {
+    let paths = Paths { config: dir.join("config.toml"), state: dir.join("state.toml") };
+    let cfg = config::ConfigFile { tunnels, ..Default::default() };
+    config::save(&paths.config, &cfg).unwrap();
+    App::with_host_key_policy(paths, policy)
+}
+
 fn wait_for(app: &mut App, secs: u64, mut pred: impl FnMut(&App) -> bool) -> bool {
     let deadline = Instant::now() + Duration::from_secs(secs);
     while Instant::now() < deadline {
@@ -419,6 +428,85 @@ fn changed_host_key_is_refused_with_a_reason() {
         }
         other => panic!("expected Failed, got {other:?}"),
     }
+}
+
+/// The mirror of [`changed_host_key_is_refused_with_a_reason`]: under the
+/// `--ignore-host-key-changes` escape hatch the same poisoned `known_hosts`
+/// must connect, and the file must be left exactly as the user wrote it.
+///
+/// Both halves matter. Refusing was correct but unusable for a host whose key
+/// legitimately rotates; rewriting `known_hosts` would have been convenient but
+/// would silently destroy the user's own record of what the key *was*, so the
+/// test pins "connects" and "did not touch the trust anchor" together.
+#[test]
+#[ignore = "needs a working sshd"]
+fn changed_host_key_is_accepted_under_ignore_and_known_hosts_is_untouched() {
+    let _guard = env_lock();
+    let Some(sshd) = start_sshd() else { return };
+    sshd.activate();
+
+    let bogus = sshd.dir.path().join("bogus_key_ignore");
+    std::process::Command::new("ssh-keygen")
+        .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+        .arg(&bogus)
+        .status()
+        .unwrap();
+    let pubkey = std::fs::read_to_string(bogus.with_extension("pub")).unwrap();
+    let mut fields = pubkey.split_whitespace();
+    let (algo, b64) = (fields.next().unwrap(), fields.next().unwrap());
+    let poisoned = format!("[127.0.0.1]:{} {algo} {b64}\n", sshd.port);
+    std::fs::write(sshd.known_hosts(), &poisoned).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with_policy(
+        dir.path(),
+        vec![tunnel(1, "l", free_port(), "testhost")],
+        sshpf::ssh::known_hosts::HostKeyPolicy::Ignore,
+    );
+    app.start_tunnel(1);
+    assert!(
+        wait_for(&mut app, 30, |a| matches!(status_of(a, 1), TunnelStatus::Up { .. })),
+        "Ignore must accept a changed key: {:?}",
+        status_of(&app, 1)
+    );
+    app.stop_tunnel(1);
+
+    let after = std::fs::read_to_string(sshd.known_hosts()).unwrap();
+    assert_eq!(after, poisoned, "known_hosts must not be rewritten under Ignore");
+}
+
+/// `knownhosts.learned` claims a trust anchor was *written*. Under `Ignore`
+/// an unknown host is accepted but nothing is persisted, so that event must not
+/// be emitted — otherwise the log sends an operator looking for a `known_hosts`
+/// entry that was never created.
+///
+/// Pinned as a regression: the record was originally emitted for both policies
+/// (the acceptance branch did not distinguish them) and the documentation had
+/// been written to match the bug.
+#[test]
+#[ignore = "needs a working sshd"]
+fn an_unknown_key_under_ignore_is_not_reported_as_learned() {
+    let _guard = env_lock();
+    let Some(sshd) = start_sshd() else { return };
+    sshd.activate();
+    std::fs::write(sshd.known_hosts(), "").unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with_policy(
+        dir.path(),
+        vec![tunnel(1, "l", free_port(), "testhost")],
+        sshpf::ssh::known_hosts::HostKeyPolicy::Ignore,
+    );
+    app.start_tunnel(1);
+    assert!(
+        wait_for(&mut app, 30, |a| matches!(status_of(a, 1), TunnelStatus::Up { .. })),
+        "Ignore must accept an unknown host: {:?}",
+        status_of(&app, 1)
+    );
+    app.stop_tunnel(1);
+
+    // Nothing may be written, and nothing may *claim* to have been written.
+    assert_eq!(std::fs::read_to_string(sshd.known_hosts()).unwrap(), "", "Ignore must not persist the key");
 }
 
 /// An unknown key under `Strict` must be refused instead of learned.

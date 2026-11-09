@@ -12,7 +12,7 @@ SSH 端口转发管理器，命令行 TUI 表格界面。Linux 与 Windows 均�
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
-│  sshpf 0.3.1  ·  ssh-config: 12 hosts  ·  cfg: ~/.config/sshpf/config.toml          13:47:03    │
+│  sshpf 0.4.0  ·  ssh-config: 12 hosts  ·  cfg: ~/.config/sshpf/config.toml          13:47:03    │
 │  ● 2 up   ◐ 0 starting   ◌ 0 retrying   ✗ 1 failed   ○ 1 off                                     │
 ├──────────────────────────────────────────────────────────────────────────────────────────────────┤
 │   名称          T 本地             远端             SSH 主机    状态        最后错误             │
@@ -91,7 +91,10 @@ sshpf --no-restore          # 启动但不自动恢复
 sshpf -c /path/config.toml  # 使用指定配置
 sshpf --list-hosts          # 打印 ~/.ssh/config 里的主机后退出
 sshpf --check               # 校验配置文件后退出
+sshpf --ignore-host-key-changes   # 接受已改变的主机密钥（全局降级开关，见排障）
 ```
+
+`--ignore-host-key-changes` 只放宽"密钥变了"这一种情况：不写入 `known_hosts`、每次接受都记一条 WARN，`@revoked` 吊销的密钥**仍然拒绝**。某台主机单独需要时，优先在 `~/.ssh/config` 的 `Host` 块里写 `StrictHostKeyChecking no`（sshpf 会读取，作用域仅限该主机）。
 
 ### 键位 / Keys
 
@@ -167,7 +170,7 @@ sshpf --check               # 校验配置文件后退出
 | 风险 | 说明与对策 |
 |---|---|
 | 密码/2FA 登录不支持 | 只走 `IdentityFile` 或 ssh-agent；需要密码的主机会立刻失败并显示「认证失败」，**不会**卡在密码提示上 |
-| 主机密钥变更 | 默认策略 `accept-new`：首次连接自动记录，**密钥变更则拒绝**（并指出 `known_hosts` 行号）；被 `@revoked` 吊销的密钥同样拒绝 |
+| 主机密钥变更 | 默认策略 `accept-new`：首次连接自动记录，**密钥变更则拒绝**（并指出 `known_hosts` 行号）；被 `@revoked` 吊销的密钥同样拒绝。确需接受变更时用 `--ignore-host-key-changes` 或 `~/.ssh/config` 的 `StrictHostKeyChecking no`，两者都留 WARN 且不改写 `known_hosts`，见[排障](#ssh-能连但-sshpf-报-host-key-verification-failed) |
 | 未做连接复用 | 同一主机多条转发各自建连（`ControlMaster -O forward` 绑定失败仍返回 exit 0，无法可靠判定成败，故不采用） |
 | 端口占用反查进程 | 仅 Linux（依赖 `/proc`），其它平台该项为空，不影响转发本身 |
 | 把错误搞静默 | 反过来的风险由设计规避：所有降级都有一条可 grep 的日志记录，见 [安全](docs/security.md) |
@@ -224,12 +227,45 @@ tail -f ~/.local/state/sshpf/logs/sshpf.log   # 实时看结构化日志
 
 | 症状 | 先看什么 |
 |---|---|
-| 主机密钥校验失败 | `known_hosts` 与服务端密钥不一致（服务器重装过）。先在终端里手动 `ssh <主机>` 确认指纹 |
+| 主机密钥校验失败 | 见下方[「ssh 能连但 sshpf 报 host key verification failed」](#ssh-能连但-sshpf-报-host-key-verification-failed) |
 | 认证失败 | 先手动 `ssh <主机>` 确认能免密登录，或 `ssh-add` 加载密钥 |
 | 端口被占用 | 详情页会显示占用进程的 `pid/进程名` |
 | 某条一直 `◌ 重试` | 网络类失败在退避；`grep 'event=tunnel.retry_scheduled'` 看排了几次，`tunnel.retry_abandoned` 表示已放弃 |
 | 界面某块不见了 | `grep 'event=ui.render_degraded'`——渲染层主动跳过的块会留一条记录 |
 | 进程崩了 / 卡死 | `grep -E 'event=crash\.|tunnel.thread_panic'`，判据见下 |
+
+### ssh 能连但 sshpf 报 host key verification failed
+
+最常见的情况：终端里 `ssh cloud_pc` 正常登录，sshpf 建同样的隧道却拒绝。**根因通常不是 `cloud_pc`，而是它前面那一跳跳板机。**典型 `~/.ssh/config`：
+
+```text
+Host cloud_pc_jump
+    HostName desk-ssh.srv.deeproute.cn
+    Port 80
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+Host cloud_pc
+    HostName 10.244.119.128
+    ProxyJump cloud_pc_jump
+```
+
+OpenSSH 因为 `StrictHostKeyChecking no` 根本不校验跳板机；sshpf 用自己的 `known_hosts` 校验器，照样拒绝。打开日志能看到是哪一跳：
+
+```bash
+grep 'event=knownhosts.rejected' ~/.local/state/sshpf/logs/sshpf.log
+# ERROR … event=knownhosts.rejected host=desk-ssh.srv.deeproute.cn port=80 policy=accept-new
+#   msg="[desk-ssh.srv.deeproute.cn]:80 的主机密钥已改变（known_hosts 第 34 行），可能存在中间人攻击"
+```
+
+`host=` 字段指出被拒的是**哪一跳**——上例里是跳板机 `desk-ssh.srv.deeproute.cn:80`，不是 `10.244.119.128`。
+
+| 顺序 | 修法 | 说明 |
+|---|---|---|
+| 1 | 首选：在 `~/.ssh/config` 对应 `Host` 块加 `StrictHostKeyChecking no` | per-host，sshpf 会读到（`no`/`off` 或 `UserKnownHostsFile /dev/null` 均生效）；目标主机仍保持严格 |
+| 2 | 或确认真实指纹后用 `ssh-keygen -R '[desk-ssh.srv.deeproute.cn]:80'` 清理旧条目 | 确实是服务器换了密钥时最干净的做法；`sshpf` 会重新学习 |
+| 3 | 兜底：`sshpf --ignore-host-key-changes` | 全局，等价 `ssh -o StrictHostKeyChecking=no`；只在临时排障时用 |
+
+**忽略是降级行为**：每次接受都在日志留一条 `knownhosts.ignored_changed`（WARN，带服务器实际呈现的 SHA256 指纹），状态条也会提示；`known_hosts` **不会被改写**，所以下次启动仍会看到同一处不一致，直到你按上表第 2 步确认或清理。`@revoked` 吊销的密钥在任何策略下都不接受。
 
 **崩溃不再是裸 panic。** 输入不合法时程序正常退出并在 stderr 说一句人话，原因写进日志，而不是甩一段 Rust 栈给用户：
 

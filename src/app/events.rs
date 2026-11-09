@@ -127,9 +127,16 @@ impl App {
     /// `remote forward success for`) is gone along with the false-ready bugs it
     /// worked around.
     pub(crate) fn on_line(&mut self, id: TunnelId, line: String) {
-        let level = if line.contains("失败") || line.contains("错误") { LogLevel::Warn } else { LogLevel::Info };
+        let warned = line.contains("失败") || line.contains("错误") || line.contains("警告");
+        let level = if warned { LogLevel::Warn } else { LogLevel::Info };
         if let Some(view) = self.tunnels.iter().find(|t| t.cfg.id == id) {
             eventlog::tunnel_line(&view.cfg, &line);
+        }
+        // A tunnel-level warning is a degraded-but-working state the user should
+        // see without opening the detail pane (ignoring a changed host key is the
+        // case this was added for), so it also reaches the status bar once.
+        if warned && line.contains("警告") {
+            self.set_status(StatusMsg::warn(line.clone()));
         }
         self.log(id, level, line);
     }

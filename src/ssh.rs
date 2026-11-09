@@ -43,6 +43,7 @@ use crate::model::ForwardKind;
 pub mod client;
 pub mod config;
 pub mod forwards;
+pub mod hostkey_conf;
 pub mod known_hosts;
 pub mod socks5;
 

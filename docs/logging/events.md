@@ -48,8 +48,9 @@
 | `sshconfig.load_failed` | WARN | `msg` | 读 / 解析失败 |
 | `sshconfig.include_capped` | WARN | `max` `msg` | `Include` 的待读文件超过上限（256），剩余文件未读；说明导入结果可能不全 |
 | `sshconfig.resolve_failed` | ERROR | 隧道字段 + `msg` | 某个 `ssh_host` 解析不出 endpoint |
-| `knownhosts.learned` | WARN | `tunnel` `host` `port` `verdict` | `accept-new` 下学到新主机密钥 |
+| `knownhosts.learned` | WARN | `tunnel` `host` `port` `verdict` | `accept-new` 下学到新主机密钥并写入 `known_hosts`。**只在真的写盘时才记**：`ignore` 下未知主机虽被接受但不持久化，因此不产生此事件（否则会让人去找一条不存在的条目） |
 | `knownhosts.rejected` | ERROR | `tunnel` `host` `port` `policy` `msg` | 密钥变了 / 被吊销 / `strict` 下未知 |
+| `knownhosts.ignored_changed` | WARN | `tunnel` `host` `port` `line` `fingerprint` | `ignore` 策略下接受了已改变的主机密钥；`known_hosts` 未被改写，`fingerprint` 是服务器实际呈现的 SHA256 指纹 |
 
 ## 隧道生命周期 / Tunnel lifecycle
 
@@ -141,6 +142,7 @@
 | `was_up` / `retryable` / `clean` | bool | `tunnel.exit`、`tunnel.failed` |
 | `elapsed_ms` | int | `tunnel.ready`、`ui.slow_frame` |
 | `path` / `msg` | string | 配置类、错误明细 |
+| `policy` / `line` / `fingerprint` | ASCII / int / string | `knownhosts.*`：命中策略、`known_hosts` 行号、服务器呈现的 SHA256 指纹 |
 | `thread` / `location` | string | `crash.panic` |
 
 ## 加一个事件 / Add an event

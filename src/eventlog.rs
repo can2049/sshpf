@@ -44,7 +44,8 @@ pub use process::{
     id_space_exhausted_on, orphan_event, state_save_failed,
 };
 pub use ssh::{
-    host_key_learned, host_key_policy_name, host_key_rejected, host_resolve_failed, hosts_failed, hosts_loaded,
+    host_key_ignored_changed, host_key_learned, host_key_policy_name, host_key_rejected, host_resolve_failed,
+    hosts_failed, hosts_loaded,
 };
 pub use tunnel::{
     forward_target_failed, kind_name, socks5_rejected, tunnel_created, tunnel_deleted, tunnel_event, tunnel_event_on,

@@ -172,7 +172,21 @@ pub struct App {
 }
 
 impl App {
+    /// Build the app with the default host-key policy.
+    ///
+    /// Kept as the single-argument constructor so the ~20 call sites in tests and
+    /// test support do not have to thread a policy through; `main` uses
+    /// [`App::with_host_key_policy`] to apply the command-line flag.
     pub fn new(paths: Paths) -> Self {
+        App::with_host_key_policy(paths, crate::ssh::known_hosts::HostKeyPolicy::default())
+    }
+
+    /// Build the app with the policy implied by the command line.
+    ///
+    /// Only the process-wide escape hatch arrives this way; per-host settings
+    /// from `~/.ssh/config` are resolved where each hop is dialled, because a
+    /// `ProxyJump` chain verifies hops separately.
+    pub fn with_host_key_policy(paths: Paths, host_key_policy: crate::ssh::known_hosts::HostKeyPolicy) -> Self {
         let mut cfg = match config::load(&paths.config) {
             Ok(cfg) => {
                 eventlog::config_loaded(&config::display_path(&paths.config), cfg.tunnels.len(), &[]);
@@ -212,7 +226,7 @@ impl App {
             event_tx,
             event_rx,
             retry_state: HashMap::new(),
-            host_key_policy: crate::ssh::known_hosts::HostKeyPolicy::default(),
+            host_key_policy,
             pending_form: None,
             pending_exit: HashMap::new(),
             pending_reason: HashMap::new(),

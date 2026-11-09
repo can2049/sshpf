@@ -180,6 +180,7 @@ mod tests {
             user: None,
             proxy_jump: Vec::new(),
             identity_file: None,
+            host_key_policy: crate::ssh::known_hosts::HostKeyPolicy::AcceptNew,
         };
         match load_auth(&endpoint).await {
             Ok(_) => {} // this machine runs an agent
