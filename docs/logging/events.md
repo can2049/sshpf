@@ -40,6 +40,34 @@
 | `log.level_invalid` | WARN | `msg` | `SSHPF_LOG_LEVEL` 写错，回退到 `info` |
 | `cli.bad_args` | ERROR | `msg` | 参数错误，进程以退出码 2 退出 |
 | `cli.stdout_failed` | WARN | `mode` | 非 TUI 模式 stdout 写失败（管道关闭、磁盘满）；**退出码仍是该模式的真实结果**，这条只是说明输出没送达 |
+| `server.socket_chmod_failed` | WARN | `msg` | socket 建成后没能收紧到 `0600`：同组用户可能连上它 |
+| `server.lock_failed` / `server.lock_open_failed` | ERROR | `msg` | 选举锁的 `flock` / `open` 真出错（不是「被别人持有」，那是 DEBUG 的 `server.election_lost`） |
+| `server.bind_failed` | ERROR | `msg` | 拿不到锁却仍无法 bind：socket 目录不可写、路径被占等 |
+| `server.client_dropped` | WARN | `session` `reason` | 某 client 收帧队列满（读不动），断开它以免拖住其他人；`reason=queue_full` |
+| `server.signal_unavailable` | WARN | `signal` | 服务端某个退出信号注册失败 |
+| `server.socket_unlink_failed` | WARN | `msg` | 关服时 socket 没删掉，下次启动会走残留恢复 |
+| `server.stopped` | INFO | `socket` | 主循环已退出并清理完毕 |
+
+## client-server 运行时 / client-server runtime
+
+> 两个进程替代了一个，所以「为什么和我想的不一样」多了一个候选答案：*是哪个进程、它们见上面了吗*。
+> 这一组事件就是为了只靠日志能回答这个问题。
+
+| `event=` | 级别 | 字段 | 含义 |
+|---|---|---|---|
+| `server.start` | INFO | `pid` `config` `socket` `keep_server` | 服务端拿到选举锁并在监听 |
+| `server.election_lost` | DEBUG | `lock` | 另一进程已在服务这份配置：**正常选举结果**，本进程退出码 3 |
+| `server.stale_socket_removed` | INFO | `socket` | 认出并清掉 `SIGKILL` 残留的 socket（抢到锁之后才做） |
+| `server.client_connected` | INFO | `count` | 某 client 完成握手；`count` 含它 |
+| `server.client_disconnected` | INFO | `count` `reason` | 某 client 离开；`reason=bye`（主动告别）/`eof`（崩溃、`kill -9`、终端被杀） |
+| `server.grace_started` | INFO | `grace_ms` `trigger` | 计数归零，开始宽限倒计时；`trigger=last_exit`(500ms)/`eof`(5000ms) |
+| `server.grace_cancelled` | INFO | `count` | 宽限期内新 client 连入，关服取消 |
+| `server.shutdown_begin` | INFO | `count` `active` `trigger` | 开始关服，`active` 是即将停掉的隧道数 |
+| `client.attached` | INFO | `server_pid` `config` | 本进程连上了服务端（而不是自己拥有隧道） |
+| `client.attach` | INFO | `config` | 本进程进入 client 模式 |
+| `client.server_spawned` | INFO | `server_pid` | 本进程拉起了它随后连上的服务端 |
+| `client.disconnected` | WARN | `reason` | 与服务端的连接断了：界面不再更新，必须让用户知道 |
+| `client.attach_failed` | ERROR | `msg` | 连不上也拉不起服务端：**不静默降级成单进程**，以非 0 退出 |
 
 ## SSH 配置与主机密钥 / SSH config & host keys
 
@@ -117,6 +145,7 @@
 | `portscan.started` | INFO | `host` `multi` | 请求扫描对端监听端口（`multi` = 勾选可批量建隧道）。它**另外开一条 SSH 连接**，所以给对端的认证日志一个本地解释 |
 | `portscan.finished` | INFO | `host` `found` `excluded` | 扫描成功；`found` 是可选的端口数，`excluded` 是因 `~/.ssh/config` 已列出而隐藏的个数 |
 | `portscan.failed` | WARN | `host` `msg` | 扫描失败（连不上、没有 `ss`/`netstat`、输出无法解析），`msg` 是面板上显示的那句话 |
+| `portscan.closed` | DEBUG | — | 端口列表被收起且没有采纳任何一项 |
 | `portscan.stale` | DEBUG | `seq` `current` | 结果属于已被替换的代次：用户换主机/重扫时旧探测才返回，答案丢弃而不是套到新列表上 |
 | `portscan.dropped` | DEBUG | `from` `to` | 主机或转发类型变了，旧列表被丢弃（`to` 是当前字段里的主机） |
 | `portscan.batch_rejected` | WARN | `problems` `msg` | 勾选端口的批量校验失败，一条都没建 |

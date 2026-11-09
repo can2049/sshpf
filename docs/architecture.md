@@ -33,10 +33,21 @@
 | `ssh` | `model`、`text`、`logging`、`eventlog`、`sys` | `app`、`ui`、`keys`、`tunnel` |
 | 叶子层 | 彼此之间尽量少，且只向下 | 任何上层 |
 
-**`ipc` 的位置（client-server 改造阶段 1 引入）**：它被将来的 `server` 与 `client`
-**双向**依赖，所以只能依赖叶子层，绝不许 `use crate::app/ui/keys/tunnel/cli`——
-否则会形成环。它现在**没有任何生产代码调用**（阶段 1 只落地协议层），
-目的正是先把协议与其测试固定下来，再在后续阶段接线。
+**`ipc` / `server` / `client` 的位置**：`ipc` 被 `server` 与 `client` **双向**依赖，
+所以只能依赖叶子层，绝不许 `use crate::app/ui/keys/tunnel/cli`——否则会形成环。
+`server` 与 `client` 都依赖 `ipc`，且都**不**依赖对方的内部实现；两者都是 Unix-only
+（Windows 仍走单进程路径）。
+
+进程模型（Unix）：
+
+| 进程 | 谁起的 | 拥有隧道？ | 写 `config.toml`？ |
+|---|---|---|---|
+| `server`（每份配置唯一） | 首个 client 自动拉起，或 `--server` | **是** | **是**（唯一写者） |
+| `client`（任意多个） | 用户运行 `sshpf` | 否，镜像快照 | 否（权威在 server） |
+
+`client` 与 `server` 之间的**状态同步只有一条路**：全量 `Snapshot` + 单调 `revision`；
+**用户意图只有一条路**：`Command` + `Reply`，且 server 一律重新校验。`App` 两边同一份类型，
+`remote: Option<Remote>` 为 `Some` 时即为镜像——见 `src/app/remote/`。
 
 **本次重构修掉的三个违规**（保留作判例）：
 
@@ -138,7 +149,19 @@
 | `src/ipc/msg.rs` | `ClientMsg`/`ServerMsg`、`Op` 命令枚举、`WireError`、`PROTO_VERSION` |
 | `src/ipc/snapshot.rs` | `Snapshot`/`WireTunnel`/`WireStatus`；`Instant` → 毫秒时间戳 |
 | `src/ipc/codec.rs` | 编解码、版本/配置协商、双语可操作错误 |
-| `src/ipc/endpoint.rs` | `config_path` → socket/lock 路径（FNV-1a）、词法规范化 |
+| `src/ipc/endpoint.rs` | `config_path` → socket/lock 路径（FNV-1a）、词法规范化、`$SSHPF_SOCKET_DIR` |
+| `src/server/mod.rs` | 权威进程主循环：drain → accept → 命令 → 广播 → 生命周期 |
+| `src/server/election.rs` | 抢锁（活 server 全程持锁）、残留 socket（锁在前、unlink 在后）、bind + `0600` |
+| `src/server/session.rs` | accept + 握手（`Hello`/`Welcome`）、每会话读/写线程、有界发送队列 |
+| `src/server/broadcast.rs` | `revision` 递增 + 全量快照扇出；队满即断开该 client |
+| `src/server/commands.rs` | `Op` → `App` 变更，**server 侧重新校验**、`expect_rev` 判定 |
+| `src/server/lifecycle.rs` | `client_count`、宽限窗口（确认 500ms / 崩溃 5s）、关服顺序 |
+| `src/client/mod.rs` | `attach()`：先连、连不上再选举、释放锁后退避重连 |
+| `src/client/handshake.rs` | `Hello`/`Welcome`、版本/配置协商、每种失败一句人话 |
+| `src/client/spawn.rs` | detached 拉起 `--server --config <path>` |
+| `src/client/pump.rs` | 读/写线程与会话拆除 |
+| `src/app/remote/` | 镜像半边：`Snapshot` → 视图、意图 → `Command`、变更指纹 |
+| `src/app/authority.rs` | server 侧 `Create`/`Update` 落地（与表单同一套记账） |
 | `src/tunnel.rs` | `Supervisor`、`TunnelEvent`、一线程一 `current_thread` runtime、`catch_unwind` |
 | `src/config.rs` | `ConfigFile`、`Defaults`、`Paths`、原子写、`0600`/`0700` |
 | `src/ssh.rs` | `ssh` 层地图 |

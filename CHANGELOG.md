@@ -5,6 +5,55 @@
 
 ## [Unreleased]
 
+本次是 **client-server 运行时**落地（阶段 2–4）：一份配置只有一个后台服务进程，多个窗口共享
+同一份状态。修的是「开第二个 `sshpf` 就报端口被占用、无法再打开」——旧版每个进程都自己拥有
+隧道并抢同一批本地端口，第二个自然撞车。方案见
+[docs/research/client-server.md](docs/research/client-server.md)。
+
+### 新增
+
+- **一份配置一个服务进程，任意多个客户端窗口共享状态。** 每个 `sshpf` 进程不再自己拥有隧道：
+  第一个窗口自动拉起 detached 的 `sshpf --server`，之后的窗口都连上它。于是
+  **第二个窗口显示的就是第一个窗口的状态**，任何窗口的操作（启停 / 新建 / 编辑 / 删除 / 批量）
+  都会广播到所有窗口。新增 `src/server/`（权威进程）与 `src/client/`（连接与拉起）。
+- **新 CLI 参数 `--server`（前台跑服务端，供调试 / systemd）与 `--keep-server`（最后一个
+  客户端退出后服务端常驻）。** `USAGE` 双语同步。
+- **最后一个客户端退出前的风险提示**：只有 `client_count == 1` 且确有运行中转发时，退出确认
+  才升级为「这是最后一个客户端：退出后所有端口转发都会停止」。别的窗口还在时文案逐字不变
+  ——避免「确认疲劳」。
+- **标题栏显示本进程角色**：`服务端/server`，或 `客户端 N/client N`；断连时显示
+  `已断开/detached`，避免「界面不更新但看起来正常」。
+- **单例选举**：活着的服务端全程持有 `flock`，进程死亡（含 `SIGKILL`）时内核自动释放——不需要
+  pid 文件或心跳。抢到锁才 unlink 残留 socket（顺序即安全性）。
+- **共享状态靠全量快照 + 单调 `revision`**，用户意图靠 `Command`/`Reply`，且**服务端一律重新
+  校验**（校验 / 端口冲突 / 去重 / id 分配），过期视图不能拥有破坏权。
+- **新日志事件**：`server.start` / `server.election_lost` / `server.stale_socket_removed` /
+  `server.client_connected` / `server.client_disconnected` / `server.grace_started` /
+  `server.grace_cancelled` / `server.shutdown_begin` / `client.attached` / `client.attach` /
+  `client.server_spawned` / `client.disconnected` / `client.attach_failed`。
+- **新环境变量 `SSHPF_SOCKET_DIR`**：socket/lock 目录（默认 `$XDG_RUNTIME_DIR/sshpf`），
+  用于测试隔离与 `$HOME` 特殊布局。
+- **`ClientMsg::Hello` 增加可选 `host_key_policy`**（协议加法，旧客户端仍可解析），服务端只记
+  不一致、不据此改变自己的策略。
+
+### 变更
+
+- **`App` 增加镜像半边（`src/app/remote/`）**：`remote: Option<Remote>` 为 `Some` 时本实例是
+  客户端镜像——状态来自快照，意图变成命令。渲染层与键位分发**读取点不变**。
+- **`main` 的模式分派**：`--server` 走服务端；否则作为客户端先 attach 再取终端。
+  attach 提前到 `take_terminal` 之前，因此无 tty 的环境（CI、`ssh host sshpf` 无 `-t`）
+  也会先尝试连接，而不是先报终端错误。
+- **客户端不写盘**：`config.toml` / `state.toml` 只由服务端写，避免过期镜像覆盖权威文件。
+- **恢复 `enabled` 隧道只在服务端做**：客户端若也恢复，每开一个窗口就会把所有隧道重启一遍。
+
+### 修复
+
+- **开第二个窗口报「端口已被占用」、无法再打开**：根因是每个进程都是独立 owner。现在第二个
+  窗口附着到已有服务端，不再抢端口。
+- **`portscan.closed` 事件此前未写进 `docs/logging/events.md`**：新增测试
+  `every_logged_event_is_in_the_catalogue` 机器校验「源码里每个 `event=` 都有文档行」，
+  发现并补齐。该测试同时防止今后再漏。
+
 ## [0.7.0] - 2026-11-09
 
 本次是 minor 版本，只有一件事：**定时连通性检测**。修的是「电脑休眠唤醒后 SSH 会话已死、

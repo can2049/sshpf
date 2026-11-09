@@ -61,6 +61,190 @@
 //! constants below with the reason spelled out, and the assertions still run for
 //! every other token.
 
+// ---------------------------------------------------------------------------
+// every `event=` the code emits is documented
+// ---------------------------------------------------------------------------
+
+/// Every `logging::*("event", …)` call in `src/eventlog/**` must have a row in
+/// `docs/logging/events.md`.
+///
+/// Same argument as the keys above: the catalogue is what a user (or an agent)
+/// reads to interpret a log line, and an undocumented event is a line nobody can
+/// act on. Two hand-written lists drift, so one is derived from the source.
+///
+/// Only the event *name* is compared, never its level or fields: the name is the
+/// stable contract, and a field added later must not fail this test.
+#[test]
+fn every_logged_event_is_in_the_catalogue() {
+    let mut missing = Vec::new();
+    for (module, source) in EVENTLOG_SOURCES {
+        for name in event_names(source) {
+            if !EVENT_CATALOGUE.contains(&format!("`{name}`")) {
+                missing.push(format!("{module}: {name}"));
+            }
+        }
+    }
+    missing.sort();
+    missing.dedup();
+    assert!(
+        missing.is_empty(),
+        "docs/logging/events.md has no row for these events (write the name in backticks):\n{}",
+        missing.join("\n")
+    );
+    // A scanner that found nothing would pass vacuously; the catalogue is large,
+    // so the source side must be too.
+    let total: usize = EVENTLOG_SOURCES.iter().map(|(_, src)| event_names(src).len()).sum();
+    assert!(total > 60, "the event scan found only {total} events, so it is not reading the sources");
+}
+
+/// Every `eventlog` module that owns `event=` names.
+///
+/// `include_str!` embeds exactly the files named here, so a new module (or a
+/// moved file) fails loudly rather than being silently unscanned.
+const EVENTLOG_SOURCES: &[(&str, &str)] = &[
+    ("process", include_str!("../src/eventlog/process.rs")),
+    ("tunnel", include_str!("../src/eventlog/tunnel.rs")),
+    ("ssh", include_str!("../src/eventlog/ssh.rs")),
+    ("user", include_str!("../src/eventlog/user.rs")),
+];
+
+const EVENT_CATALOGUE: &str = include_str!("../docs/logging/events.md");
+
+/// Every event-shaped literal in `source`, with comments blanked first.
+///
+/// An "event name" is a dotted lowercase token (`tunnel.retry_scheduled`,
+/// `client.attach_failed`). Scanning for the *shape* rather than for
+/// `logging::info(` calls is deliberate: many events are emitted through helper
+/// functions (`tunnel_event_on(logger, level, "tunnel.exit", …)`), so a scan that
+/// only looked at direct `logging::` call sites would silently miss most of the
+/// catalogue — which is exactly the failure mode this test exists to prevent.
+///
+/// String-literal contents are *not* blanked (the names live there); only comments
+/// are, so a name quoted in prose cannot invent a false positive.
+fn event_names(source: &str) -> Vec<String> {
+    let chars = blank_comments(source);
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i] != '"' {
+            i += 1;
+            continue;
+        }
+        // Collect one literal's contents.
+        i += 1;
+        let mut text = String::new();
+        while let Some(&c) = chars.get(i) {
+            if c == '"' {
+                break;
+            }
+            text.push(c);
+            i += 1;
+        }
+        i += 1;
+        if is_event_name(&text) {
+            out.push(text);
+        }
+    }
+    out
+}
+
+/// Whether `text` has the shape of an event name: dotted, lowercase, no spaces.
+///
+/// The segment rules are what keep this from matching version strings ("0.7.0"),
+/// file names ("config.toml") or log paths, which are the near-misses a looser
+/// pattern picks up.
+fn is_event_name(text: &str) -> bool {
+    let mut segments = 0usize;
+    for segment in text.split('.') {
+        if segment.is_empty() {
+            return false;
+        }
+        if !segment.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_') {
+            return false;
+        }
+        // Purely numeric segments mean a version, not a name.
+        if segment.chars().all(|c| c.is_ascii_digit()) {
+            return false;
+        }
+        segments += 1;
+    }
+    segments >= 2
+}
+
+/// Blank `//` and `/* */` comment text, keeping every other character in place.
+///
+/// Char-based throughout: these sources are full of Chinese, and mixing byte and
+/// `char` offsets is how a scan silently compares the wrong region.
+fn blank_comments(source: &str) -> Vec<char> {
+    let chars: Vec<char> = source.chars().collect();
+    let mut out = chars.clone();
+    let mut i = 0usize;
+    let mut state = ScanState::Code;
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        match state {
+            ScanState::LineComment => {
+                if c == '\n' {
+                    state = ScanState::Code;
+                } else {
+                    out[i] = ' ';
+                }
+                i += 1;
+            }
+            ScanState::BlockComment => {
+                if c == '*' && next == Some('/') {
+                    out[i] = ' ';
+                    out[i + 1] = ' ';
+                    i += 2;
+                    state = ScanState::Code;
+                } else {
+                    if c != '\n' {
+                        out[i] = ' ';
+                    }
+                    i += 1;
+                }
+            }
+            ScanState::String => {
+                if c == '\\' {
+                    i += 2;
+                } else {
+                    if c == '"' {
+                        state = ScanState::Code;
+                    }
+                    i += 1;
+                }
+            }
+            ScanState::Code => {
+                if c == '/' && next == Some('/') {
+                    out[i] = ' ';
+                    out[i + 1] = ' ';
+                    i += 2;
+                    state = ScanState::LineComment;
+                } else if c == '/' && next == Some('*') {
+                    out[i] = ' ';
+                    out[i + 1] = ' ';
+                    i += 2;
+                    state = ScanState::BlockComment;
+                } else if c == '"' {
+                    state = ScanState::String;
+                    i += 1;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+    out
+}
+
+enum ScanState {
+    Code,
+    LineComment,
+    BlockComment,
+    String,
+}
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use sshpf::help::{SECTIONS, SectionId};
