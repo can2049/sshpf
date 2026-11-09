@@ -47,7 +47,7 @@ pub(super) fn tunnel(id: u64, name: &str, port: u16) -> TunnelConfig {
         local_addr: "127.0.0.1".into(),
         local_port: port,
         remote_host: "127.0.0.1".into(),
-        remote_port: 22,
+        remote_port: port,
         enabled: false,
         auto_restart: false,
         ssh_options: vec![],

@@ -9,16 +9,29 @@
 
 - **清空导入面板勾选后，手填的转发不再被「没有勾选任何转发」挡住**：勾选数为 0 的面板没有可执行
   内容，让位给完整的手填表单（手填表单也不完整时才仍报该错）→ [import-save.md](docs/import-save.md#提交归属默认提议-vs-明确指令)
-- **手填的「新建转发」不再被自动展开的导入面板吞掉**；**新增转发也不再重复堆积**（判定比意图不比
-  端口，见 [docs/dedup.md](docs/dedup.md)）。
+- **加一个新端口转发时，同一台主机已有的转发不再被顺手重建一遍。** 导入面板原来把
+  `~/.ssh/config` 里的转发**无条件全部勾上**，其中包括已经建过的；每建一份副本，本地端口就被
+  顺延一次，于是「18789 / 18790 / 18791 都指向 `127.0.0.1:18789`」越堆越多。现在已存在的行
+  照旧列出，但标成「已存在：<隧道名>」、**不可勾选**（`space`/`a`/`I` 全部跳过），计数里也不
+  算它——`1/1 条勾选 · 1 条已存在`。见 [docs/import-pane.md](docs/import-pane.md#已存在的行--rows-that-already-exist)。
+- **已经写进 `config.toml` 的重复条目会在载入时折叠成一条**：按转发身份分组，保留文件里的第
+  一条，其余移除，每组记 `event=config.deduped`（WARN）并在启动后状态栏说明「已合并 N 条重复
+  转发」。不改 `~/.ssh/config`、不重新规划端口。见
+  [docs/dedup.md](docs/dedup.md#已写进配置的重复载入时折叠--fold-duplicates-on-load)。
+- **手填的「新建转发」不再被自动展开的导入面板吞掉**（未被动过的面板只是默认提议，完整的手填
+  表单才是明确指令）；**新增转发也不再重复堆积**，判定比意图不比端口，见 [docs/dedup.md](docs/dedup.md)。
 
 ### 变更
 
-- **AI agent 协作约束：一条改动一个 worktree**（[AGENTS.md](AGENTS.md) +
-  [agents.md](docs/agents.md#一特性一-worktree--one-worktree-per-change)）：改动一律在独立 worktree
-  + 独立分支里做，**合并后立即删除 worktree 与本地/远端分支**。
-- 新增事件 `action.duplicate_skipped`；`docs/import-forwards.md` 按职责拆为 import-pane /
-  import-save / port-scan 三篇，`design.md` 加 D32/D33。
+- **给 AI agent 的协作约束：一条改动一个 worktree。** 文档新增「一特性一 worktree」
+  一节（[`AGENTS.md`](AGENTS.md) + [`docs/agents.md`](docs/agents.md#一特性一-worktree--one-worktree-per-change)）：
+  开发新特性、修复问题一律在 `.agents/worktrees/<分支名>` 的独立 worktree + 独立分支里做，
+  不在共享 checkout 里改；**PR 合并后立即删除该 worktree 与本地/远端分支**，不留僵尸分支。
+  纯文档约定变更，无代码、无行为变化。
+- 新增事件 `action.duplicate_skipped` 与 `config.deduped`；`docs/import-forwards.md` 按职责拆为
+  import-pane / import-save / port-scan 三篇，`design.md` 加 D32/D33/D34。
+- 身份算法抽出 `model::tunnel::identity_of`，`TunnelConfig` 与 `SshForward`（未规划端口时）共用
+  一份；方向映射抽出 `SshForward::ends`，`app::import` 只在其上加端口规划。
 
 ## [0.5.0] - 2026-11-09
 

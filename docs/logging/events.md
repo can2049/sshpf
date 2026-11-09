@@ -31,6 +31,7 @@
 | `config.invalid` | WARN | `path` `msg` | 每条校验问题的明细 |
 | `config.load_failed` | ERROR | `path` `msg` `fallback` | 配置读不进来，以空配置启动 |
 | `config.repaired` | WARN | `path` `entries` | 载入时修正了重复 id / 缺失时间戳 |
+| `config.deduped` | WARN | `kept` `dropped` | 载入时把「同一个转发」的多条已保存条目折成一条；`kept` 是留下的条目名，`dropped` 被移除的条数。每组一条 |
 | `config.save_failed` | ERROR | `path` `msg` | 写盘失败：改动只在内存里 |
 | `config.perms_tightened` | WARN / ERROR | `path` `ok` | 配置原先对同组/所有人可读，已收紧到 `0600`（`ok=false` 即收紧失败，记 ERROR） |
 | `config.defaults_clamped` | WARN | `field` `original` `used` | 手写的 `retry_initial_secs` / `retry_max_secs` 越界或倒挂，已钳制到 [1s, 24h] |

@@ -84,6 +84,15 @@ impl ImportColumn {
 pub struct ImportRow {
     pub forward: SshForward,
     pub checked: bool,
+    /// Name of the saved tunnel that already *is* this forward, if any.
+    ///
+    /// A row with `Some(name)` is still listed — hiding it would make the pane
+    /// silently disagree with `~/.ssh/config`, and the user would have no way to
+    /// see why a forward they wrote is "missing". It is rendered dimmed with
+    /// 「已存在」 and can never be ticked: creating it would be the duplicate this
+    /// very marker exists to prevent. See [`ImportRow::existing`] for the flag
+    /// checks and `docs/dedup.md` for the identity rule.
+    pub existing: Option<String>,
 }
 
 impl ImportRow {
@@ -91,6 +100,17 @@ impl ImportRow {
     /// with no destination): the table renders them dimmed with the reason.
     pub fn importable(&self) -> bool {
         self.forward.unsupported_reason().is_none()
+    }
+
+    /// Whether this row can still be *created*: importable and not already saved.
+    ///
+    /// This — not [`ImportRow::importable`] — is what the tick marks and the
+    /// checked counters use. A row that already exists is perfectly importable as
+    /// data; what it cannot be is a new tunnel. Keeping the two predicates apart
+    /// is what lets the pane still explain itself ("this forward is already
+    /// there") instead of just dropping the line.
+    pub fn creatable(&self) -> bool {
+        self.importable() && self.existing.is_none()
     }
 }
 
