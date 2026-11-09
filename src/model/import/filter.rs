@@ -151,6 +151,13 @@ impl ImportTable {
     /// `*_en()` accessors (`src/ui/import.rs`).
     pub fn summary(&self) -> String {
         let mut s = format!("{}/{} 条勾选", self.checked_count(), self.importable_count());
+        // Rows kept only to say "you already have this". Same reason as the
+        // bilingual footer in `ui::import::footer`: a dimmed row whose exclusion
+        // from both counts is unexplained looks like a rendering bug.
+        match self.existing_count() {
+            0 => {}
+            n => s.push_str(&format!(" · {n} 条已存在")),
+        }
         if self.has_filters() {
             let parts: Vec<String> = ImportColumn::ALL
                 .into_iter()

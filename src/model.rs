@@ -16,6 +16,7 @@
 //! | `import::table` | `ImportTable`: candidate rows, cursor, scroll, selection | `app::import`, `ui::import`, `app::mouse` | row/selection state and navigation |
 //! | `import::filter` | `ImportTable`'s per-column filters + the undo stack | `app::import`, `keys` | filter/undo behaviour |
 //! | `batch` | `MultiSelect`, `BatchAction`: the marked-set and the batch verbs | `app`, `keys`, `ui`, `ui::hit` | a batch verb or selection rule |
+//! | `dedup` | `fold_duplicates`, `Folded`: folding saved entries that mean one forward | `config` | which duplicate survives, how it is reported |
 //! | `failure` | `FailureKind`, `FailureInfo`: classified ssh failures | `ssh::client`, `tunnel`, `app`, `ui` | a new failure class or its wording |
 //! | `status` | `TunnelStatus`, `LogLevel`, `LogLine`, `LogRing`, `TunnelView`: live state | `tunnel`, `app`, `ui` | a lifecycle state or log-ring behaviour |
 //! | `form` | `FormField`, `FormMode`, `InputBuf`: the create/edit form's state | `app::form`, `app::import`, `ui` | a field, or text-editing behaviour |
@@ -33,6 +34,7 @@
 //!    off it.
 
 mod batch;
+mod dedup;
 mod failure;
 mod form;
 mod import;
@@ -52,10 +54,12 @@ pub type TunnelId = u64;
 // split. New code may name the submodule directly (`crate::model::status::…`);
 // these are the stable surface.
 pub use batch::{BatchAction, MultiSelect};
+pub use dedup::{Folded, fold_duplicates};
 pub use failure::{FailureInfo, FailureKind};
 pub use form::{FormField, FormMode, InputBuf};
 pub use import::{
-    ImportColumn, ImportRow, ImportTable, LocalPortReason, PORT_SCAN_LIMIT, SshForward, col_match, plan_local_port,
+    ForwardEnds, ImportColumn, ImportRow, ImportTable, LocalPortReason, PORT_SCAN_LIMIT, SshForward, col_match,
+    plan_local_port,
 };
 pub use r#match::fuzzy_match;
 pub use msg::{StatusMsg, now_hms, now_unix};
@@ -65,4 +69,4 @@ pub use portscan::{
     parse_listen_ports,
 };
 pub use status::{LogLevel, LogLine, LogRing, TunnelStatus, TunnelView};
-pub use tunnel::{ForwardKind, TunnelConfig};
+pub use tunnel::{ForwardKind, TunnelConfig, identity_of};

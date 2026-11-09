@@ -31,7 +31,7 @@
 use crate::app::{App, FormMode};
 use crate::config;
 use crate::help;
-use crate::model::{self, ForwardKind, SshForward, StatusMsg, TunnelConfig, TunnelView, now_unix};
+use crate::model::{self, ForwardEnds, ForwardKind, SshForward, StatusMsg, TunnelConfig, TunnelView, now_unix};
 use crate::ssh;
 
 // ---------------------------------------------------------------------------
@@ -341,56 +341,28 @@ fn unique_within(base: &str, siblings: Vec<String>) -> String {
     base.to_string()
 }
 
-/// Which side of an imported forward becomes which side of the config.
-struct ForwardEnds {
-    local_addr: String,
-    local_port: u16,
-    remote_host: String,
-    remote_port: u16,
-}
-
-/// Map an imported ssh-config forward onto a config's local/remote sides.
+/// Map an imported ssh-config forward onto a config's local/remote sides, then
+/// pick a bindable local port where one is needed.
 ///
-/// The mapping is not symmetric, which is why it is one function: `-L`/`-D`
-/// listen locally, but `-R` listens *on the server* and lands locally, so the ssh
-/// config's listen side becomes the config's remote side. Getting this backwards
-/// would silently forward the wrong port.
-///
-/// `-L`/`-D` bind locally, so only those need a collision-free port; that scan
-/// uses `plan_local_port` (shared with the form) and `taken` so two rows cannot
-/// be handed the same port.
+/// The direction mapping itself is [`SshForward::ends`] (in `model`), because the
+/// duplicate detector asks the same question without planning a port. What is
+/// added here is the *planning*: `-L`/`-D` bind locally, so only those need a
+/// collision-free port, and `taken` keeps two rows of one batch from being handed
+/// the same one.
 fn forward_ends(bind: &str, forward: &SshForward, taken: &[u16]) -> ForwardEnds {
-    let listen_addr = if forward.listen_addr.is_empty() { bind.to_string() } else { forward.listen_addr.clone() };
-    let mut ends = match forward.kind {
-        ForwardKind::Local => ForwardEnds {
-            local_addr: listen_addr,
-            local_port: forward.listen_port,
-            remote_host: forward.target_host.clone(),
-            remote_port: forward.target_port,
-        },
-        ForwardKind::Remote => ForwardEnds {
-            local_addr: forward.target_host.clone(),
-            local_port: forward.target_port,
-            remote_host: listen_addr,
-            remote_port: forward.listen_port,
-        },
-        ForwardKind::Dynamic => ForwardEnds {
-            local_addr: listen_addr,
-            local_port: forward.listen_port,
-            remote_host: String::new(),
-            remote_port: 0,
-        },
-    };
-    if forward.kind != ForwardKind::Remote {
-        // A privileged port is never scanned upwards from itself, which would
-        // spend the whole budget inside the range that needs root.
-        let addr = ends.local_addr.clone();
-        if let Some((port, _)) = model::plan_local_port(ends.local_port, taken, |c| ssh::port_available(&addr, c)) {
-            ends.local_port = port;
-        }
-        // Nothing usable found: keep the requested port so validation reports the
-        // real problem instead of silently using port 0.
+    let mut ends = forward.ends(bind);
+    // `-R` does not bind locally, so its port is passed through untouched.
+    if forward.kind == ForwardKind::Remote {
+        return ends;
     }
+    // A privileged port is never scanned upwards from itself, which would spend
+    // the whole budget inside the range that needs root.
+    let addr = ends.local_addr.clone();
+    if let Some((port, _)) = model::plan_local_port(ends.local_port, taken, |c| ssh::port_available(&addr, c)) {
+        ends.local_port = port;
+    }
+    // Nothing usable found: keep the requested port so validation reports the real
+    // problem instead of silently using port 0.
     ends
 }
 

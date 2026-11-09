@@ -11,7 +11,7 @@
 //! and the importer share.
 //! Does not belong: anything that reads the file (that is `ssh::forwards`).
 
-use super::tunnel::ForwardKind;
+use super::tunnel::{ForwardKind, identity_of};
 
 pub(super) mod filter;
 pub(super) mod row;
@@ -119,6 +119,73 @@ impl SshForward {
     pub fn suggested_name(&self) -> String {
         format!("{}-{}-{}", self.host_alias, self.kind.tag(), self.listen_port)
     }
+
+    /// Which side of this directive becomes which side of a `TunnelConfig`.
+    ///
+    /// Pure, and deliberately *before* any local-port planning: the planner probes
+    /// sockets and may bump the number, so the answer depends on what is running
+    /// right now. The duplicate question must not depend on that — see
+    /// [`SshForward::forward_identity`].
+    ///
+    /// The mapping is not symmetric, which is why it lives in one function:
+    /// `-L`/`-D` listen locally, but `-R` listens *on the server* and lands
+    /// locally, so the directive's listen side becomes the config's remote side.
+    /// Getting this backwards would silently forward the wrong port.
+    pub fn ends(&self, bind: &str) -> ForwardEnds {
+        let listen_addr = if self.listen_addr.is_empty() { bind.to_string() } else { self.listen_addr.clone() };
+        match self.kind {
+            ForwardKind::Local => ForwardEnds {
+                local_addr: listen_addr,
+                local_port: self.listen_port,
+                remote_host: self.target_host.clone(),
+                remote_port: self.target_port,
+            },
+            ForwardKind::Remote => ForwardEnds {
+                local_addr: self.target_host.clone(),
+                local_port: self.target_port,
+                remote_host: listen_addr,
+                remote_port: self.listen_port,
+            },
+            ForwardKind::Dynamic => ForwardEnds {
+                local_addr: listen_addr,
+                local_port: self.listen_port,
+                remote_host: String::new(),
+                remote_port: 0,
+            },
+        }
+    }
+
+    /// The [`TunnelConfig::forward_identity`] this directive *means*, without
+    /// planning a local port.
+    ///
+    /// Used to ask "do we already have this forward?" before the import pane
+    /// offers the row. Comparing against a planned config would answer a
+    /// different question: the planner's output depends on what is listening
+    /// right now, so the same row could look new on one run and old on the next.
+    ///
+    /// `-L`'s local port drops out of the identity anyway (see
+    /// [`crate::model::identity_of`]), so this is exact for `-L`. For `-R`/`-D`,
+    /// where the local port *is* identity, the directive's own port is used —
+    /// that is the port the user asked for, which is what the persisted side means
+    /// too unless a bump happened (and `-R` is never bumped; `-D`'s bump is
+    /// visible because the row is skipped as a duplicate of the saved tunnel).
+    pub fn forward_identity(&self, bind: &str) -> String {
+        let ends = self.ends(bind);
+        identity_of(self.kind, &self.host_alias, &ends.local_addr, ends.local_port, &ends.remote_host, ends.remote_port)
+    }
+}
+
+/// One discovered forward, split into the two ends a `TunnelConfig` stores.
+///
+/// Produced by [`SshForward::ends`], consumed by the importer (which then plans a
+/// local port on top). It exists so the direction mapping is one function instead
+/// of a match at each call site.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardEnds {
+    pub local_addr: String,
+    pub local_port: u16,
+    pub remote_host: String,
+    pub remote_port: u16,
 }
 
 /// Why [`plan_local_port`] picked the port it did, for the form's hint text.

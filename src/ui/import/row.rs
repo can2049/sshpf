@@ -134,35 +134,56 @@ pub(super) fn unsupported_label(row: &ImportRow) -> String {
 
 /// One row, padded to the full width so the cursor bar spans the whole line.
 pub(super) fn row_line(row: &ImportRow, is_cursor: bool, cols: &[ColSpec], width: u16, p: Palette) -> Line<'static> {
-    let importable = row.importable();
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(cols.len() + 2);
-    spans.push(check_cell(row, importable, is_cursor, p));
+    spans.push(check_cell(row, is_cursor, p));
     spans.push(Span::raw(" "));
-    spans.extend(value_cells(row, cols, importable, p));
+    spans.extend(value_cells(row, cols, p));
     pad_to_line(&mut spans, cols, width);
     let line = Line::from(spans);
     if is_cursor { line.style(p.focused()) } else { line }
 }
 
-/// The leading `▸[x]` / ` [ ]` / ` [–]` cell.
+/// The leading cell: cursor mark, then one of four box glyphs.
 ///
-/// Symbol *and* colour: `▸` marks the cursor row, and `[–]` is what an
-/// un-importable row looks like — both must read in a `NO_COLOR` run.
-fn check_cell(row: &ImportRow, importable: bool, is_cursor: bool, p: Palette) -> Span<'static> {
+/// Symbol *and* colour, so a `NO_COLOR` run loses no information:
+///
+/// | glyph | meaning |
+/// |---|---|
+/// | `[x]` | ticked — saving creates this forward |
+/// | `[ ]` | not ticked |
+/// | `[✓]` | already saved as a tunnel (dimmed, never tickable) |
+/// | `[–]` | cannot be imported at all (dimmed, reason in the last column) |
+///
+/// `[✓]` rather than a second `[–]`: "you already have this" and "this cannot be
+/// expressed" are different sentences, and the pane has to say both. The tick
+/// box is the one place where the user decides, so the distinction belongs here
+/// as well as in the last column's label.
+fn check_cell(row: &ImportRow, is_cursor: bool, p: Palette) -> Span<'static> {
     let lead = if is_cursor { "▸" } else { " " };
-    let check = if !importable {
-        "[–]"
+    let (check, style) = if !row.importable() {
+        ("[–]", p.fg(p.dim))
+    } else if row.existing.is_some() {
+        ("[✓]", p.fg(p.dim))
     } else if row.checked {
-        "[x]"
+        ("[x]", p.fg(p.up))
     } else {
-        "[ ]"
+        ("[ ]", p.fg(p.dim))
     };
-    let check_style = if !importable || !row.checked { p.fg(p.dim) } else { p.fg(p.up) };
-    Span::styled(format!("{lead}{check}"), check_style)
+    Span::styled(format!("{lead}{check}"), style)
+}
+
+/// `已存在：cloud_pc-L-18789 / exists as cloud_pc-L-18789`.
+///
+/// Chinese first and verbatim: the pane test asserts on 「已存在」, the same way the
+/// port-in-use hint is asserted by 「占用」. The English half is composed here rather
+/// than stored, so the two cannot drift apart.
+pub(super) fn existing_label(name: &str) -> String {
+    bi(&format!("已存在：{name}"), &format!("exists as {name}"))
 }
 
 /// The data cells, in column order.
-fn value_cells(row: &ImportRow, cols: &[ColSpec], importable: bool, p: Palette) -> Vec<Span<'static>> {
+fn value_cells(row: &ImportRow, cols: &[ColSpec], p: Palette) -> Vec<Span<'static>> {
+    let importable = row.importable();
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(cols.len());
     for (i, spec) in cols.iter().enumerate() {
         if i > 0 {
@@ -178,6 +199,17 @@ fn value_cells(row: &ImportRow, cols: &[ColSpec], importable: bool, p: Palette) 
             // languages are paired at the source instead of drifting here.
             let reason = format!("⚠ {}", unsupported_label(row));
             spans.push(cell_span(&reason, rest_width(cols, i).max(spec.width), p.fg(p.failed)));
+            continue;
+        }
+        // An already-saved forward explains itself in the same place, for the same
+        // reason: the user's question is "why can't I tick this?", and the answer
+        // is a sentence, not a column value. It names the tunnel so the row is
+        // traceable to the table the user is about to look at.
+        if let Some(existing) = row.existing.as_deref()
+            && last
+        {
+            let label = existing_label(existing);
+            spans.push(cell_span(&label, rest_width(cols, i).max(spec.width), p.fg(p.dim)));
             continue;
         }
         let style = if !importable {
@@ -291,8 +323,11 @@ mod tests {
     #[test]
     fn an_unimportable_row_on_a_wide_pane_keeps_its_reason_readable() {
         let p = palette_with(true);
-        let bad =
-            ImportRow { forward: forward(ForwardKind::Local, 0, "LocalForward abc 127.0.0.1:3000"), checked: false };
+        let bad = ImportRow {
+            forward: forward(ForwardKind::Local, 0, "LocalForward abc 127.0.0.1:3000"),
+            checked: false,
+            existing: None,
+        };
         for w in [90u16, 4_000, u16::MAX] {
             let cols = columns(w);
             let line = row_line(&bad, false, &cols, w, p);
@@ -335,7 +370,7 @@ mod tests {
         // Built through real `ImportRow`s rather than by passing strings, so this
         // exercises the actual path `row_line` takes (and would break the day the
         // model's two accessors disagree about whether a row is importable).
-        let row = |forward: SshForward| ImportRow { forward, checked: false };
+        let row = |forward: SshForward| ImportRow { forward, checked: false, existing: None };
 
         // `listen_port == 0`: the port could not be parsed.
         let bad_port = row(forward(ForwardKind::Local, 0, "LocalForward abc 127.0.0.1:3000"));
@@ -361,8 +396,11 @@ mod tests {
     fn unimportable_rows_render_the_reason_not_the_directive() {
         let p = palette_with(true);
         let cols = columns(90);
-        let bad =
-            ImportRow { forward: forward(ForwardKind::Local, 0, "LocalForward abc 127.0.0.1:3000"), checked: false };
+        let bad = ImportRow {
+            forward: forward(ForwardKind::Local, 0, "LocalForward abc 127.0.0.1:3000"),
+            checked: false,
+            existing: None,
+        };
         let line = row_line(&bad, false, &cols, 90, p);
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("⚠ 端口无法解析"), "{text}");
@@ -374,8 +412,11 @@ mod tests {
     fn cursor_rows_are_flagged_with_a_symbol_too() {
         let p = palette_with(true);
         let cols = columns(90);
-        let good =
-            ImportRow { forward: forward(ForwardKind::Local, 8080, "LocalForward 8080 127.0.0.1:3000"), checked: true };
+        let good = ImportRow {
+            forward: forward(ForwardKind::Local, 8080, "LocalForward 8080 127.0.0.1:3000"),
+            checked: true,
+            existing: None,
+        };
         let text = |l: Line<'static>| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>();
         assert!(text(row_line(&good, true, &cols, 90, p)).starts_with("▸[x]"));
         assert!(text(row_line(&good, false, &cols, 90, p)).starts_with(" [x]"));

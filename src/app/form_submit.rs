@@ -636,6 +636,92 @@ mod tests {
     }
 
     #[test]
+    fn adding_one_new_port_never_re_creates_the_hosts_existing_forwards() {
+        // The reported bug, end to end and through the real submit path. `cloud_pc`
+        // declares two forwards in `~/.ssh/config`; both are already managed. The
+        // user opens "new tunnel", the pane fills with those two, and they type a
+        // third one by hand. `ctrl+s` used to create all three — then four, then
+        // six — because the pane offered the existing two as *ticked defaults* on
+        // every open, and each copy got a freshly bumped local port so the
+        // duplicate check saw nothing.
+        //
+        // Built through the `built_in_cfg` + `install_import_rows` pair rather than
+        // by hand, so it exercises the real discovery → table → submit chain
+        // (including the `existing` marking), not a mock of it.
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths { config: dir.path().join("config.toml"), state: dir.path().join("state.toml") };
+        let cfg = ConfigFile {
+            tunnels: vec![saved_tunnel(18789, 18789, "dev-box"), {
+                let mut second = saved_tunnel(44897, 44897, "dev-box");
+                second.id = 2;
+                second.name = "already-there-2".into();
+                second
+            }],
+            ..ConfigFile::default()
+        };
+        crate::config::save(&paths.config, &cfg).unwrap();
+        let mut app = App::new(paths);
+        app.open_form_create();
+        app.form.as_mut().unwrap().ssh_host.set("dev-box");
+        // The host's two directives, exactly as discovery would report them.
+        app.install_import_rows(
+            "dev-box",
+            vec![
+                SshForward {
+                    kind: ForwardKind::Local,
+                    listen_addr: String::new(),
+                    listen_port: 18789,
+                    target_host: "127.0.0.1".into(),
+                    target_port: 18789,
+                    host_alias: "dev-box".into(),
+                    line: 30,
+                    raw: "LocalForward 18789 127.0.0.1:18789".into(),
+                },
+                SshForward {
+                    kind: ForwardKind::Local,
+                    listen_addr: String::new(),
+                    listen_port: 44897,
+                    target_host: "127.0.0.1".into(),
+                    target_port: 44897,
+                    host_alias: "dev-box".into(),
+                    line: 32,
+                    raw: "LocalForward 44897 127.0.0.1:44897".into(),
+                },
+            ],
+        );
+        // Both already exist: nothing is offered as a default to create.
+        assert_eq!(
+            app.form.as_ref().unwrap().import.checked_count(),
+            0,
+            "the host's existing forwards must not arrive ticked"
+        );
+        assert_eq!(app.form.as_ref().unwrap().import.existing_count(), 2);
+
+        // The user types the one they actually want and saves.
+        let wanted = free_port();
+        fill_hand_typed(&mut app, "cloud_pc-3081", wanted, wanted);
+        app.submit_form();
+
+        assert_eq!(
+            app.tunnels.len(),
+            3,
+            "exactly one new tunnel: {:#?}",
+            app.tunnels.iter().map(|t| t.cfg.name.clone()).collect::<Vec<_>>()
+        );
+        let created: Vec<&str> = app
+            .tunnels
+            .iter()
+            .map(|t| t.cfg.name.as_str())
+            .filter(|n| *n != "already-there" && *n != "already-there-2")
+            .collect();
+        assert_eq!(created.len(), 1, "the two pre-existing entries must not be duplicated");
+        assert_eq!(created[0], "cloud_pc-3081");
+        let new_tunnel = app.tunnels.iter().find(|t| t.cfg.name == "cloud_pc-3081").unwrap();
+        assert_eq!(new_tunnel.cfg.remote_port, wanted);
+        assert_eq!(new_tunnel.cfg.local_port, wanted);
+    }
+
+    #[test]
     fn the_same_forward_typed_with_a_taken_local_port_says_already_exists() {
         // Both rules apply to a re-typed duplicate (same intent *and* a listen
         // collision). The duplicate message is the one that describes what is

@@ -188,6 +188,13 @@ pub struct App {
     /// from `validated_port_batch` to the `commit_port_batch` that follows it in
     /// the same submit, so the status line can report the count.
     pub(crate) pending_port_skipped: Vec<String>,
+    /// Duplicate saved entries that were folded on load, kept so `main` can say so.
+    ///
+    /// The repair itself happens in `config` (it owns the file), but *telling the
+    /// user* is a UI decision, and the status bar is set from `main`/`app` — this
+    /// field is the hand-off between them. Empty for a clean config, which is the
+    /// normal case.
+    pub folded_on_load: Vec<crate::model::Folded>,
 }
 
 impl App {
@@ -206,9 +213,11 @@ impl App {
     /// from `~/.ssh/config` are resolved where each hop is dialled, because a
     /// `ProxyJump` chain verifies hops separately.
     pub fn with_host_key_policy(paths: Paths, host_key_policy: crate::ssh::known_hosts::HostKeyPolicy) -> Self {
-        let mut cfg = match config::load(&paths.config) {
-            Ok(cfg) => {
+        let mut folded_on_load = Vec::new();
+        let mut cfg = match config::load_with_report(&paths.config) {
+            Ok((cfg, folded)) => {
                 eventlog::config_loaded(&config::display_path(&paths.config), cfg.tunnels.len(), &[]);
+                folded_on_load = folded;
                 cfg
             }
             Err(e) => {
@@ -257,6 +266,7 @@ impl App {
             port_rx: None,
             port_seq: 0,
             pending_port_skipped: Vec::new(),
+            folded_on_load,
         }
     }
 
@@ -421,7 +431,7 @@ mod tests {
             local_addr: "127.0.0.1".into(),
             local_port: port,
             remote_host: "127.0.0.1".into(),
-            remote_port: 22,
+            remote_port: port,
             enabled: false,
             auto_restart: false,
             ssh_options: vec![],

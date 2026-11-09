@@ -35,6 +35,8 @@
 | 改导入面板的**交互**（筛选/全选/自动展开） | [import-pane.md](import-pane.md) | `src/app/import_pane.rs`、`src/model/import/` |
 | 改 `ctrl+s` **保存**导入行（字段映射/端口顺延/命名） | [import-save.md](import-save.md) | `src/app/import.rs`、`src/app/form_submit.rs` |
 | 改「新增时怎么判定已有相同转发」 | [dedup.md](dedup.md) | `src/model/tunnel.rs`、`src/app/duplicate.rs` |
+| 改「已经重复的条目怎么办」 | [dedup.md](dedup.md#已写进配置的重复载入时折叠--fold-duplicates-on-load) | `src/model/dedup.rs`、`src/config.rs` |
+| 改「导入面板里哪一行不能勾」 | [import-pane.md](import-pane.md#已存在的行--rows-that-already-exist) | `src/model/import/row.rs`、`src/app/import_pane.rs` |
 | 改「手填表单与导入面板谁赢 `ctrl+s`」 | [import-save.md](import-save.md#提交归属默认提议-vs-明确指令) | `src/app/form_submit.rs`、`src/model/import/table.rs` |
 | 改「对端监听端口」选择 / 扫描 | [port-scan.md](port-scan.md) | `src/ssh/probe.rs`、`src/app/port_scan.rs`、`src/model/portscan.rs` |
 | 查键位 / 帮助文案 | [keymap.md](keymap.md) | `src/help.rs`、`src/keys/` |
@@ -59,7 +61,7 @@
 | [import-pane.md](import-pane.md) | 面板何时自动展开、`touched` 标记、逐列筛选与撤销、全选只看筛选视图 | 哪些行被列出、保存 |
 | [import-save.md](import-save.md) | `ctrl+s` 归谁、一条勾选行变成什么、端口顺延、命名、保存后状态 | 行发现、面板交互 |
 | [port-scan.md](port-scan.md) | 对端监听端口：探测命令、哪些不列出、单条/批量选择、`-R` 只读、扫描线程与代次 | `~/.ssh/config` 导入 |
-| [dedup.md](dedup.md) | 新增转发时的**转发身份去重**：判据、三个入口的行为、留痕 | 行去重（在 import-forwards） |
+| [dedup.md](dedup.md) | 新增转发时的**转发身份去重**：判据、三个入口的行为、留痕、**已写进配置的重复怎么折叠** | 行去重（在 import-forwards） |
 | [design.md](design.md) | 关键设计决策索引（1 段 + 链接） | 任何展开叙述 |
 | [agents.md](agents.md) | 改码/写作约定与 checklist | 项目背景 |
 | [research/README.md](research/README.md) | 历史调研的定位与目录 | 当前行为 |

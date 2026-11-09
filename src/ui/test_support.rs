@@ -36,7 +36,7 @@ mod fixtures {
             local_addr: "127.0.0.1".into(),
             local_port: port,
             remote_host: "127.0.0.1".into(),
-            remote_port: 3000,
+            remote_port: port,
             enabled: false,
             auto_restart: true,
             ssh_options: vec![],

@@ -168,12 +168,35 @@ fn prepare_app(app: &mut App, no_restore: bool) {
         logging::error("log.unavailable", &[("msg", &reason)]);
     }
     app.load_hosts();
+    // The load repaired the user's table: entries that meant the same forward were
+    // folded into one (see `model::dedup`). A shorter table on start-up with no
+    // explanation reads as data loss, so it is said out loud — after `load_hosts`
+    // so `--no-restore`'s own notice does not overwrite it.
+    announce_folded(app);
     if no_restore {
         logging::info("app.restore_skipped", &[("reason", &"no-restore")]);
         app.set_status(StatusMsg::info("已跳过自动恢复（--no-restore）"));
     } else {
         app.restore_enabled();
     }
+}
+
+/// Say that duplicate saved entries were merged on load, if any were.
+///
+/// Both halves of the sentence matter: *how many* rows disappeared (the table is
+/// visibly shorter) and *which intent they collapsed into* (so the survivor is
+/// identifiable in the list). Silent repair would be read as "sshpf lost my
+/// forwards" — the opposite of the truth.
+fn announce_folded(app: &mut App) {
+    if app.folded_on_load.is_empty() {
+        return;
+    }
+    let dropped: usize = app.folded_on_load.iter().map(|g| g.dropped.len()).sum();
+    let kept = app.folded_on_load.first().map(|g| g.kept.clone()).unwrap_or_default();
+    app.set_status(StatusMsg::warn(sshpf::help::bi(
+        &format!("已合并 {dropped} 条重复转发（保留「{kept}」等 {} 条）", app.folded_on_load.len()),
+        &format!("Merged {dropped} duplicate forward(s) into {} existing one(s)", app.folded_on_load.len()),
+    )));
 }
 
 /// Shut the session down in the order that cannot leave a broken terminal behind.

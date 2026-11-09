@@ -70,6 +70,27 @@ impl App {
             batch.iter().find(|other| other.forward_identity() == identity).map(|other| other.name.clone())
         })
     }
+
+    /// The name of a saved tunnel that already *is* `forward`, without planning
+    /// anything.
+    ///
+    /// The import pane asks this **before** it decides what to pre-tick. Two
+    /// reasons it must not go through [`Self::duplicate_of`]:
+    ///
+    /// 1. That function takes a built `TunnelConfig`, and building one plans a
+    ///    local port — which probes sockets. The pane is a *list*; a question asked
+    ///    once per row while drawing would make the answer depend on what is
+    ///    listening at that instant, so a busy port could hide an existing forward.
+    /// 2. The pane asks about every row of a host, including ones it is about to
+    ///    leave unticked. Answering from intent alone keeps that cheap and
+    ///    side-effect free.
+    ///
+    /// Identity comes from [`SshForward::forward_identity`], which is the same
+    /// recipe as [`TunnelConfig::forward_identity`] — the two cannot drift.
+    pub(crate) fn saved_forward_name(&self, forward: &crate::model::SshForward) -> Option<String> {
+        let identity = forward.forward_identity(&self.cfg.defaults.bind);
+        self.cfg.tunnels.iter().find(|t| t.forward_identity() == identity).map(|t| t.name.clone())
+    }
 }
 
 #[cfg(test)]
