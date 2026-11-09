@@ -3,10 +3,11 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [0.4.1] - 2026-11-09
+## [0.5.0] - 2026-11-09
 
-本次是 patch 版本：把「新建 / 编辑转发」里最靠记忆的一步——填远端端口——变成可以
-直接从对端正在监听的端口里挑。无新增依赖、无配置格式变化。
+本次是 minor 版本，两件事：把「新建 / 编辑转发」里最靠记忆的一步——填远端端口——
+变成可以直接从对端正在监听的端口里挑；并修正 v0.4.0 引入的一个主机密钥误判
+（同一台主机的「不同算法」被错报成「密钥已改变」）。无新增依赖、无配置格式变化。
 
 ### 新增
 
@@ -34,6 +35,29 @@
 - 新增日志事件 `portscan.started` / `portscan.finished` / `portscan.failed`（它另外开一条
   SSH 连接，需要给对端的认证日志一个本地解释），以及 `portscan.stale` / `portscan.dropped` /
   `portscan.batch_rejected`。
+
+### 修复
+
+- **「服务器提供多种密钥算法」被误报为「主机密钥已改变」。** `known_hosts` 的条目本应按
+  「主机 + 算法」匹配（OpenSSH 语义）：一台主机可以同时有 `ssh-ed25519` 与
+  `ecdsa-sha2-nistp256` 两行，协商到后者不等于密钥被换。原实现把**任何**不匹配的条目都
+  记为 `Changed`，于是"服务器提供多算法、而 `known_hosts` 只记了其中一种"这种极常见的情况
+  会跳出「可能存在中间人攻击」并拒绝连接——即使 `@revoked`、算法都没问题。
+
+  实测：某主机在 `known_hosts` 只有 ECDSA 一行，而会话协商到 ED25519。OpenSSH 在
+  `StrictHostKeyChecking=yes` 下能正常登录，sshpf 却拒绝，两者对同一份文件判定相反：
+
+  ```text
+  INF 10.244.119.128 的主机密钥已改变（known_hosts 第 36 行），可能存在中间人攻击
+  ```
+
+  现在按算法区分：**同一算法下不同密钥**才是 `Changed`（仍然拒绝/告警）；**不同算法**属
+  未知，走该策略对未知主机的处理（`accept-new` 学到并追加一行，`strict` 拒绝）。这一条也让
+  `learn` 能为一台主机补记第二种算法，此前会因误判成 `Changed` 而拒绝追加。
+
+  影响面：v0.4.1 之前，凡是 `known_hosts` 只记录了部分算法的多算法主机，都可能被误拒；
+  这也是"`ssh` 能连、sshpf 连不上"除了跳板机之外的另一类成因。
+
 
 ## [0.4.0] - 2026-11-09
 
@@ -347,7 +371,8 @@ DNS 失败被错报为「未知错误」的分类。无新增依赖、无配置�
 - 不统计流量；同一主机多条转发各自建连，未做连接复用。
 - macOS 走 Unix 分支，未实测。
 
-[Unreleased]: https://github.com/can2049/sshpf/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/can2049/sshpf/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/can2049/sshpf/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/can2049/sshpf/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/can2049/sshpf/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/can2049/sshpf/compare/v0.3.0...v0.3.1

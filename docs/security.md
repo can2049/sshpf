@@ -143,6 +143,8 @@ panic hook 要写日志，写日志要拿锁。**如果 panic 恰好发生在持
 
 密钥被拒时界面明确显示"已改变"还是"已吊销"，并指向 `known_hosts` 的行号；日志记 `knownhosts.rejected`（ERROR，含 `policy`）。`ignore` 下接受变更时状态条会出现一条「警告: … 的主机密钥已改变（已按忽略策略接受，未写入 known_hosts）」。
 
+**条目按「主机 + 算法」匹配，与 OpenSSH 一致。** 一台主机通常同时提供 `ssh-ed25519`、`ecdsa-sha2-nistp256`、`ssh-rsa` 几种密钥，而 `known_hosts` 里可能只记了其中一种；协商到另一种**不算变更**，只是该算法尚未记录（按未知处理：`accept-new` 学到并追加一行，`strict` 拒绝）。只有**同一算法下出现不同密钥**才是 `Changed`。这条区分是 v0.4.0 修的缺陷：此前任何不匹配的条目都被记为「已改变」，于是"服务器提供多算法、known_hosts 只记了一种"这种极常见的情况会被误报成「可能存在中间人攻击」——实测同一台主机 OpenSSH 在 `StrictHostKeyChecking=yes` 下能连，sshpf 却拒绝。
+
 ### 忽略密钥变更 / Ignoring key changes
 
 两种入口，语义一致（都映射到 `HostKeyPolicy::Ignore`），区别只在作用域：
