@@ -38,6 +38,9 @@
 | [pure-rust-ssh-russh.md](pure-rust-ssh-russh.md) | `russh` API 层面核实 | 版本号已过期，以 `Cargo.toml` 为准 |
 | [pure-rust-ssh-config.md](pure-rust-ssh-config.md) | `~/.ssh/config` 解析、密钥、agent、known_hosts 生态调研 | `ssh2-config` 选型依据 |
 | [pure-rust-ssh-spike.md](pure-rust-ssh-spike.md) | 三种转发的端到端实测 | §8 是库缺陷复现证据 |
+| [client-server.md](client-server.md) | **client-server 架构调研总览**：为什么做、方案、代价、路线图、不做清单 | 另有 [client-server/](client-server/) 三篇展开与 [client-server-spike/](client-server-spike/) 实测 |
+| [client-server/](client-server/) | 协议字段（`protocol.md`）、生命周期与选举（`lifecycle.md`）、迁移计划（`migration.md`） | 设计文档，非当前行为 |
+| `client-server-spike/` | client-server 假设的可运行探针（52 条断言全 PASS，含真实多进程 e2e） | 独立工程，可丢弃 |
 | `spike/` | 上述实测用的可丢弃工程与探针程序 | 不参与构建，不进 crates.io 包 |
 
 `spike/` 不在 `cargo build` 的路径上：它的 `Cargo.toml` 是独立工程，`spike/sshd/run.sh` 起一个临时 sshd。不要把它当作可维护代码。
@@ -48,3 +51,10 @@
 - 需要新调研时**新建**文件并在此登记，不要覆写旧的。
 - 若某个结论已被代码推翻，在本文"判断"上记录一句并把结论写进 [../design.md](../design.md)；**不要**改历史笔记。
 - 发布包排除本目录（`Cargo.toml` 的 `exclude`），仓库里保留。
+
+`client-server-spike/` 与 `spike/` 同理：独立 `Cargo.toml`，不在根 workspace，不参与 `cargo build`。
+区别：`spike/` 记录 v1 时代对 `russh` 的实测；`client-server-spike/` 记录 client-server 方案的实测
+（选举、广播、生命周期、codec、时钟），运行方式见其 `README.md`。
+
+**注意定位**：[client-server.md](client-server.md) 及其子目录是**面向未来的设计调研**，
+描述的是「打算怎么改」，不是当前行为。当前行为仍以 `src/` 与 [../index.md](../index.md) 为准。
