@@ -420,6 +420,31 @@ mod tests {
     }
 
     #[test]
+    fn unticking_every_row_then_typing_one_forward_creates_the_typed_one() {
+        // The reported workflow, driven through the key handler the user actually
+        // presses: the host's rows are auto-ticked, the user wants a *different*
+        // port, so they clear the ticks (`U`) and fill the form by hand, then
+        // `ctrl+s`. The cleared pane must not answer "没有勾选任何转发" over a
+        // complete typed form — that message used to block the save entirely.
+        let (_d, mut app) = import_app();
+        handle_key(&mut app, ch('U'));
+        assert_eq!(app.form.as_ref().unwrap().import.checked_count(), 0);
+        {
+            let f = app.form.as_mut().unwrap();
+            f.name.set("cloud_pc-3081");
+            f.remote_host.set("127.0.0.1");
+            f.remote_port.set("3081");
+            f.local_port.set("3081");
+        }
+        handle_key(&mut app, ctrl('s'));
+
+        assert_eq!(app.tunnels.len(), 1, "the typed forward must be created");
+        assert_eq!(app.tunnels[0].cfg.name, "cloud_pc-3081");
+        assert_eq!(app.tunnels[0].cfg.remote_port, 3081);
+        assert!(matches!(app.overlay, Overlay::None), "the form closes on success");
+    }
+
+    #[test]
     fn the_import_pane_scrolls_its_window_with_the_cursor() {
         // `IMPORT_ROWS_VISIBLE` is shared by the key handler (this window) and
         // the renderer (pane height). Walking past the window must move `scroll`

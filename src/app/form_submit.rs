@@ -31,6 +31,12 @@
 //! * **Incomplete form** — nothing was typed that could be a tunnel, so the
 //!   untouched pane keeps winning. That preserves the headline workflow: pick a
 //!   host, hit `ctrl+s`, import everything.
+//! * **Emptied pane** — touching the rows can also mean *unticking all of
+//!   them* ("create none of these"). That leaves the pane with nothing to
+//!   create, so it cannot be the instruction: a complete typed form wins, and
+//!   the pane keeps the key only to report "没有勾选任何转发" when nothing was
+//!   typed either. Reporting that over a valid form was a bug: the user unticked
+//!   the host's rows precisely because they wanted a different forward.
 //!
 //! When a complete form wins over a still-offering pane, the success notice says
 //! so: the pane disappears without its rows being created, and silence there
@@ -54,10 +60,11 @@ impl App {
     /// for confirmation (editing an existing one, which replaces a running
     /// process and therefore drops live connections).
     ///
-    /// For a create, the import pane only owns the submit while it is *on screen
-    /// and the user has actually used it* — or while the typed fields do not add
-    /// up to a tunnel at all. See the module docs for the full rule; the short
-    /// version is "touched pane or incomplete form ⇒ batch, else the typed one".
+    /// For a create, the import pane only owns the submit while it is *on screen,
+    /// the user has actually used it, and it still has something ticked* — or
+    /// while the typed fields do not add up to a tunnel at all. See the module
+    /// docs for the full rule; the short version is "a touched pane with rows to
+    /// create, or an incomplete form ⇒ batch, else the typed one".
     pub fn submit_form(&mut self) {
         if self.import_pane_wins_submit() {
             self.commit_form_create_from_import();
@@ -117,12 +124,25 @@ impl App {
     /// True only for a create with a drawable, non-empty pane, and then only when
     /// either the user has touched the rows or the form cannot stand on its own.
     /// Editing is excluded: an edit always stays one tunnel.
+    ///
+    /// An **emptied** pane is the one case where "touched" cannot decide on its
+    /// own: unticking every row says "create none of these", which leaves the
+    /// pane with no instruction to carry out at all. A complete typed form is
+    /// then the only instruction with a body, so it wins.
     fn import_pane_wins_submit(&self) -> bool {
         let Some(form) = self.form.as_ref() else {
             return false;
         };
         if form.is_modifying() || !form.import_open || form.import.is_empty() {
             return false;
+        }
+        // "Ticked" is not the same as "has a body": every importable row being
+        // unticked means the batch path would create nothing, so the pane can
+        // only report "nothing is ticked". It keeps the key solely when that is
+        // the useful answer — i.e. when the typed fields do not add up to a
+        // tunnel either.
+        if !form.import.any_checked() {
+            return !form.is_complete();
         }
         form.import.touched || !form.is_complete()
     }
@@ -407,6 +427,52 @@ mod tests {
         let msg = app.status.as_ref().map(|s| s.text.clone()).unwrap_or_default();
         assert!(msg.contains("未创建"), "the user must be told the pane's rows were skipped: {msg}");
         assert!(msg.contains('2'), "and how many: {msg}");
+    }
+
+    #[test]
+    fn an_emptied_pane_hands_the_save_key_back_to_the_complete_typed_form() {
+        // The reported regression: the pane auto-opened with the host's two
+        // forwards, the user unticked *all* of them and typed the forward they
+        // actually wanted (port 3081), then pressed ctrl+s. Unticking is an
+        // instruction, but an emptied pane has nothing left to create — the
+        // complete typed form is the only instruction with a body, so it must
+        // win. The old rule read "touched ⇒ the pane decides" and answered
+        // "没有勾选任何转发 / No forward is ticked" over a perfectly valid form.
+        let (p1, p2) = (free_port(), free_port());
+        let (typed_port, wanted_port) = (free_port(), 3081u16);
+        let (_d, mut app) = app_with_default_pane(vec![show(p1, 80), show(p2, 8080)]);
+        app.form.as_mut().unwrap().import.uncheck_all_visible();
+        assert!(app.form.as_ref().unwrap().import.touched, "unticking every row is still a user instruction");
+        assert_eq!(app.form.as_ref().unwrap().import.checked_count(), 0, "precondition: nothing is ticked");
+        fill_hand_typed(&mut app, "cloud_pc-3081", wanted_port, typed_port);
+
+        app.submit_form();
+
+        assert_eq!(app.tunnels.len(), 1, "the typed forward is the only thing left to create");
+        assert_eq!(app.tunnels[0].cfg.name, "cloud_pc-3081");
+        assert_eq!(app.tunnels[0].cfg.remote_port, wanted_port);
+        assert_eq!(app.tunnels[0].cfg.local_port, typed_port);
+        assert!(app.form.is_none(), "the form closes: nothing was wrong with what the user typed");
+        assert!(
+            !app.tunnels.iter().any(|t| t.cfg.local_port == p1 || t.cfg.local_port == p2),
+            "the unticked import rows must still not be created"
+        );
+    }
+
+    #[test]
+    fn an_emptied_pane_still_reports_nothing_ticked_when_no_forward_was_typed() {
+        // The counterpart, so the fix cannot become "an empty pane never
+        // decides": untick everything and type nothing, and the only sensible
+        // answer is that there is nothing to save.
+        let (_d, mut app) = app_with_default_pane(vec![show(free_port(), 80)]);
+        app.form.as_mut().unwrap().import.uncheck_all_visible();
+
+        app.submit_form();
+
+        assert!(app.tunnels.is_empty(), "nothing ticked and nothing typed creates nothing");
+        assert!(app.form.is_some(), "the form stays open to explain why");
+        let errors = app.form.as_ref().map(|f| f.errors.clone()).unwrap_or_default();
+        assert!(errors.iter().any(|e| e.contains("没有勾选任何转发")), "{errors:?}");
     }
 
     #[test]
@@ -719,6 +785,60 @@ mod tests {
         let new_tunnel = app.tunnels.iter().find(|t| t.cfg.name == "cloud_pc-3081").unwrap();
         assert_eq!(new_tunnel.cfg.remote_port, wanted);
         assert_eq!(new_tunnel.cfg.local_port, wanted);
+    }
+
+    #[test]
+    fn a_pane_of_only_already_saved_rows_never_blocks_a_complete_typed_form() {
+        // The state PR #29 created and that the unticked-pane rule has to cover:
+        // a host whose every `~/.ssh/config` forward is already managed gets a
+        // pane whose rows are all un-tickable (`existing`, so `creatable()` is
+        // false). `space`/`i` still opens it — to explain the dimmed lines — and
+        // opening by hand sets `touched`. `checked_count()` is 0 no matter what
+        // the user does, so without the "emptied pane" rule `ctrl+s` would answer
+        // "没有勾选任何转发" over a perfectly good typed forward.
+        //
+        // The distinguishing detail versus PR #29's auto-open case: here the pane
+        // is *open* and *touched*, which is exactly what used to hand it the save
+        // key.
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths { config: dir.path().join("config.toml"), state: dir.path().join("state.toml") };
+        let cfg = ConfigFile { tunnels: vec![saved_tunnel(18789, 18789, "dev-box")], ..ConfigFile::default() };
+        crate::config::save(&paths.config, &cfg).unwrap();
+        let mut app = App::new(paths);
+        app.open_form_create();
+        app.form.as_mut().unwrap().ssh_host.set("dev-box");
+        app.install_import_rows(
+            "dev-box",
+            vec![SshForward {
+                kind: ForwardKind::Local,
+                listen_addr: String::new(),
+                listen_port: 18789,
+                target_host: "127.0.0.1".into(),
+                target_port: 18789,
+                host_alias: "dev-box".into(),
+                line: 30,
+                raw: "LocalForward 18789 127.0.0.1:18789".into(),
+            }],
+        );
+        // Auto-open declined (nothing creatable to offer); the user opens it by
+        // hand to see why, which marks it touched.
+        assert!(!app.form.as_ref().unwrap().import_open, "precondition: nothing creatable, so nothing auto-opens");
+        app.toggle_import_pane();
+        {
+            let f = app.form.as_ref().unwrap();
+            assert!(f.import_open, "the manual open must succeed so it can explain itself");
+            assert!(f.import.touched, "opening by hand is a user action");
+            assert_eq!(f.import.checked_count(), 0, "an existing row can never be ticked");
+        }
+
+        let wanted = free_port();
+        fill_hand_typed(&mut app, "cloud_pc-3081", wanted, wanted);
+        app.submit_form();
+
+        assert_eq!(app.tunnels.len(), 2, "exactly the typed one on top of the saved one");
+        assert_eq!(app.tunnels[1].cfg.name, "cloud_pc-3081");
+        assert_eq!(app.tunnels[1].cfg.remote_port, wanted);
+        assert!(app.form.is_none(), "the form closes: the typed forward was valid all along");
     }
 
     #[test]

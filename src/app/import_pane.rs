@@ -17,8 +17,10 @@
 //! * The auto-open is an *offer*, not an instruction. Everything the user does to
 //!   the pane deliberately — opening it by hand, focusing a column filter, ticking
 //!   or unticking rows — marks the table
-//!   `touched`, and only a touched table outranks a complete hand-filled form on
-//!   `ctrl+s`. See `form_submit`'s module docs for the routing rule.
+//!   `touched`, and only a touched table *with at least one row still ticked*
+//!   outranks a complete hand-filled form on `ctrl+s` (unticking every row is an
+//!   instruction to create none of them, which leaves the pane nothing to carry
+//!   out). See `form_submit`'s module docs for the routing rule.
 
 use crate::app::{App, FormMode};
 use crate::eventlog;
