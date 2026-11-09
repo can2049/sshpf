@@ -3,7 +3,7 @@
 > **这份文档回答**：client 与 server 两个进程怎么起、谁先谁后、怎么保证全局只有一个 server、
 > 最后一个 client 退出时发生什么（**以及用户在哪一步被告知全部转发将停止**）、崩溃与残留资源怎么收尾。
 > **不负责**：协议消息字段（见 [protocol.md](protocol.md)）、代码怎么改（见 [migration.md](migration.md)）、
-> 为什么选 UDS 而不是 TCP（见 [protocol.md](protocol.md#传输层--transport)）。
+> 为什么选 UDS 而不是 TCP（见 [protocol.md](protocol.md#1-传输层--transport)）。
 > **相关代码路径**：`src/main.rs`（入口与信号）、`src/cli.rs`（参数与 `USAGE`）、`src/app/runtime.rs`
 > （`restore_enabled`）、`src/tunnel.rs`（`Supervisor::stop_all` 与 `Drop`）、`src/config.rs`（`Paths`）、
 > `src/sys/mod.rs`（`quit_signals`）。设计完成后新增 `src/server/`、`src/ipc/`。

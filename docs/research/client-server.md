@@ -52,7 +52,7 @@
 |---|---|---|
 | 不同 client 信息完全一致，一处修改各处相同 | 全量快照 + `revision` 单调递增广播 | [protocol.md](client-server/protocol.md#3-消息全集--messages) |
 | 所有 client 退出后 server 才退出 | `client_count` 归零 + 宽限窗口 | [lifecycle.md](client-server/lifecycle.md#客户端计数与宽限窗口--client-count--grace-window) |
-| 某个 client 可以停止所有转发 | `stop_all` 命令（server 侧校验，任何 client 都能发） | [protocol.md](client-server/protocol.md#33-命令与应答) |
+| 某个 client 可以停止所有转发 | `stop_all` 命令（server 侧校验，任何 client 都能发） | [protocol.md](client-server/protocol.md#34-command--reply--stale--bye--error) |
 | **最后一个 client 退出要给风险提示** | 确认闸文案升级 + server 复核计数 | §4 与 [lifecycle.md](client-server/lifecycle.md#最后一个客户端退出--last-client-exit) |
 
 **"信息一致"的边界要说清**：一致的是**转发状态**，不是"我打开的窗口"。两个 client 同时开不同表单、
@@ -68,8 +68,11 @@
 每次状态变更广播**完整**快照，客户端按 `revision` 丢弃旧的。
 
 - **好处**：乱序、丢帧、重连**结构上不可能** desync。丢一帧，下一帧就是完整真相。
-- **代价**：带宽比 delta 大。实测 50 条隧道 ≈ **9.7 KB**（精简 schema）/ **19.4 KB**（完整 schema），
-  1000 条约 **196 KB**。在本机 UDS 上是噪声级。
+- **代价**：带宽比 delta 大。实测 50 条隧道：不含日志 **17 KB**、带 15 行日志尾巴 **94 KB**
+  （单帧编+解 1.9 ms）；带整个 ring 则 5.2 MB —— **所以快照必须只带日志尾巴**，见
+  [protocol.md §7](client-server/protocol.md#7-体积预算--size-budget)。
+- **硬约束**：快照里的日志**必须截断**到 `DETAIL_LOG_TAIL = 15` 行/条（与详情面板一致）；
+  不截断会到 5.2 MB，连帧上限都过不去。
 - **什么时候该改**：隧道数上千、或每秒上百次状态变更时才需要 delta。现在不需要。
 
 ### 3.2 单例选举靠文件锁，不靠 pid 文件 + 心跳
