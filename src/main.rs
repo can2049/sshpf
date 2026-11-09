@@ -84,7 +84,7 @@ fn main() -> ExitCode {
         return cli::check_config(&paths);
     }
 
-    match run_tui(paths, args.no_restore, started) {
+    match run_tui(paths, &args, started) {
         Ok(code) => code,
         Err(e) => {
             // The TUI could not even start (terminal init, event loop I/O) — the
@@ -201,7 +201,7 @@ fn shut_down(app: &mut App, mouse: bool, started: Instant, result: std::io::Resu
 }
 
 /// Run the TUI until the user quits, a quit signal arrives, or the terminal fails.
-fn run_tui(paths: Paths, no_restore: bool, started: Instant) -> std::io::Result<ExitCode> {
+fn run_tui(paths: Paths, args: &cli::Args, started: Instant) -> std::io::Result<ExitCode> {
     // A signal only flips these flags: the loop then exits normally so `Drop`
     // handlers stop the tunnels. `process::exit()` would skip them. `received`
     // records *which* signal arrived — the TUI is gone by the time the exit code
@@ -224,8 +224,8 @@ fn run_tui(paths: Paths, no_restore: bool, started: Instant) -> std::io::Result<
         eventlog::config_perms_tightened(&config::display_path(&paths.config), ok);
     }
 
-    let mut app = App::new(paths);
-    prepare_app(&mut app, no_restore);
+    let mut app = App::with_host_key_policy(paths, args.host_key_policy());
+    prepare_app(&mut app, args.no_restore);
 
     // Mouse capture is on for the whole session: the import table's filtering and
     // the table's row selection are click-driven, and terminals cannot report a

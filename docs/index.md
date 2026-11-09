@@ -22,7 +22,7 @@
 | 加一个界面面板 / 改渲染 | [tui.md](tui.md) | `src/ui/` |
 | 改鼠标点击行为 | [tui.md](tui.md#命中图--hit-map) | `src/ui/hit.rs`、`src/app/mouse.rs` |
 | 改隧道启动 / 停止 / 重试 | [runtime.md](runtime.md) | `src/app/runtime.rs`、`src/tunnel.rs` |
-| 改 SSH 连接 / 认证 / 主机密钥 | [runtime.md](runtime.md) 与 [design.md](design.md) | `src/ssh/` |
+| 改 SSH 连接 / 认证 / 主机密钥 | [runtime.md](runtime.md) 与 [design.md](design.md)；主机密钥策略见 [security.md](security.md#主机密钥--host-keys) | `src/ssh/`、`src/ssh/hostkey_conf.rs` |
 | 加一个日志事件 / 改字段 | [agents.md](agents.md#加日志事件--add-a-log-event) → [logging/events.md](logging/events.md) | `src/eventlog/` |
 | 查某个 `event=` 是什么意思 | [logging/events.md](logging/events.md) | `src/eventlog/` |
 | 排查日志（重连风暴、崩溃、降级） | [logging.md](logging.md#排查配方--recipes) | `src/logging/` |

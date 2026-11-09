@@ -189,7 +189,11 @@ fn load_config() -> Result<Option<SshConfig>> {
     let cleaned = strip_match_blocks(&text);
     let mut reader = BufReader::new(cleaned.as_bytes());
     let cfg = SshConfig::default()
-        .parse(&mut reader, ParseRule::ALLOW_UNKNOWN_FIELDS)
+        // `ALLOW_UNSUPPORTED_FIELDS` is what keeps `StrictHostKeyChecking` and
+        // `UserKnownHostsFile` available for [`super::hostkey_conf`]: without it
+        // they are dropped by the parser and a host the user told ssh to stop
+        // verifying would still be a hard failure here.
+        .parse(&mut reader, ParseRule::ALLOW_UNKNOWN_FIELDS | ParseRule::ALLOW_UNSUPPORTED_FIELDS)
         .with_context(|| format!("解析 {} 失败", path.display()))?;
     Ok(Some(cfg))
 }
@@ -281,6 +285,12 @@ pub struct Endpoint {
     /// Full ProxyJump chain, first hop first.
     pub proxy_jump: Vec<String>,
     pub identity_file: Option<String>,
+    /// Host-key policy this host's own `~/.ssh/config` block implies.
+    ///
+    /// Per endpoint, not per tunnel: a `ProxyJump` chain re-verifies every hop,
+    /// and it is normal for the *jump* host to be the one the user stopped
+    /// verifying while the target stays strict. See [`super::hostkey_conf`].
+    pub host_key_policy: super::known_hosts::HostKeyPolicy,
 }
 
 impl Endpoint {
@@ -292,12 +302,18 @@ impl Endpoint {
             Some(cfg) => proxy_chain(cfg, &host.proxy_jump),
             None => Vec::new(),
         };
+        // With no config there are no directives to honour, so the default holds.
+        let host_key_policy = match &cfg {
+            Some(cfg) => super::hostkey_conf::policy_for_params(&cfg.query(ssh_host)),
+            None => super::known_hosts::HostKeyPolicy::default(),
+        };
         Ok(Endpoint {
             hostname: host.hostname,
             port: host.port,
             user: host.user,
             proxy_jump,
             identity_file: host.identity_file,
+            host_key_policy,
         })
     }
 

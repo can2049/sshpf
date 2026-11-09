@@ -3,6 +3,42 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.4.0] - 2026-11-09
+
+本次是 minor 版本：新增主机密钥变更的忽略能力。默认行为不变（密钥变了仍然拒绝），
+新增一个全局开关，并让 sshpf 尊重 `~/.ssh/config` 里用户已经写下的 `StrictHostKeyChecking` /
+`UserKnownHostsFile`。无配置格式变化、无键位变化。
+
+### 新增
+
+- **`--ignore-host-key-changes` 全局开关**。开启后接受"已改变"的主机密钥，只记一条
+  `WARN knownhosts.ignored_changed`（带服务器实际呈现的 SHA256 指纹），**不写入
+  `known_hosts`**；`@revoked` 吊销的密钥仍然拒绝。等价于 `ssh -o StrictHostKeyChecking=no`，
+  是排障时的兜底手段，不是默认行为。
+- **尊重 `~/.ssh/config` 的 `StrictHostKeyChecking` / `UserKnownHostsFile`，逐跳生效**。
+  新增 `src/ssh/hostkey_conf.rs`：`StrictHostKeyChecking no|off` 或
+  `UserKnownHostsFile /dev/null` 映射为**该 Host** 的 `HostKeyPolicy::Ignore`；`yes` / `ask` /
+  未写保持 sshpf 原有的 `accept-new`（不会因为读配置反而变严格，否则所有没写这条指令的
+  用户都会被打断）。作用域（`Host *` 继承、首个匹配块优先）由 `ssh2-config` 按 OpenSSH
+  语义处理。策略是**逐跳**的：`ProxyJump` 链上每一跳各用自己的策略，目标主机严格、跳板机
+  忽略是常见组合。全局 `--ignore-host-key-changes` 优先，不会被更严格的 `Host` 块削弱。
+
+### 动机
+
+`ssh cloud_pc` 能正常登录，sshpf 建同样的隧道却报 `host key verification failed`。实测根因
+**不是 `cloud_pc`，而是它的跳板机那一跳**：用户的 `~/.ssh/config` 里
+`Host cloud_pc_jump` 写了 `StrictHostKeyChecking no` + `UserKnownHostsFile /dev/null`，
+OpenSSH 因此不校验这一跳；sshpf 用自己的 `known_hosts` 校验器，照样拒绝，日志实证：
+
+```text
+ERROR event=knownhosts.rejected host=desk-ssh.srv.deeproute.cn port=80 policy=accept-new
+msg="[desk-ssh.srv.deeproute.cn]:80 的主机密钥已改变（known_hosts 第 34 行），可能存在中间人攻击"
+```
+
+结论：sshpf 拒绝得没错，但**不该无视用户已经对某台主机表达过的意图**。本次改动把"用户的
+意图"和"安全的默认值"分开：默认仍是拒绝（并指出 `known_hosts` 行号），忽略必须显式开启，
+且每次降级都留痕。
+
 ## [0.3.1] - 2026-11-09
 
 本次是 patch 版本：把「新建 / 编辑转发」这一屏被截断的信息补回来，并修正 Windows 上
@@ -279,7 +315,8 @@ DNS 失败被错报为「未知错误」的分类。无新增依赖、无配置�
 - 不统计流量；同一主机多条转发各自建连，未做连接复用。
 - macOS 走 Unix 分支，未实测。
 
-[Unreleased]: https://github.com/can2049/sshpf/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/can2049/sshpf/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/can2049/sshpf/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/can2049/sshpf/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/can2049/sshpf/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/can2049/sshpf/compare/v0.2.0...v0.2.1

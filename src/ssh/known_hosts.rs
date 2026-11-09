@@ -34,6 +34,11 @@
 //!   still a hard failure.
 //! * `Ask` — unknown host is reported back so the caller can prompt; not used
 //!   by default (the tunnel starts unattended).
+//! * `Ignore` — a *changed* key is accepted too (opt-in escape hatch for hosts
+//!   whose key legitimately rotates, e.g. a dev jump host). `@revoked` is still
+//!   fatal: an explicit revocation is a statement about the key, not about the
+//!   host's convenience. Nothing is written back, so the trust anchor on disk is
+//!   never silently rewritten.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -55,11 +60,18 @@ pub enum HostKeyVerdict {
 
 impl HostKeyVerdict {
     /// Whether this verdict permits the connection under `policy`.
+    ///
+    /// `Revoked` is refused under *every* policy, including [`HostKeyPolicy::Ignore`]:
+    /// a `@revoked` line is a deliberate statement that this key must never be
+    /// trusted, so ignoring a *change* must not also ignore a revocation.
     pub fn is_acceptable(&self, policy: HostKeyPolicy) -> bool {
         match self {
             HostKeyVerdict::Trusted => true,
-            HostKeyVerdict::Unknown => matches!(policy, HostKeyPolicy::AcceptNew | HostKeyPolicy::Ask),
-            HostKeyVerdict::Changed { .. } | HostKeyVerdict::Revoked { .. } => false,
+            HostKeyVerdict::Unknown => {
+                matches!(policy, HostKeyPolicy::AcceptNew | HostKeyPolicy::Ask | HostKeyPolicy::Ignore)
+            }
+            HostKeyVerdict::Changed { .. } => matches!(policy, HostKeyPolicy::Ignore),
+            HostKeyVerdict::Revoked { .. } => false,
         }
     }
 
@@ -77,6 +89,16 @@ impl HostKeyVerdict {
     }
 }
 
+/// The `SHA256:…` fingerprint of a presented key, for the "ignored a change"
+/// record.
+///
+/// Worth logging because accepting a changed key is exactly the moment an
+/// operator later wants to compare against what they expected. Never fails: a
+/// fingerprint is diagnostic detail, not a reason to refuse a connection.
+pub fn fingerprint(key: &PublicKey) -> String {
+    key.fingerprint(russh::keys::HashAlg::Sha256).to_string()
+}
+
 /// How to treat an unknown host key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HostKeyPolicy {
@@ -87,6 +109,30 @@ pub enum HostKeyPolicy {
     AcceptNew,
     /// Report unknown hosts to the caller so it can prompt.
     Ask,
+    /// Accept a *changed* key as well as an unknown one (opt-in escape hatch).
+    ///
+    /// Never writes to `known_hosts` — the on-disk trust anchor is left exactly
+    /// as the user wrote it, so the change stays visible next run. A `@revoked`
+    /// key is still refused; see [`HostKeyVerdict::is_acceptable`].
+    Ignore,
+}
+
+/// Whether `policy` accepts a *changed* key, i.e. whether it is the
+/// ignore-the-change escape hatch.
+///
+/// Named for the question the connector asks ("is this acceptance the degraded
+/// path?"), so the logging call sites cannot drift from the acceptance rule.
+pub fn accepts_changed(policy: HostKeyPolicy) -> bool {
+    matches!(policy, HostKeyPolicy::Ignore)
+}
+
+/// `host` for port 22, `[host]:port` otherwise — the OpenSSH spelling.
+///
+/// Exposed for the callers that must name a hop in a user-facing message
+/// (`client::handler`'s ignored-change warning) without keeping a second copy of
+/// the bracket rule.
+pub fn describe_host(host: &str, port: u16) -> String {
+    format_host(host, port)
 }
 
 /// `host` for port 22, `[host]:port` otherwise — the OpenSSH spelling.
@@ -428,6 +474,30 @@ mod tests {
         assert_eq!(verify_path("127.0.0.1", 22200, &key(KEY_B), f.path()), HostKeyVerdict::Changed { line: 1 });
     }
 
+    /// The whole point of the escape hatch, at the level of a real file: the
+    /// verdict itself stays `Changed` (it is a fact about the file), and only
+    /// the *acceptance* changes. That keeps the WARN record truthful.
+    #[test]
+    fn a_changed_key_is_verdict_changed_and_only_ignore_accepts_it() {
+        let f = TempFile::with(&format!("[127.0.0.1]:22200 {KEY_A}\n"));
+        let verdict = verify_path("127.0.0.1", 22200, &key(KEY_B), f.path());
+        assert_eq!(verdict, HostKeyVerdict::Changed { line: 1 });
+        assert!(verdict.is_acceptable(HostKeyPolicy::Ignore));
+        for p in [HostKeyPolicy::Strict, HostKeyPolicy::AcceptNew, HostKeyPolicy::Ask] {
+            assert!(!verdict.is_acceptable(p), "a changed key was accepted under {p:?}");
+        }
+    }
+
+    /// `Ignore` must not soften a revocation even when the same file also has a
+    /// normal entry for the key — the combination russh's checker gets wrong.
+    #[test]
+    fn ignore_does_not_accept_a_revoked_key() {
+        let f = TempFile::with(&format!("@revoked [127.0.0.1]:22200 {KEY_A}\n[127.0.0.1]:22200 {KEY_A}\n"));
+        let verdict = verify_path("127.0.0.1", 22200, &key(KEY_A), f.path());
+        assert_eq!(verdict, HostKeyVerdict::Revoked { line: 1 });
+        assert!(!verdict.is_acceptable(HostKeyPolicy::Ignore));
+    }
+
     #[test]
     fn unknown_host() {
         let f = TempFile::with(&format!("other.example.com {KEY_A}\n"));
@@ -534,14 +604,57 @@ mod tests {
     #[test]
     fn policy_acceptance() {
         assert!(HostKeyVerdict::Trusted.is_acceptable(HostKeyPolicy::Strict));
+        assert!(HostKeyVerdict::Trusted.is_acceptable(HostKeyPolicy::Ignore));
         assert!(!HostKeyVerdict::Unknown.is_acceptable(HostKeyPolicy::Strict));
         assert!(HostKeyVerdict::Unknown.is_acceptable(HostKeyPolicy::AcceptNew));
         assert!(HostKeyVerdict::Unknown.is_acceptable(HostKeyPolicy::Ask));
-        // A changed key is never acceptable, under any policy.
+        assert!(HostKeyVerdict::Unknown.is_acceptable(HostKeyPolicy::Ignore));
+        // A changed key is refused everywhere except the explicit escape hatch.
         for p in [HostKeyPolicy::Strict, HostKeyPolicy::AcceptNew, HostKeyPolicy::Ask] {
-            assert!(!HostKeyVerdict::Changed { line: 1 }.is_acceptable(p));
-            assert!(!HostKeyVerdict::Revoked { line: 1 }.is_acceptable(p));
+            assert!(!HostKeyVerdict::Changed { line: 1 }.is_acceptable(p), "changed accepted under {p:?}");
         }
+        assert!(HostKeyVerdict::Changed { line: 1 }.is_acceptable(HostKeyPolicy::Ignore));
+        // A revocation is refused under *every* policy, `Ignore` included:
+        // `@revoked` is a statement about the key, not about the host's
+        // convenience, so ignoring a change must not also ignore a revocation.
+        for p in [HostKeyPolicy::Strict, HostKeyPolicy::AcceptNew, HostKeyPolicy::Ask, HostKeyPolicy::Ignore] {
+            assert!(!HostKeyVerdict::Revoked { line: 1 }.is_acceptable(p), "revoked accepted under {p:?}");
+        }
+    }
+
+    /// `accepts_changed` is the question the connector and the log call sites
+    /// ask; it must agree with the acceptance rule exactly, or a key could be
+    /// accepted without a warning (or warned about without being accepted).
+    #[test]
+    fn only_the_ignore_policy_accepts_a_changed_key() {
+        assert!(!accepts_changed(HostKeyPolicy::Strict));
+        assert!(!accepts_changed(HostKeyPolicy::AcceptNew));
+        assert!(!accepts_changed(HostKeyPolicy::Ask));
+        assert!(accepts_changed(HostKeyPolicy::Ignore));
+        for p in [HostKeyPolicy::Strict, HostKeyPolicy::AcceptNew, HostKeyPolicy::Ask, HostKeyPolicy::Ignore] {
+            assert_eq!(
+                accepts_changed(p),
+                HostKeyVerdict::Changed { line: 7 }.is_acceptable(p),
+                "policy {p:?} disagrees with `Changed::is_acceptable`"
+            );
+        }
+    }
+
+    /// The fingerprint is the only identifier of *what the server actually
+    /// presented* in the WARN record, so it has to be SHA256 (not MD5/SHA1),
+    /// stable for one key, and different for another.
+    #[test]
+    fn fingerprint_is_a_stable_sha256_of_the_key() {
+        let a = key(KEY_A);
+        let b = key(KEY_B);
+        let fa = fingerprint(&a);
+        assert!(fa.starts_with("SHA256:"), "fingerprint is not SHA256: {fa}");
+        // SHA256 is 32 bytes → 43 base64 chars, unpadded. SHA1 would be 28.
+        let body = fa.trim_start_matches("SHA256:");
+        assert_eq!(body.len(), 43, "not a 32-byte base64 body: {body}");
+        assert!(!body.contains('='), "fingerprint must not be padding-padded: {body}");
+        assert_eq!(fa, fingerprint(&a), "the same key must fingerprint identically");
+        assert_ne!(fa, fingerprint(&b), "two different keys collided");
     }
 
     #[test]

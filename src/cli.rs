@@ -41,6 +41,17 @@ sshpf — SSH 端口转发 TUI 管理器 / SSH port-forward manager for the term
                         Print the hosts in ~/.ssh/config, then exit
       --check           校验配置文件后退出（不启动 UI）
                         Validate the config file, then exit (no UI)
+      --ignore-host-key-changes
+                        接受已改变的主机密钥（不写入 known_hosts，仅告警）
+                        Accept a changed host key (warns; known_hosts is untouched)
+                        用于开发机 / 跳板机密钥轮换后 ssh 能连、本工具报
+                        host key verification failed 的情况。
+                        For a dev or jump host whose key rotates: `ssh` connects but
+                        this tool reports \"host key verification failed\".
+                        更推荐在 ~/.ssh/config 里写 StrictHostKeyChecking no
+                        （见 README）：那个设置只影响该主机，本开关影响所有主机。
+                        Prefer `StrictHostKeyChecking no` in ~/.ssh/config for one
+                        host (see README): that setting is per host, this flag is global.
   -h, --help            显示本帮助 / Show this help
   -V, --version         显示版本 / Show the version
 
@@ -132,6 +143,19 @@ pub struct Args {
     pub no_restore: bool,
     pub list_hosts: bool,
     pub check: bool,
+    /// Accept a changed server host key instead of refusing the connection.
+    pub ignore_host_key_changes: bool,
+}
+
+impl Args {
+    /// Process-wide host-key policy implied by the command line.
+    pub fn host_key_policy(&self) -> crate::ssh::known_hosts::HostKeyPolicy {
+        if self.ignore_host_key_changes {
+            crate::ssh::known_hosts::HostKeyPolicy::Ignore
+        } else {
+            crate::ssh::known_hosts::HostKeyPolicy::default()
+        }
+    }
 }
 
 /// The config/state paths implied by `--config` (or the platform defaults).
@@ -166,7 +190,8 @@ fn parse_args_from<I>(args: I) -> Result<Option<Args>, String>
 where
     I: IntoIterator<Item = std::ffi::OsString>,
 {
-    let mut parsed = Args { config: None, no_restore: false, list_hosts: false, check: false };
+    let mut parsed =
+        Args { config: None, no_restore: false, list_hosts: false, check: false, ignore_host_key_changes: false };
     let mut it = args.into_iter();
     while let Some(arg) = it.next() {
         // Lossy only for the *match*; a path is stored untouched below.
@@ -189,6 +214,7 @@ where
             "--no-restore" => parsed.no_restore = true,
             "--list-hosts" => parsed.list_hosts = true,
             "--check" => parsed.check = true,
+            "--ignore-host-key-changes" => parsed.ignore_host_key_changes = true,
             other => {
                 return Err(format!("未知参数 / Unknown option: {other}\n\n{USAGE}"));
             }
@@ -363,5 +389,47 @@ mod tests {
     fn write_stdout_reports_instead_of_panicking() {
         // Not a tty here, so this exercises the buffered path end to end.
         assert!(write_stdout("sshpf test line\n"));
+    }
+
+    #[test]
+    fn ignore_host_key_changes_is_off_by_default() {
+        let args = parse(&[]).unwrap().unwrap();
+        assert!(!args.ignore_host_key_changes, "the escape hatch must be opt-in, never the default");
+        assert_eq!(args.host_key_policy(), crate::ssh::known_hosts::HostKeyPolicy::AcceptNew);
+    }
+
+    #[test]
+    fn ignore_host_key_changes_flag_parses_to_the_ignore_policy() {
+        let args = parse(&["--ignore-host-key-changes"]).unwrap().unwrap();
+        assert!(args.ignore_host_key_changes);
+        assert_eq!(args.host_key_policy(), crate::ssh::known_hosts::HostKeyPolicy::Ignore);
+    }
+
+    /// The flag is additive: it must not swallow the other modes, because
+    /// `--check --ignore-host-key-changes` is a legitimate "validate with my
+    /// usual flags" invocation.
+    #[test]
+    fn ignore_host_key_changes_composes_with_the_other_flags() {
+        let args = parse(&["--check", "--ignore-host-key-changes", "--no-restore"]).unwrap().unwrap();
+        assert!(args.check && args.no_restore && args.ignore_host_key_changes);
+        assert_eq!(args.host_key_policy(), crate::ssh::known_hosts::HostKeyPolicy::Ignore);
+        // Position must not matter.
+        let reordered = parse(&["--ignore-host-key-changes", "--check"]).unwrap().unwrap();
+        assert!(reordered.check && reordered.ignore_host_key_changes);
+    }
+
+    /// Order after `--help` is irrelevant and must not be validated — the same
+    /// rule the other flags follow.
+    #[test]
+    fn ignore_host_key_changes_after_help_is_never_reached() {
+        assert!(parse(&["--help", "--ignore-host-key-changes"]).unwrap().is_none());
+    }
+
+    #[test]
+    fn the_usage_text_documents_the_ignore_flag() {
+        // Users grep the help text and `docs/keymap.md` mirrors it; a flag with
+        // no help line is undiscoverable.
+        assert!(USAGE.contains("--ignore-host-key-changes"), "USAGE must list the flag");
+        assert!(USAGE.contains("Accept a changed host key"), "the flag needs an English explanation");
     }
 }

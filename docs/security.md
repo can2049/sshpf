@@ -1,8 +1,8 @@
 # 安全与健壮性 / Security & robustness
 
 > **这份文档回答**：为什么生产代码里不许 panic、`unsafe` 只在哪里、崩溃怎么被记录下来、文件权限与日志脱敏的边界、以及哪些测试在守这些规则。
-> **不负责**：日志格式与级别（见 [logging.md](logging.md)）、事件字段全表（见 [logging/events.md](logging/events.md)）、SSH 主机密钥策略的实现（见 `src/ssh/known_hosts.rs`）。
-> **相关代码路径**：`src/logging/crash.rs`（唯一 `unsafe`）、`src/logging/panic.rs`、`src/sys/`、`tests/safety_guards.rs`、`tests/panic_hardening.rs`。
+> **不负责**：日志格式与级别（见 [logging.md](logging.md)）、事件字段全表（见 [logging/events.md](logging/events.md)）、SSH 主机密钥策略的实现细节（见 `src/ssh/known_hosts.rs`、`src/ssh/hostkey_conf.rs`）。
+> **相关代码路径**：`src/logging/crash.rs`（唯一 `unsafe`）、`src/logging/panic.rs`、`src/sys/`、`src/ssh/known_hosts.rs`、`src/ssh/hostkey_conf.rs`、`tests/safety_guards.rs`、`tests/panic_hardening.rs`。
 
 ## 政策 / Policy（全员硬约束）
 
@@ -139,8 +139,22 @@ panic hook 要写日志，写日志要拿锁。**如果 panic 恰好发生在持
 | `accept-new`（默认） | 接受并写入 `known_hosts`，记 `knownhosts.learned`（WARN） | **拒绝** | **拒绝** |
 | `strict` | 拒绝 | 拒绝 | 拒绝 |
 | `ask` | 接受（当前实现） | 拒绝 | 拒绝 |
+| `ignore`（`--ignore-host-key-changes`） | 接受，**不写入** `known_hosts`（故不记 `knownhosts.learned`） | **接受**，记 `knownhosts.ignored_changed`（WARN，含 SHA256 指纹） | **拒绝** |
 
-密钥被拒时界面明确显示"已改变"还是"已吊销"，并指向 `known_hosts` 的行号；日志记 `knownhosts.rejected`（ERROR，含 `policy`）。
+密钥被拒时界面明确显示"已改变"还是"已吊销"，并指向 `known_hosts` 的行号；日志记 `knownhosts.rejected`（ERROR，含 `policy`）。`ignore` 下接受变更时状态条会出现一条「警告: … 的主机密钥已改变（已按忽略策略接受，未写入 known_hosts）」。
+
+### 忽略密钥变更 / Ignoring key changes
+
+两种入口，语义一致（都映射到 `HostKeyPolicy::Ignore`），区别只在作用域：
+
+| 入口 | 作用域 | 何时用 |
+|---|---|---|
+| `--ignore-host-key-changes` | **全局**（等价 `ssh -o StrictHostKeyChecking=no`） | 临时排障；全局优先，**不会被更严格的 `Host` 块削弱** |
+| `~/.ssh/config` 的 `StrictHostKeyChecking no` / `UserKnownHostsFile /dev/null` | **per-host**，更推荐 | 某台开发机 / 跳板机密钥轮换，其它主机保持严格 |
+
+`~/.ssh/config` 的读取在 `src/ssh/hostkey_conf.rs`：`no`/`off` 或 `UserKnownHostsFile /dev/null` → `Ignore`；`yes`/`ask`/未写 → 保持 sshpf 默认的 `accept-new`（**不会**升格成 `strict`，否则给不写该指令的用户平添破坏）。`Host *` 继承与首个匹配块优先由 `ssh2-config` 处理。策略是**逐跳**的：`ProxyJump` 链上每一跳各用自己的策略，因此"跳板机忽略、目标主机严格"是正常组合。
+
+**`@revoked` 永不被忽略。** 吊销是对这把密钥本身的判决，而忽略只针对"这台主机的密钥换了"——`Ignore` 的 `is_acceptable` 对 `Revoked` 恒为 `false`。忽略同时是**降级**：每次接受都留 `knownhosts.ignored_changed`（WARN），且**不改写** `known_hosts`，所以下次启动仍会看到同一处不一致，直到你用 `ssh-keygen -R` 清理或确认新指纹。
 
 ## 这些规则由谁守 / What enforces this
 

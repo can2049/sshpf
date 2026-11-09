@@ -41,7 +41,31 @@ const KEEPALIVE_MAX: usize = 3;
 /// Verify-what-you-connect-to settings for one run.
 #[derive(Default)]
 pub struct Options {
+    /// Process-wide policy: `Ignore` when the user passed
+    /// `--ignore-host-key-changes`, otherwise the default (`accept-new`).
+    ///
+    /// This is a *floor on leniency*, not an override that erases per-host
+    /// settings: a host whose `~/.ssh/config` asks for `Ignore` stays ignored
+    /// even if this is `AcceptNew`. See [`Options::policy_for`].
     pub host_key_policy: known_hosts::HostKeyPolicy,
+}
+
+impl Options {
+    /// The policy a single hop is verified under.
+    ///
+    /// A `ProxyJump` chain verifies every hop separately, and the hosts
+    /// legitimately differ: it is normal — and the reference case for this
+    /// feature — for the *jump* host to be the one the user stopped verifying
+    /// while the target stays under sshpf's default. So the per-host policy
+    /// resolved from `~/.ssh/config` wins, unless the user asked for `Ignore`
+    /// globally, which must not be weakened by a strict host block.
+    pub fn policy_for(&self, endpoint: &Endpoint) -> known_hosts::HostKeyPolicy {
+        if self.host_key_policy == known_hosts::HostKeyPolicy::Ignore {
+            known_hosts::HostKeyPolicy::Ignore
+        } else {
+            endpoint.host_key_policy
+        }
+    }
 }
 
 /// TCP connect with a timeout and a readable error.
@@ -56,7 +80,7 @@ pub(crate) async fn timeout_connect(host: &str, port: u16, what: &str) -> Result
 pub(crate) async fn session<S>(
     stream: S,
     endpoint: &Endpoint,
-    opts: &Options,
+    policy: known_hosts::HostKeyPolicy,
     id: TunnelId,
     tx: Sender<TunnelEvent>,
     local_target: Option<(String, u16)>,
@@ -64,7 +88,7 @@ pub(crate) async fn session<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let shared = SharedVerdict::new(opts.host_key_policy);
+    let shared = SharedVerdict::new(policy);
     let handler =
         Handler { id, tx, host: endpoint.hostname.clone(), port: endpoint.port, shared: shared.clone(), local_target };
     let config = Arc::new(client::Config {
@@ -84,7 +108,7 @@ where
             // The handler records its verdict before russh returns the error.
             let verdict = shared.take();
             return Err(match verdict {
-                Some(v) if !v.is_acceptable(opts.host_key_policy) => host_key_rejected(v, host, port),
+                Some(v) if !v.is_acceptable(policy) => host_key_rejected(v, host, port),
                 _ => anyhow::Error::new(e).context(format!("连接 {host}:{port} 失败")),
             });
         }
@@ -93,7 +117,7 @@ where
     // A refusal can also be recorded without the connect failing (e.g. a later
     // re-exchange), so double-check.
     if let Some(v) = shared.take()
-        && !v.is_acceptable(opts.host_key_policy)
+        && !v.is_acceptable(policy)
     {
         return Err(host_key_rejected(v, host, port));
     }
@@ -114,7 +138,7 @@ pub(crate) async fn connect(
 ) -> Result<Arc<client::Handle<Handler>>> {
     if endpoint.proxy_jump.is_empty() {
         let stream = timeout_connect(&endpoint.hostname, endpoint.port, "连接目标主机").await?;
-        return session(stream, endpoint, opts, id, tx, local_target).await;
+        return session(stream, endpoint, opts.policy_for(endpoint), id, tx, local_target).await;
     }
 
     let hops = resolve_hops(endpoint)?;
@@ -122,7 +146,9 @@ pub(crate) async fn connect(
         bail!("ProxyJump 为空，无法确定第一跳");
     };
     let stream = timeout_connect(&first.hostname, first.port, "连接跳板机").await?;
-    let mut handle = session(stream, &first, opts, id, tx.clone(), None).await?;
+    // Each hop carries its own policy from `~/.ssh/config`: the jump host is
+    // often the one the user stopped verifying, while the target stays strict.
+    let mut handle = session(stream, &first, opts.policy_for(&first), id, tx.clone(), None).await?;
 
     // Intermediate hops never need the `-R` target; only the final session does.
     for hop in hops.iter().skip(1) {
@@ -157,17 +183,77 @@ async fn hop_through(
         .channel_open_direct_tcpip(hop.hostname.clone(), u32::from(hop.port), "127.0.0.1", 1234)
         .await
         .with_context(|| format!("经跳板机连接 {}:{} 失败", hop.hostname, hop.port))?;
-    session(channel.into_stream(), hop, opts, id, tx, local_target).await
+    session(channel.into_stream(), hop, opts.policy_for(hop), id, tx, local_target).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// An endpoint whose own `~/.ssh/config` block implied `policy`.
+    fn endpoint_with(policy: known_hosts::HostKeyPolicy) -> Endpoint {
+        Endpoint {
+            hostname: "h".into(),
+            port: 22,
+            user: None,
+            proxy_jump: Vec::new(),
+            identity_file: None,
+            host_key_policy: policy,
+        }
+    }
+
     #[test]
     fn an_empty_proxy_jump_resolves_to_no_hops() {
-        let endpoint =
-            Endpoint { hostname: "h".into(), port: 22, user: None, proxy_jump: Vec::new(), identity_file: None };
-        assert!(resolve_hops(&endpoint).unwrap().is_empty());
+        assert!(resolve_hops(&endpoint_with(known_hosts::HostKeyPolicy::AcceptNew)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn without_the_global_flag_a_host_keeps_its_own_policy() {
+        let opts = Options::default();
+        assert_eq!(
+            opts.policy_for(&endpoint_with(known_hosts::HostKeyPolicy::AcceptNew)),
+            known_hosts::HostKeyPolicy::AcceptNew
+        );
+    }
+
+    /// The reference case: the jump host says `StrictHostKeyChecking no` in
+    /// `~/.ssh/config` while the target declares nothing. Per-hop resolution is
+    /// what makes `ssh cloud_pc` and sshpf agree.
+    #[test]
+    fn a_host_that_asked_to_be_ignored_is_ignored_per_host() {
+        let opts = Options::default();
+        assert_eq!(
+            opts.policy_for(&endpoint_with(known_hosts::HostKeyPolicy::Ignore)),
+            known_hosts::HostKeyPolicy::Ignore
+        );
+    }
+
+    /// The flag is a *floor on leniency*: a strict host block must not be able to
+    /// weaken it, because the user asked for it globally.
+    #[test]
+    fn the_global_flag_is_not_weakened_by_a_stricter_host() {
+        let opts = Options { host_key_policy: known_hosts::HostKeyPolicy::Ignore };
+        for per_host in [
+            known_hosts::HostKeyPolicy::Strict,
+            known_hosts::HostKeyPolicy::AcceptNew,
+            known_hosts::HostKeyPolicy::Ask,
+            known_hosts::HostKeyPolicy::Ignore,
+        ] {
+            assert_eq!(
+                opts.policy_for(&endpoint_with(per_host)),
+                known_hosts::HostKeyPolicy::Ignore,
+                "host was {per_host:?}"
+            );
+        }
+    }
+
+    /// Without the flag the default is `AcceptNew`, which must not be upgraded
+    /// to `Ignore` for a host that says nothing.
+    #[test]
+    fn the_default_options_do_not_upgrade_a_host_to_ignore() {
+        let opts = Options { host_key_policy: known_hosts::HostKeyPolicy::AcceptNew };
+        let resolved = opts.policy_for(&endpoint_with(known_hosts::HostKeyPolicy::AcceptNew));
+        assert_eq!(resolved, known_hosts::HostKeyPolicy::AcceptNew);
+        assert!(!known_hosts::accepts_changed(resolved), "the default must refuse a changed key");
     }
 }

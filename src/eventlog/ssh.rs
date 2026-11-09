@@ -30,6 +30,7 @@ pub fn host_key_policy_name(policy: HostKeyPolicy) -> &'static str {
         HostKeyPolicy::Strict => "strict",
         HostKeyPolicy::AcceptNew => "accept-new",
         HostKeyPolicy::Ask => "ask",
+        HostKeyPolicy::Ignore => "ignore",
     }
 }
 
@@ -55,6 +56,20 @@ pub fn host_key_rejected(id: TunnelId, host: &str, port: u16, policy: &str, deta
     );
 }
 
+/// A *changed* server key was accepted because the host is under
+/// [`HostKeyPolicy::Ignore`].
+///
+/// `warn`, not `info`: the connection proceeds, but a trust anchor the user
+/// recorded on disk no longer matches what the server presented, and `known_hosts`
+/// is deliberately **not** rewritten. This record is the only place that says so
+/// once the TUI is gone.
+pub fn host_key_ignored_changed(id: TunnelId, host: &str, port: u16, line: usize, fingerprint: &str) {
+    logging::warn(
+        "knownhosts.ignored_changed",
+        &[("tunnel", &id), ("host", &host), ("port", &port), ("line", &line), ("fingerprint", &fingerprint)],
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -64,5 +79,6 @@ mod tests {
         assert_eq!(host_key_policy_name(crate::ssh::known_hosts::HostKeyPolicy::Strict), "strict");
         assert_eq!(host_key_policy_name(crate::ssh::known_hosts::HostKeyPolicy::AcceptNew), "accept-new");
         assert_eq!(host_key_policy_name(crate::ssh::known_hosts::HostKeyPolicy::Ask), "ask");
+        assert_eq!(host_key_policy_name(crate::ssh::known_hosts::HostKeyPolicy::Ignore), "ignore");
     }
 }
