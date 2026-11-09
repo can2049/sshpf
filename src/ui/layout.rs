@@ -292,4 +292,18 @@ mod tests {
         assert!(err_w(120) >= err_w(100));
         assert!(err_w(120) <= MAX_LAST_ERROR);
     }
+
+    /// The wire protocol sends this many log lines per tunnel in a snapshot, so
+    /// anything the detail panel renders beyond it would be missing. `ipc` cannot
+    /// import from `ui` (wrong direction), so the value is duplicated; this is
+    /// the assertion that keeps the two in step.
+    #[test]
+    fn the_snapshot_log_tail_matches_what_the_detail_panel_renders() {
+        assert_eq!(
+            crate::ipc::SNAPSHOT_LOG_TAIL,
+            DETAIL_LOG_TAIL,
+            "SNAPSHOT_LOG_TAIL (wire) and DETAIL_LOG_TAIL (render) must agree, \
+             or a snapshot would carry lines nobody shows, or miss lines the panel needs"
+        );
+    }
 }

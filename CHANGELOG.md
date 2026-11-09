@@ -5,6 +5,15 @@
 
 ## [Unreleased]
 
+### 变更
+
+- **client-server 改造阶段 1：新增 `src/ipc/` 协议层。** 落地帧格式（`u32` 大端长度前缀、
+  256 KiB 上限）、消息与命令枚举、全量快照（`Instant` → 服务器时钟毫秒戳）、编解码与版本协商、
+  以及由配置路径派生的 socket/lock 端点（FNV-1a-64，不用不稳定的 `DefaultHasher`）。
+  **本阶段不改变任何可观察行为**：该层尚无生产调用点，只为后续把端口转发搬到本地 server
+  做准备，方案见 [docs/research/client-server.md](docs/research/client-server.md)。
+  新增 48 个单元测试，覆盖 round-trip、帧边界、坏输入不 panic、版本/配置协商。
+
 ### 修复
 
 - **`ctrl+s` / `f10` 在任何子焦点下都能真正保存。** 实测反馈「为 cloud_pc 填好 3081 端口
