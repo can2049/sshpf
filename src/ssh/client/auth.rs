@@ -69,7 +69,7 @@ async fn connect_agent() -> Result<AnyAgent> {
     // The OpenSSH-for-Windows agent listens on this well-known pipe.
     const OPENSSH_AGENT_PIPE: &str = r"\\.\pipe\openssh-ssh-agent";
     match AgentClient::connect_named_pipe(OPENSSH_AGENT_PIPE).await {
-        Ok(agent) => return Ok(agent.dynamic()),
+        Ok(agent) => Ok(agent.dynamic()),
         Err(pipe_err) => {
             // Fall back to PuTTY's Pageant, which is still common.
             match AgentClient::connect_pageant().await {
