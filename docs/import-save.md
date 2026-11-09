@@ -1,13 +1,13 @@
 # 保存导入：一行一条隧道 / Save imported rows
 
 > **这份文档回答**：`ctrl+s` 归谁（手填表单 vs 导入面板）、一条勾选行变成什么 `TunnelConfig`、端口怎么顺延、名称怎么去重、保存后的状态。
-> **不负责**：哪些行会被列出（见 [import-forwards.md](import-forwards.md)）、面板交互与筛选（见 [import-pane.md](import-pane.md)）、转发身份去重（见 [dedup.md](dedup.md)）、对端端口批量（见 [port-scan.md](port-scan.md)）。
+> **不负责**：哪些行会被列出（见 [import-forwards.md](import-forwards.md)）、面板交互与筛选与「已存在」行的表现（见 [import-pane.md](import-pane.md)）、转发身份去重（见 [dedup.md](dedup.md)）、对端端口批量（见 [port-scan.md](port-scan.md)）。
 > **相关代码路径**：`src/app/form_submit.rs`（提交路由 + 单条路径）、`src/app/import.rs`（批量构建与提交）、`src/model/import.rs`（`plan_local_port`）、`src/config.rs`（`validate_tunnel`/`unique_name`）。
 
 `ctrl+s`（或 `f10`）在**面板赢得提交**时走批量路径，**整批先校验、全过才写**：
 
 ```text
-for each ticked forward:
+for each ticked forward:            ← 已保存的行根本不会被勾上（见 import-pane.md）
     TunnelConfig ← config_from_forward
     跳过：已保存的隧道 / 本批次前面的行里有同一转发（见 dedup.md）
     校验字段（validate_tunnel）
@@ -85,3 +85,4 @@ errors 非空 → 错误写进表单，一条都不创建
 | 编辑已有条目 | 永远单条 + 二次确认，不走批量（把一次编辑变成批量新建是数据丢失级问题） |
 | 名称里的端口 | 是**请求**的端口，不是顺延后的 |
 | 重复行 | 跳过而非报错；每条跳过记 `event=action.duplicate_skipped` |
+| 行对应的转发已保存 | 该行**在列表里就不勾选**（`[✓]`），所以批量路径通常连"跳过"都不用记；能走到跳过说明是同批次内重复 |

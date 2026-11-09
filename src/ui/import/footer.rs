@@ -105,6 +105,14 @@ pub(super) fn footer_summary(table: &ImportTable) -> String {
     let checked = table.checked_count();
     let importable = table.importable_count();
     let mut s = format!("{checked}/{importable} 条勾选 / {checked}/{importable} checked");
+    // Rows listed only because the forward is already a tunnel. Said here, in the
+    // one line that already explains the tick count, because the alternative is a
+    // dimmed row the user cannot account for: `~/.ssh/config` *does* declare it, so
+    // "why is it not ticked?" needs an answer on screen.
+    match table.existing_count() {
+        0 => {}
+        n => s.push_str(&format!(" · {n} 条已存在 / {n} already exist")),
+    }
     if table.has_filters() {
         let active = ImportColumn::ALL.into_iter().filter(|c| !table.filter(*c).trim().is_empty());
         let zh: Vec<String> = active.clone().map(|c| format!("{}={}", c.label(), table.filter(c))).collect();

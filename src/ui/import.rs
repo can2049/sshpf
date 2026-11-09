@@ -148,6 +148,12 @@ mod tests {
     /// An app with a create form whose SSH HOST is set and whose import table
     /// holds `rows`, pane open.
     fn app_with_import(rows: Vec<SshForward>) -> App {
+        app_with_table(ImportTable::new(rows))
+    }
+
+    /// The pane as the app would install it, including the table's "already
+    /// saved" markings when the caller supplies them.
+    fn app_with_table(table: ImportTable) -> App {
         let mut app = app_with_tunnels(vec![]);
         app.open_form_create();
         app.hosts = vec![crate::ssh::SshHost {
@@ -160,7 +166,7 @@ mod tests {
         }];
         if let Some(f) = app.form.as_mut() {
             f.ssh_host.set("dev-box");
-            f.set_import_table("dev-box", ImportTable::new(rows));
+            f.set_import_table("dev-box", table);
             f.import_open = true;
         }
         app
@@ -206,6 +212,35 @@ mod tests {
         let form = app.form.as_mut().unwrap();
         form.import.toggle_cursor();
         assert_eq!(form.import.checked_count(), 0, "un-importable rows must not become checked");
+    }
+
+    #[test]
+    fn an_already_saved_forward_is_drawn_dimmed_named_and_unticked() {
+        // The row exists in `~/.ssh/config` but the tunnel is already managed, so
+        // the pane must (a) still show it, (b) not offer it as a ticked default,
+        // and (c) say *why* — otherwise a dimmed, untickable, unnamed row reads as
+        // a rendering bug rather than as "you already have this".
+        let rows = vec![
+            fwd(ForwardKind::Local, 8080, "127.0.0.1", 80, "LocalForward 8080 127.0.0.1:80"),
+            fwd(ForwardKind::Local, 9090, "127.0.0.1", 90, "LocalForward 9090 127.0.0.1:90"),
+        ];
+        let mut app = app_with_table(ImportTable::with_existing(rows, vec![Some("cloud_pc-L-8080".to_string()), None]));
+        let text = render_to_text(&mut app, 140, 45);
+
+        let row = text.lines().find(|l| l.contains("localhost:8080")).unwrap_or_else(|| panic!("{text}"));
+        assert!(row.contains("[✓]"), "an existing forward needs its own box glyph: {row:?}");
+        assert!(!row.contains("[x]"), "it must never look like a ticked default: {row:?}");
+        assert!(row.contains("已存在"), "the row has to name the tunnel it already is: {row:?}");
+        assert!(row.contains("cloud_pc-L-8080"), "and the name itself: {row:?}");
+
+        // The genuinely new row is still a ticked default.
+        let fresh = text.lines().find(|l| l.contains("localhost:9090")).unwrap_or_else(|| panic!("{text}"));
+        assert!(fresh.contains("[x]"), "a new forward is still offered: {fresh:?}");
+
+        // Counts describe what a save would create, plus an explicit note about
+        // the one that cannot be created.
+        assert!(text.contains("1/1 条勾选"), "denominator counts creatable rows only:\n{text}");
+        assert!(text.contains("1 条已存在"), "the existing row must be accounted for:\n{text}");
     }
 
     #[test]

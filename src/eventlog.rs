@@ -39,8 +39,8 @@ pub mod tunnel;
 pub mod user;
 
 pub use process::{
-    app_exit, app_start, cli_error, cli_mode, config_defaults_clamped, config_defaults_clamped_on, config_load_failed,
-    config_loaded, config_perms_tightened, config_repaired, config_save_failed, id_space_exhausted,
+    app_exit, app_start, cli_error, cli_mode, config_deduped, config_defaults_clamped, config_defaults_clamped_on,
+    config_load_failed, config_loaded, config_perms_tightened, config_repaired, config_save_failed, id_space_exhausted,
     id_space_exhausted_on, orphan_event, state_save_failed,
 };
 pub use ssh::{

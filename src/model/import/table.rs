@@ -49,14 +49,43 @@ pub struct ImportTable {
 }
 
 impl ImportTable {
-    /// Build a table from the discovered forwards: everything importable is
-    /// checked by default.
+    /// Build a table from the discovered forwards: everything importable and not
+    /// already saved is checked by default.
     pub fn new(forwards: Vec<SshForward>) -> Self {
+        ImportTable::with_existing(forwards, Vec::new())
+    }
+
+    /// Build a table that knows which rows are already saved tunnels.
+    ///
+    /// The caller (`app::import_pane`) owns the config, so it answers the "already
+    /// saved?" question for every row and passes the answers in. `existing` is
+    /// aligned with `forwards` by position: entry `i` is the name of
+    /// the saved tunnel that row `i` already is, if any. Positional (rather than a
+    /// callback) so the caller can answer from one snapshot of the config — a
+    /// callback that re-read the config per row could give two rows of one table
+    /// two different answers for the same forward.
+    ///
+    /// The two things that follow from a row being saved, and both matter:
+    ///
+    /// * it starts **unticked**, because the default offer is "these are the
+    ///   forwards you can create" and this one already exists;
+    /// * it can never *become* ticked (`toggle_*` / `check_all_*` skip it), because
+    ///   a keyboard route to a known duplicate would undo the whole point.
+    ///
+    /// The row stays visible and keeps its name, so the pane can say "already
+    /// exists as X" instead of appearing to have lost a directive the user wrote.
+    pub fn with_existing(forwards: Vec<SshForward>, existing: Vec<Option<String>>) -> Self {
+        let mut answers = existing.into_iter();
         let rows = forwards
             .into_iter()
             .map(|forward| {
-                let checked = forward.unsupported_reason().is_none();
-                ImportRow { forward, checked }
+                // Only an *importable* row can already exist: a directive we
+                // cannot express as a `TunnelConfig` has no identity to compare,
+                // and asking would compare a nonsense string.
+                let importable = forward.unsupported_reason().is_none();
+                let existing = answers.next().flatten().filter(|_| importable);
+                let checked = importable && existing.is_none();
+                ImportRow { forward, checked, existing }
             })
             .collect();
         ImportTable {
@@ -166,7 +195,7 @@ impl ImportTable {
         self.touch();
         if let Some(&idx) = self.visible().get(self.cursor)
             && let Some(row) = self.rows.get_mut(idx)
-            && row.importable()
+            && row.creatable()
         {
             row.checked = !row.checked;
         }
@@ -180,7 +209,7 @@ impl ImportTable {
         self.touch();
         for idx in self.visible() {
             if let Some(row) = self.rows.get_mut(idx)
-                && row.importable()
+                && row.creatable()
             {
                 row.checked = true;
             }
@@ -200,19 +229,39 @@ impl ImportTable {
         self.touch();
         for idx in self.visible() {
             if let Some(row) = self.rows.get_mut(idx)
-                && row.importable()
+                && row.creatable()
             {
                 row.checked = !row.checked;
             }
         }
     }
 
+    /// Rows that will become a tunnel if the user saves now.
+    ///
+    /// Counts only `creatable()` rows: an already-saved forward is listed but
+    /// cannot be created, so counting it would promise a tunnel the save does not
+    /// produce.
     pub fn checked_count(&self) -> usize {
-        self.rows.iter().filter(|r| r.checked && r.importable()).count()
+        self.rows.iter().filter(|r| r.checked && r.creatable()).count()
     }
 
+    /// Rows the user *could* create — the denominator of `n/m 条勾选`.
+    ///
+    /// Not `len()`: un-importable rows (unix sockets, a `-R` with no
+    /// destination) and already-saved rows are listed but never creatable, and a
+    /// denominator that included them would make "all of them are ticked" look
+    /// false.
     pub fn importable_count(&self) -> usize {
-        self.rows.iter().filter(|r| r.importable()).count()
+        self.rows.iter().filter(|r| r.creatable()).count()
+    }
+
+    /// Rows listed because a saved tunnel already is this forward.
+    ///
+    /// Reported in the pane footer so "why is this line dimmed?" has an answer on
+    /// screen, and so a host whose every directive is already managed says so
+    /// instead of looking broken.
+    pub fn existing_count(&self) -> usize {
+        self.rows.iter().filter(|r| r.importable() && r.existing.is_some()).count()
     }
 
     pub fn any_checked(&self) -> bool {
@@ -221,7 +270,7 @@ impl ImportTable {
 
     /// The checked forwards, in file order — what the form turns into tunnels.
     pub fn checked_forwards(&self) -> Vec<SshForward> {
-        self.rows.iter().filter(|r| r.checked && r.importable()).map(|r| r.forward.clone()).collect()
+        self.rows.iter().filter(|r| r.checked && r.creatable()).map(|r| r.forward.clone()).collect()
     }
 }
 

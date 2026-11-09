@@ -228,3 +228,16 @@ v1 需要 Job Object 替代进程组、`KILL_ON_JOB_CLOSE` 替代 `PR_SET_PDEATH
 导入面板自动展开 + 自动全勾是刻意的默认。但旧实现把「面板可见」直接等同于「面板就是用户的意思」，于是手填一条转发按 `ctrl+s` 会被批量路径静默吞掉（实测：手填 3082，只建了 `~/.ssh/config` 里的 2 条）。修法不是取消自动展开，而是给两种意图分优先级：**未动过的面板是默认提议，完整的手填表单是明确指令**，后者优先；面板一旦被真正改动（勾选/筛选/手动展开），或表单本身不完整，面板照旧赢得 `ctrl+s`。判据落在 `ImportTable::touched` 上，移动光标与自动展开不置位。
 
 → [import-save.md](import-save.md#提交归属默认提议-vs-明确指令) · `src/app/form_submit.rs`、`src/model/import/table.rs`
+
+## D34 去重必须发生在「提议」这一层，而不只是「提交」这一层
+
+D32 的守卫拦得住**新建**的重复，拦不住两种已经发生的重复：
+
+1. **面板的默认勾选**：`~/.ssh/config` 里的转发如果已经建过，它仍然是 `ImportTable::new` 的「全部勾上」默认——于是每次「加一个新端口」都会顺带重建那几条老的，每份副本还被 `plan_local_port` 顶到新的本地端口，下一轮连守卫都认不出来。
+2. **`config.toml` 里已经写进去的重复**：守卫出现之前写下的条目，守卫永远看不到，于是表格永久显示 3 行、拨 3 条连接。
+
+所以修法分两处，都在**提交之前**：面板把已存在的行标成「已存在」并禁止勾选（提议层），载入时按身份折叠已保存的重复（持久层）。只修提交层不够——用户看到的那份提议本身就在要求错误的东西；只修持久层也不够——下一次打开面板又会提出同样的重复。
+
+两条判断标准贯穿两处：**同一份身份算法**（`model::tunnel::identity_of`，`-L` 不含本地端口）与**不留沉默**（面板写明「已存在：X」，载入折叠记 `event=config.deduped` 并在状态栏说明）。表格无故变短、某行无故不可勾，都会被读成 bug；说明白才是一次修复。
+
+→ [dedup.md](dedup.md#已写进配置的重复载入时折叠--fold-duplicates-on-load) · [import-pane.md](import-pane.md#已存在的行--rows-that-already-exist) · `src/model/dedup.rs`、`src/model/import/row.rs`、`src/app/import_pane.rs`

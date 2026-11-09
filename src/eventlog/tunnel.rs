@@ -287,7 +287,7 @@ mod tests {
             ssh_host: "cloud_pc".into(),
             local_addr: "127.0.0.1".into(),
             local_port: 19711,
-            remote_host: "127.0.0.1".into(),
+            remote_host: "10.0.0.1".into(),
             remote_port: 22,
             enabled: true,
             auto_restart: true,
@@ -308,7 +308,7 @@ mod tests {
         // A reader must be able to tell which tunnel a line is about without
         // reading the surrounding lines, so the identity fields come first and in
         // a fixed order.
-        let expected = "tunnel=7 name=cloud-pc forward=local listen=127.0.0.1:19711 target=127.0.0.1:22 host=cloud_pc";
+        let expected = "tunnel=7 name=cloud-pc forward=local listen=127.0.0.1:19711 target=10.0.0.1:22 host=cloud_pc";
         assert!(line.contains(expected), "identity fields missing or reordered:\n{line}");
         assert!(line.contains("elapsed_ms=812"), "caller fields follow the identity ones:\n{line}");
         assert!(line.contains(" INFO "), "{line}");
