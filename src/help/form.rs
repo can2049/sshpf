@@ -71,6 +71,10 @@ pub(super) const FORM_EDITING: HelpSection = HelpSection {
             "Saving works in both stages: ctrl+s / f10 behave the same while editing and never type into the field.",
         ),
         HelpItem::note(
+            "主机下拉框开着、或导入面板某列筛选正在输入时，ctrl+s / f10 也照样保存。",
+            "ctrl+s / f10 still save while the host dropdown is open or an import column filter is being typed into.",
+        ),
+        HelpItem::note(
             "输入远端端口会联动推荐本地端口；手改本地端口后不再被覆盖。",
             "Typing the remote port suggests the local port; a hand-edited local port is never overwritten.",
         ),

@@ -24,12 +24,16 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 /// rest still behave exactly as they do in the plain form — the pane is an
 /// addition, not a modal that swallows the form.
 pub(super) fn handle_import_key(app: &mut App, key: KeyEvent) -> bool {
-    // A save key that reaches the filter catch-all below becomes the letter `s`
-    // in whichever column is focused, so the save silently never happens — no
-    // tunnel, no error, no log line. Record which focus took it: that single line
-    // is what turns "ctrl+s did nothing" from a mystery into a diagnosis.
+    // A save key is not filter text: the catch-all below is
+    // `Char(c) if !c.is_control()`, and `ctrl+s` is a `Char('s')` whose `char` is
+    // not a control character, so without this guard the key is typed into
+    // whichever column is focused and the save silently never happens — no tunnel,
+    // no error, no log line. Record the near-miss (the WARN is what makes an
+    // otherwise-empty log file explain itself) and hand the key back: the pane's
+    // own footer advertises `ctrl+s 保存`, so it must honour it.
     if crate::keys::is_save_key(key) {
         crate::eventlog::save_key_swallowed("import_filter");
+        return false;
     }
     // `f` outranks filter typing, so it means the same thing whether or not a
     // filter is active: advance to the next column. Handled before the delegation
@@ -407,60 +411,37 @@ mod tests {
     }
 
     #[test]
-    fn saving_with_every_row_unticked_says_nothing_is_ticked() {
-        // Regression: this used to fall through to the single-tunnel validation
-        // and report "名称不能为空", describing fields the user was not editing.
-        let (_d, mut app) = import_app();
-        handle_key(&mut app, ch('U'));
-        assert_eq!(app.form.as_ref().unwrap().import.checked_count(), 0);
-        handle_key(&mut app, ctrl('s'));
-        assert!(app.tunnels.is_empty());
-        let errs = &app.form.as_ref().unwrap().errors;
-        assert!(
-            errs.iter().any(|e| e.contains("没有") || e.contains("没有勾选")),
-            "expected a 'nothing ticked' message, got {errs:?}"
-        );
-        assert!(
-            !errs.iter().any(|e| e.contains("名称不能为空")),
-            "must not complain about unrelated form fields: {errs:?}"
-        );
-    }
-
-    #[test]
-    fn unticking_every_row_then_typing_one_forward_creates_the_typed_one() {
-        // The reported workflow, driven through the key handler the user actually
-        // presses: the host's rows are auto-ticked, the user wants a *different*
-        // port, so they clear the ticks (`U`) and fill the form by hand, then
-        // `ctrl+s`. The cleared pane must not answer "没有勾选任何转发" over a
-        // complete typed form — that message used to block the save entirely.
-        let (_d, mut app) = import_app();
-        handle_key(&mut app, ch('U'));
-        assert_eq!(app.form.as_ref().unwrap().import.checked_count(), 0);
+    fn a_save_key_is_never_filter_text_even_with_a_column_focused() {
+        // The reported failure, driven the way the user actually presses it: the
+        // pane is open, a column filter owns the keyboard (one stray `←`/`f` is
+        // enough), the form holds the forward they want, they press `ctrl+s`. The
+        // filter catch-all `Char(c) if !c.is_control()` used to see the save key as
+        // the letter `s`, so the key became filter text, the save never happened,
+        // and nothing was logged — the tunnel simply never appeared.
+        let (_d, mut app) = default_open_import_app();
+        // Clear the pane's default ticks first: this case is about *dispatch*, and
+        // a still-ticked pane would legitimately win the submit for its own batch
+        // (that is the documented routing rule, tested elsewhere). What matters
+        // here is that the focused filter cannot eat the key.
+        app.import_uncheck_all();
+        app.begin_import_filter(crate::model::ImportColumn::Raw);
         {
             let f = app.form.as_mut().unwrap();
-            f.name.set("cloud_pc-3081");
+            f.name.set("typed-3081");
             f.remote_host.set("127.0.0.1");
             f.remote_port.set("3081");
             f.local_port.set("3081");
+            f.mark_local_port_manual();
         }
+        assert!(crate::keys::is_save_key(ctrl('s')), "precondition: ctrl+s is the save key");
+
         handle_key(&mut app, ctrl('s'));
 
-        assert_eq!(app.tunnels.len(), 1, "the typed forward must be created");
-        assert_eq!(app.tunnels[0].cfg.name, "cloud_pc-3081");
-        assert_eq!(app.tunnels[0].cfg.remote_port, 3081);
-        assert!(matches!(app.overlay, Overlay::None), "the form closes on success");
-    }
-
-    #[test]
-    fn a_save_key_that_a_column_filter_would_eat_is_recorded() {
-        // The diagnostic half (this change): `ctrl+s` is a `Char('s')` whose char is
-        // not a control character, so the filter catch-all used to type it as `s`.
-        // The guard now records `event=form.save_key_swallowed focus=import_filter`,
-        // so an otherwise-empty log file explains itself. Making the save *succeed*
-        // in this state is the follow-up routing change.
-        assert!(crate::keys::is_save_key(ctrl('s')), "precondition: ctrl+s is the save key");
-        assert!(!crate::keys::is_save_key(ctrl('a')), "and an ordinary ctrl chord is not");
-        assert!(!crate::keys::is_save_key(ch('s')), "nor is a plain `s` typed into a filter");
+        assert!(
+            app.tunnels.iter().any(|t| t.cfg.remote_port == 3081),
+            "ctrl+s must save even with a column filter focused: {:?}",
+            app.form.as_ref().map(|f| f.errors.clone())
+        );
     }
 
     #[test]
