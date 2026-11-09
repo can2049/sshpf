@@ -24,7 +24,7 @@ use crate::ui::frame::{centered, clear_and_block, popup_block};
 use crate::ui::hints::{Hint, flow_hints};
 use crate::ui::hit::HitMap;
 use crate::ui::import;
-use crate::ui::layout::{form_label_w, form_value_x};
+use crate::ui::layout::{FORM_POPUP_W, form_label_w, form_value_x};
 use crate::ui::palette::{Palette, palette};
 use crate::ui::text::{fit_pair, fit_pair_spaced, warn_once};
 
@@ -56,7 +56,10 @@ pub(crate) fn draw_form(frame: &mut Frame, app: &App, area: Rect, hits: &mut Hit
         "新建转发 · New tunnel".to_string()
     };
     let pane_open = pane_open(app);
-    let popup = centered(area, 74.min(area.width), form_height(pane_open).min(area.height));
+    // 110 instead of 74: at 74 the import pane's raw-directive column was clipped
+    // (`RemoteForward 9000 12…`), and this is the one screen where a tunnel is
+    // defined. `centered` clamps both axes, so a narrow terminal keeps its width.
+    let popup = centered(area, FORM_POPUP_W.min(area.width), form_height(pane_open).min(area.height));
     let block = popup_block(&title, p);
     let inner = block.inner(popup);
     clear_and_block(frame, popup, block);
@@ -318,10 +321,10 @@ pub(crate) fn form_notes(form: &crate::app::FormState, p: Palette, width: usize)
     }
     extra.push(Line::from(""));
     // The legend flows like the main footer instead of being one long string:
-    // the form popup is only ~70 cells wide, and a single line would be cut
-    // mid-token (`esc 取…`), which is worse than useless for the keys that teach
-    // the two-stage editing model. Flowing drops a whole hint instead, and on a
-    // normal terminal every hint fits in both languages.
+    // the popup is wide but a narrow terminal can still clamp it, and a single
+    // line would then be cut mid-token (`esc 取…`), which is worse than useless
+    // for the keys that teach the two-stage editing model. Flowing drops a whole
+    // hint instead, and on a normal terminal every hint fits in both languages.
     let hints: &[Hint] = if form.is_editing_field() {
         // Say which stage the form is in, in words: the highlight colour is the
         // other cue, and colour alone is not allowed to carry meaning.
@@ -539,6 +542,36 @@ mod tests {
         app.close_import_pane();
         let text = render_to_text(&mut app, 100, 14);
         assert!(!text.contains("导入面板未显示"), "a collapsed pane has nothing hidden:\n{text}");
+    }
+
+    /// The form must show a whole value, not a clipped one.
+    ///
+    /// This is the user-visible half of the width change, asserted on rendered
+    /// text rather than on the geometry: the widest thing a user actually types
+    /// is a remote hostname and a `~/.ssh/config` directive, and at the old fixed
+    /// 74 columns both were drawn with a trailing `…`. A form that silently
+    /// truncates the value you are checking is worse than a wider popup.
+    #[test]
+    fn the_form_is_wide_enough_to_show_complete_values() {
+        let host = "internal-db-prod-01.example.internal";
+        let raw = "RemoteForward 9000 127.0.0.1:9001";
+        let mut app = app_with_import(vec![fwd(crate::model::ForwardKind::Remote, 9000, "127.0.0.1", 9001, raw)]);
+        if let Some(f) = app.form.as_mut() {
+            f.ssh_host.set("dev-box");
+            f.remote_host.set(host);
+            f.remote_port.set("5432");
+        }
+
+        // The default terminal: the whole hostname and the whole directive.
+        let text = render_to_text(&mut app, 120, 45);
+        assert!(text.contains(host), "remote host must not be clipped:\n{text}");
+        assert!(text.contains(raw), "the raw directive must not be clipped:\n{text}");
+
+        // A terminal narrower than the popup still wins: the form clamps to the
+        // frame and the values truncate, because an overflowing popup is worse.
+        let narrow = render_to_text(&mut app, 60, 40);
+        assert!(!narrow.contains(raw), "a narrow frame must clamp the popup:\n{narrow}");
+        assert!(narrow.contains("新建转发"), "a narrow frame must still show the form:\n{narrow}");
     }
 
     #[test]

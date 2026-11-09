@@ -199,3 +199,14 @@ v1 需要 Job Object 替代进程组、`KILL_ON_JOB_CLOSE` 替代 `PR_SET_PDEATH
 单体大文件（`model.rs` 2532 / `ui.rs` 3095 / `logging.rs` 1522 / `keys.rs` 1828 / `app.rs` 1602 行）拆成一层一职责的小文件，单文件生产行 ≤ 400（`tests/safety_guards.rs` 断言）；把重复实现收敛到 `src/text.rs` 与 `src/eventlog.rs`；`eventlog` 上移修掉"底层依赖上层"；`unsafe` 收口到 `src/logging/crash.rs`；文档按 agent 信息架构重建（入口 [index.md](index.md)）。
 
 → [architecture.md](architecture.md#模块地图--module-map) · [agents.md](agents.md)
+
+## D31 v0.3.1：新建转发弹窗加宽
+
+表单弹窗原本固定 74 列 —— 内宽 70，值列 49，导入面板的「原始指令」列 23 列。于是
+`RemoteForward 9000 127.0.0.1:9001`（33 列）被画成 `RemoteForward 9000 12…`，恰好截掉
+用户辨认一行所依据的那一列；而新建/编辑转发是这个界面**唯一**定义隧道的地方。改为固定
+110 列（内宽 106，「原始指令」列 33 列，正好完整），窄终端仍由 `centered` 夹到帧内，
+所以只增不减。宽度是 `layout::FORM_POPUP_W` 一个常量，两个测试看护：布局层按真实字符串
+长度断言各列放得下，渲染层断言 120 列终端里渲染出的文本**不含** `…` 且窄终端里弹窗被夹住。
+
+→ [tui.md](tui.md#浮层--overlays) · `src/ui/layout.rs`、`src/ui/form.rs`
