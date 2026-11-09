@@ -31,8 +31,12 @@
 | 改崩溃捕获 / 权限 / 日志脱敏 | [security.md](security.md) | `src/logging/`、`src/sys/` |
 | 加测试 / 跑测试 / 测试放哪 | [testing.md](testing.md) | `src/**/#[cfg(test)]`、`tests/` |
 | 理解某条设计为什么这样 | [design.md](design.md) | — |
-| 改 `~/.ssh/config` 导入逻辑 | [import-forwards.md](import-forwards.md) | `src/ssh/forwards.rs`、`src/app/import.rs` |
-| 改「对端监听端口」选择 / 扫描 | [import-forwards.md](import-forwards.md) | `src/ssh/probe.rs`、`src/app/port_scan.rs`、`src/model/portscan.rs` |
+| 改 `~/.ssh/config` 的**发现**逻辑（作用域/Include/哪些行可导入） | [import-forwards.md](import-forwards.md) | `src/ssh/forwards.rs`、`src/ssh/forwards/` |
+| 改导入面板的**交互**（筛选/全选/自动展开） | [import-pane.md](import-pane.md) | `src/app/import_pane.rs`、`src/model/import/` |
+| 改 `ctrl+s` **保存**导入行（字段映射/端口顺延/命名） | [import-save.md](import-save.md) | `src/app/import.rs`、`src/app/form_submit.rs` |
+| 改「新增时怎么判定已有相同转发」 | [dedup.md](dedup.md) | `src/model/tunnel.rs`、`src/app/duplicate.rs` |
+| 改「手填表单与导入面板谁赢 `ctrl+s`」 | [import-save.md](import-save.md#提交归属默认提议-vs-明确指令) | `src/app/form_submit.rs`、`src/model/import/table.rs` |
+| 改「对端监听端口」选择 / 扫描 | [port-scan.md](port-scan.md) | `src/ssh/probe.rs`、`src/app/port_scan.rs`、`src/model/portscan.rs` |
 | 查键位 / 帮助文案 | [keymap.md](keymap.md) | `src/help.rs`、`src/keys/` |
 | 改配置字段 / 持久化 | [README.md](../README.md#配置--configuration) | `src/config.rs` |
 | 改双语文案 / 宽度 / 截断 / 折行 | [agents.md](agents.md#改文案--change-user-facing-text) | `src/text.rs` |
@@ -51,7 +55,11 @@
 | [logging.md](logging.md) | 日志格式、级别、怎么排查 | 事件目录（在 logging/events.md） |
 | [logging/events.md](logging/events.md) | 每个 `event=` 的级别/字段/含义 | 格式与排查配方 |
 | [keymap.md](keymap.md) | 全部按键与鼠标操作 | 实现与设计理由 |
-| [import-forwards.md](import-forwards.md) | 导入规则、去重、坑、批量创建；对端端口扫描的规则（`p`） | 表单交互细节 |
+| [import-forwards.md](import-forwards.md) | 哪些行会被列出、作用域累积、`Match`/`Include`、行去重、不可导入的行 | 面板交互、保存语义 |
+| [import-pane.md](import-pane.md) | 面板何时自动展开、`touched` 标记、逐列筛选与撤销、全选只看筛选视图 | 哪些行被列出、保存 |
+| [import-save.md](import-save.md) | `ctrl+s` 归谁、一条勾选行变成什么、端口顺延、命名、保存后状态 | 行发现、面板交互 |
+| [port-scan.md](port-scan.md) | 对端监听端口：探测命令、哪些不列出、单条/批量选择、`-R` 只读、扫描线程与代次 | `~/.ssh/config` 导入 |
+| [dedup.md](dedup.md) | 新增转发时的**转发身份去重**：判据、三个入口的行为、留痕 | 行去重（在 import-forwards） |
 | [design.md](design.md) | 关键设计决策索引（1 段 + 链接） | 任何展开叙述 |
 | [agents.md](agents.md) | 改码/写作约定与 checklist | 项目背景 |
 | [research/README.md](research/README.md) | 历史调研的定位与目录 | 当前行为 |

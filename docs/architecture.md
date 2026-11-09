@@ -68,7 +68,8 @@
 | `src/app/events.rs` | 事件泵的**读**侧：`drain_events`、`on_ready`/`on_line`/`on_exit`、`flush_pending_exits`、`tick_retries`/`arm_retry` | `app` | 事件 → 状态转移、退避规则 |
 | `src/app/persist.rs` | `persist`（config.toml）、`save_state`（state.toml）、`persist_quietly` | `app` | 落盘策略 |
 | `src/app/form.rs` | 表单**状态** + 校验（纯状态机，不 spawn、不落盘） | `app`、`keys::form` | 表单字段与校验规则 |
-| `src/app/form_submit.rs` | 表单**提交**：校验 → 持久化 → supervisor（create 直接保存，edit 确认后重建） | `keys`、`app` | 提交顺序与副作用 |
+| `src/app/form_submit.rs` | 表单**提交**：校验 → 持久化 → supervisor（create 直接保存，edit 确认后重建），以及「手填 vs 导入面板谁赢 `ctrl+s`」的路由 | `keys`、`app` | 提交顺序与副作用、提交归属 |
+| `src/app/duplicate.rs` | 转发**身份去重**：`duplicate_of` / `duplicate_in_batch`（只比 `forward_identity`，不做 I/O） | `form_submit`、`import`、`port_batch` | 新的重复判定入口；身份定义在 `model::tunnel` |
 | `src/app/import.rs` | 导入的**提交**半边：发现主机转发、批量校验、`config_from_forward`、建隧道 | `app` | 导入语义与校验 |
 | `src/app/port_scan.rs` | 对端端口扫描的**交互**半边：`p` 打开、扫描线程/代次、光标与勾选 | `keys::ports`、`app` | 扫描状态与面板交互 |
 | `src/app/port_batch.rs` | 对端端口批量的**提交**半边：勾选端口 → 每条一条 `-L` 隧道（全有或全无） | `app::form_submit` | 批量提交语义与命名 |
@@ -148,7 +149,7 @@
 | 文件 | 放什么 | 加东西放哪 |
 |---|---|---|
 | `src/model.rs` | 模块地图 + `mod`/`pub use`（63 行，只做导航） | 新类型 → 下表对应文件 |
-| `src/model/tunnel.rs` | `ForwardKind`、`TunnelConfig` | 隧道定义字段 |
+| `src/model/tunnel.rs` | `ForwardKind`、`TunnelConfig`（含 `forward_identity`：转发意图身份，去重的唯一判据） | 隧道定义字段、身份规则 |
 | `src/model/import.rs` | `SshForward`、`LocalPortReason`、`PORT_SCAN_LIMIT`、`plan_local_port`、`col_match` | 导入的发现规则与端口规则 |
 | `src/model/import/row.rs` | `ImportColumn`、`ImportRow`（一行怎么显示、怎么勾） | 可筛选列 / 每行标志 |
 | `src/model/import/table.rs` | `ImportTable`：候选行、光标、滚动、选中 | 行与选中状态 |

@@ -118,6 +118,46 @@ impl TunnelConfig {
         }
     }
 
+    /// A stable, data-only identity for *the forward the user asked for*.
+    ///
+    /// Two configs with the same identity are the same intent, even when the
+    /// environment has since moved one of their ports. That case is why this
+    /// function exists: importing `LocalForward 18789 127.0.0.1:18789` while a
+    /// tunnel already listens on 18789 makes `plan_local_port` bump the local port
+    /// to 18790, and creating that second entry leaves two rows for one forward.
+    /// The bump is not even necessarily recent — a bumped port is persisted, so
+    /// `config.toml` may hold 18790 for a directive that asked for 18789 and the
+    /// original request is gone. Comparing local ports would therefore miss the
+    /// duplicate exactly when the bump happened on an earlier run.
+    ///
+    /// Which ends count as intent depends on the kind:
+    ///
+    /// * `-L` → `L|ssh_host|local_addr|remote_host:remote_port` — the local
+    ///   **port** is deliberately absent: it is a derived value the environment
+    ///   may rewrite (and persist rewritten), so including it would make the very
+    ///   same forward look new exactly when the port was bumped.
+    /// * `-R` → `R|ssh_host|remote_host:remote_port|local_addr:local_port` — both
+    ///   ends are intent: the peer-side listen endpoint (what other machines
+    ///   dial) and our local target endpoint.
+    /// * `-D` → `D|ssh_host|local_addr:local_port` — only the local listen
+    ///   endpoint; a SOCKS proxy has no target.
+    ///
+    /// This is a pure data identity: it does no I/O, never probes a port and only
+    /// serialises fields. A *listen-port* conflict is a different question,
+    /// answered by `config::listen_endpoint`.
+    pub fn forward_identity(&self) -> String {
+        let ssh_host = self.ssh_host.trim();
+        let local_addr = self.local_addr.trim();
+        let remote_host = self.remote_host.trim();
+        match self.kind {
+            ForwardKind::Local => format!("L|{ssh_host}|{local_addr}|{remote_host}:{}", self.remote_port),
+            ForwardKind::Remote => {
+                format!("R|{ssh_host}|{remote_host}:{}|{local_addr}:{}", self.remote_port, self.local_port)
+            }
+            ForwardKind::Dynamic => format!("D|{ssh_host}|{local_addr}:{}", self.local_port),
+        }
+    }
+
     /// 0..=33 are privileged ports on Linux.
     pub fn uses_privileged_port(&self) -> bool {
         let listen_port = match self.kind {
@@ -184,6 +224,73 @@ mod tests {
         // A dynamic forward has no remote target: say so rather than printing
         // a stale host:port.
         assert_eq!(sample(ForwardKind::Dynamic).remote_display(), "(SOCKS5)");
+    }
+
+    #[test]
+    fn local_identity_ignores_the_bumpable_local_port() {
+        // The real-world case: the same `LocalForward` re-imported while the local
+        // port is taken gets a bumped local port. Same intent, same identity.
+        let a = sample(ForwardKind::Local);
+        let mut b = a.clone();
+        b.id = 2;
+        b.name = "another-name".into();
+        b.local_port = a.local_port + 1;
+        assert_eq!(a.forward_identity(), b.forward_identity());
+
+        // The remote side *is* intent: a different remote port is another forward.
+        let mut c = a.clone();
+        c.remote_port = a.remote_port + 1;
+        assert_ne!(a.forward_identity(), c.forward_identity());
+
+        // So is the SSH host, and the local address the user binds.
+        let mut d = a.clone();
+        d.ssh_host = "other-host".into();
+        assert_ne!(a.forward_identity(), d.forward_identity());
+        let mut e = a.clone();
+        e.local_addr = "0.0.0.0".into();
+        assert_ne!(a.forward_identity(), e.forward_identity());
+    }
+
+    #[test]
+    fn dynamic_identity_is_the_local_listener_only() {
+        let a = sample(ForwardKind::Dynamic);
+        let mut b = a.clone();
+        // `-D` has no target, so the remote fields are noise.
+        b.remote_host = "10.9.9.9".into();
+        b.remote_port = 1234;
+        assert_eq!(a.forward_identity(), b.forward_identity());
+
+        let mut c = a.clone();
+        c.local_port = a.local_port + 1;
+        assert_ne!(a.forward_identity(), c.forward_identity(), "the SOCKS listener is the intent");
+    }
+
+    #[test]
+    fn remote_identity_counts_both_ends() {
+        let a = sample(ForwardKind::Remote);
+        // The peer-side listener is intent …
+        let mut b = a.clone();
+        b.remote_port = a.remote_port + 1;
+        assert_ne!(a.forward_identity(), b.forward_identity());
+        // … and so is the local target we forward back to.
+        let mut c = a.clone();
+        c.local_port = a.local_port + 1;
+        assert_ne!(a.forward_identity(), c.forward_identity());
+    }
+
+    #[test]
+    fn identity_trims_whitespace_and_ignores_names_and_ids() {
+        let a = sample(ForwardKind::Local);
+        let mut b = a.clone();
+        b.id = 42;
+        b.name = "renamed".into();
+        b.note = "note".into();
+        b.enabled = true;
+        let mut padded = b.clone();
+        padded.ssh_host = format!("  {}  ", b.ssh_host);
+        padded.local_addr = format!(" {} ", b.local_addr);
+        padded.remote_host = format!("\t{}\n", b.remote_host);
+        assert_eq!(a.forward_identity(), padded.forward_identity());
     }
 
     #[test]

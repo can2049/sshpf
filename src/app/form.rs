@@ -112,12 +112,18 @@ impl FormState {
     }
 
     /// Install a freshly discovered import table for `host`.
+    ///
+    /// A new table is a **new default offer**, so it starts untouched: any tick
+    /// the user made on the previous host's rows must not be read as an
+    /// instruction about *these* rows. (Only `install_import_rows` reaches this,
+    /// and only for a changed host — see `refresh_import_table`.)
     pub fn set_import_table(&mut self, host: impl Into<String>, table: ImportTable) {
         self.import_host = host.into();
         self.import = table;
         // A new host's rows must not inherit the previous host's filter, but the
         // pane-open state is a UI preference the user just expressed.
         self.import.filters = std::array::from_fn(|_| String::new());
+        self.import.touched = false;
         self.import.end_filter();
     }
 
@@ -259,6 +265,20 @@ impl FormState {
             return Err(errs);
         }
         Ok(self.assemble(draft, id, existing))
+    }
+
+    /// Whether the typed fields alone already describe one valid tunnel.
+    ///
+    /// A *field-only* question, on purpose: it allocates no id, checks no
+    /// duplicate and writes no error into [`Self::errors`]. The submit router
+    /// asks it to decide whether the user has actually typed a forward by hand
+    /// (and therefore whether a complete form may outrank the import pane's
+    /// default offer), so it must be answerable without touching `App` state.
+    ///
+    /// `false` for a completely empty form — that is "nothing typed", which is
+    /// exactly what lets "picked a host, pressed ctrl+s" keep importing.
+    pub fn is_complete(&self) -> bool {
+        self.validate(&self.draft()).is_empty()
     }
 
     /// The trimmed text of every field, before any validation.

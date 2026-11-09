@@ -46,6 +46,26 @@ pub fn import_rejected(problems: &[String]) {
     logging::warn("import.rejected", &[("problems", &problems.len()), ("msg", &problems.join("; "))]);
 }
 
+/// A batch row was dropped because the same forward is already saved.
+///
+/// `source` says which path proposed it — `import` (`~/.ssh/config` batch),
+/// `port-scan` (ticked remote ports) or `form` (the single hand-filled form);
+/// `name` is the candidate's would-be name and `existing` the tunnel it
+/// duplicates. `info`, not `warn`: skipping a redundant forwarding is the intended
+/// outcome, and this line is what explains a submit that created fewer tunnels
+/// than rows were ticked.
+pub fn action_duplicate_skipped(source: &str, name: &str, existing: &str) {
+    action_duplicate_skipped_on(logging::logger(), source, name, existing);
+}
+
+pub fn action_duplicate_skipped_on(logger: &Logger, source: &str, name: &str, existing: &str) {
+    logger.event(
+        Level::Info,
+        "action.duplicate_skipped",
+        &[("source", &source), ("name", &name), ("existing", &existing)],
+    );
+}
+
 /// A confirmation was armed for a tunnel id that is no longer in the table.
 ///
 /// The dialog still opens with a fallback sentence, so the user is not stuck;
@@ -184,6 +204,24 @@ mod tests {
         assert!(text.contains(" WARN "), "{text}");
         assert!(text.contains("event=action.target_missing"), "{text}");
         assert!(text.contains("action=delete"), "{text}");
+    }
+
+    #[test]
+    fn a_skipped_duplicate_records_its_source_and_both_names() {
+        // INFO: skipping a redundant forward is the intended outcome, not a
+        // failure — but it explains a batch that created fewer tunnels than rows
+        // the user ticked.
+        let dir = tempfile::tempdir().unwrap();
+        let log = logger(dir.path());
+        action_duplicate_skipped_on(&log, "import", "cloud_pc-L-18789", "cloud_pc-L-18789-2");
+        let text = text(dir.path());
+        assert!(text.contains(" INFO "), "{text}");
+        assert!(text.contains("event=action.duplicate_skipped"), "{text}");
+        assert!(text.contains("source=import"), "the field order is part of the contract: {text}");
+        assert!(text.contains("name=cloud_pc-L-18789"), "{text}");
+        assert!(text.contains("existing=cloud_pc-L-18789-2"), "{text}");
+        let after_event = text.split("event=action.duplicate_skipped").nth(1).unwrap_or_default();
+        assert!(after_event.find("source=") < after_event.find("name="), "field order source/name/existing");
     }
 
     #[test]

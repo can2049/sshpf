@@ -66,7 +66,7 @@ UI 线程保持同步（`poll(200ms)`），绝不阻塞在网络握手上。一�
 
 填远端端口后自动推导本地端口，用户始终可改。规则：≥1024 且空闲 → 同值；**<1024 → `remote + 2200`**（`22 → 2222`）；被系统占用 → 向上顺延；被其它条目占用 → 跳过（含**未运行**的——它一旦启动就会冲突）；用户手改过 → 停止自动覆盖；编辑既有条目 → 不推导。特权端口不能"从远端端口向上扫"：`port_available` 会把所有 <1024 端口报成不可用，扫描预算会在特权区间全部耗尽。
 
-→ [import-forwards.md](import-forwards.md#本地端口顺延--local-port-shifting) · `src/model/`（`plan_local_port`）
+→ [import-save.md](import-save.md#本地端口顺延--local-port-shifting) · `src/model/`（`plan_local_port`）
 
 ## D11 风险操作：三条判断标准
 
@@ -118,7 +118,7 @@ handler 体：先按 `fn <name>(` 找签名，再从第一个 `{` 做花括号�
 
 主表 `/` 用 `fuzzy_match`（字符按序出现即命中）。列筛选**刻意**用大小写不敏感子串：端口列用模糊匹配，`1080` 会命中 `127.0.0.1:1080`、`127.0.0.1:10800`、`1:0:8:0`——筛选端口是为了**精确定位一行**，返回一堆无关行等于没筛。列筛选是"缩小范围"工具（`8080`、`localhost`、`-R`），子串才符合用途。
 
-→ [import-forwards.md](import-forwards.md#为什么用子串而不是模糊匹配--substring-not-fuzzy) · `src/model/`（`col_match`）
+→ [import-pane.md](import-pane.md#为什么用子串而不是模糊匹配--substring-not-fuzzy) · `src/model/`（`col_match`）
 
 ## D19 撤销用快照栈，不用增量日志
 
@@ -130,13 +130,13 @@ handler 体：先按 `fn <name>(` 找签名，再从第一个 `{` 做花括号�
 
 `f` 用于循环切换"正在筛选哪一列"，而它的助记位置又正好在被筛选的输入里。实现上 `f` **优先**被处理：连按是"换列"，不是"打开输入然后把 f 写进去"。代价是字面 `f` 无法输入到筛选里——四列内容是端口、主机地址和指令名，没有哪列需要匹配字母 `f`；反过来若让 `f` 被输入吃掉，底部「f/←→ 选列」的提示就成了谎话，第二次按下时行为突变，是"看起来能用、用起来出错"的设计。
 
-→ [import-forwards.md](import-forwards.md) · `src/keys/import.rs`
+→ [import-pane.md](import-pane.md#为什么用子串而不是模糊匹配--substring-not-fuzzy) · `src/keys/import.rs`
 
 ## D21 全选只看筛选后的视图
 
 `check_all_visible` / `invert_visible` / `uncheck_all_visible` 只遍历 `visible()`。这不是实现细节，是安全约束：带筛选时若勾上隐藏行，用户看到 3 行只勾了 1 行，保存却创建 3 条隧道——起 3 个监听端口。同一条规则保护主表多选。
 
-→ [import-forwards.md](import-forwards.md#全选--反选--全不选只看筛选后的视图--bulk-ticks-see-only-the-filtered-view) · `src/model/`
+→ [import-pane.md](import-pane.md#全选--反选--全不选只看筛选后的视图--bulk-ticks-see-only-the-filtered-view) · `src/model/`
 
 ## D22 多选标记按 `TunnelId`，不按行号
 
@@ -210,3 +210,21 @@ v1 需要 Job Object 替代进程组、`KILL_ON_JOB_CLOSE` 替代 `PR_SET_PDEATH
 长度断言各列放得下，渲染层断言 120 列终端里渲染出的文本**不含** `…` 且窄终端里弹窗被夹住。
 
 → [tui.md](tui.md#浮层--overlays) · `src/ui/layout.rs`、`src/ui/form.rs`
+
+## D32 去重比「意图」，不比端口
+
+新增转发前先问「这个转发是否已经存在」，判据是 `TunnelConfig::forward_identity()`。
+`-L` 的身份里**不含本地监听端口**——那是 `plan_local_port` 会按可用性顺延、并且顺延值会被
+持久化的派生量，原始请求事后不可恢复。实测的重复正是这么来的：已存 `local:18790 → remote:18789`
+（上次创建时 18789 被占），再次导入 `LocalForward 18789 127.0.0.1:18789` 又建一条。
+任何 `saved.local_port == requested` 的判定都会漏掉它。`-R`/`-D` 的本地端口仍算身份（两端都是意图 / 本地监听就是全部）。
+
+代价是 `LocalForward 8080 host:80` 与 `9090 host:80` 会被判成同一条，只保留一条。取舍：同目标两个本地监听是冗余的，而漏判重复会让用户**根本清不掉**重复条目——前者可绕过（改地址/目标），后者不可。
+
+→ [dedup.md](dedup.md) · `src/model/tunnel.rs`、`src/app/duplicate.rs`
+
+## D33 「默认全选」不等于「赢过手填」
+
+导入面板自动展开 + 自动全勾是刻意的默认。但旧实现把「面板可见」直接等同于「面板就是用户的意思」，于是手填一条转发按 `ctrl+s` 会被批量路径静默吞掉（实测：手填 3082，只建了 `~/.ssh/config` 里的 2 条）。修法不是取消自动展开，而是给两种意图分优先级：**未动过的面板是默认提议，完整的手填表单是明确指令**，后者优先；面板一旦被真正改动（勾选/筛选/手动展开），或表单本身不完整，面板照旧赢得 `ctrl+s`。判据落在 `ImportTable::touched` 上，移动光标与自动展开不置位。
+
+→ [import-save.md](import-save.md#提交归属默认提议-vs-明确指令) · `src/app/form_submit.rs`、`src/model/import/table.rs`

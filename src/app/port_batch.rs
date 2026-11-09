@@ -14,6 +14,10 @@
 //!
 //! Two invariants worth keeping:
 //!
+//! * **No duplicate forwards.** A ticked port whose forward is already saved is
+//!   skipped and reported, never created twice: the local port is planned from
+//!   what is free, so the same intent can otherwise be produced a second time
+//!   under a bumped local port.
 //! * **All or nothing.** A partial write (three tunnels created, then a
 //!   validation error on the fourth) leaves a state the user never asked for, so
 //!   everything is validated before anything is written.
@@ -51,7 +55,32 @@ impl App {
 
     /// Validate every ticked port into a config, or report all problems and
     /// create nothing.
+    ///
+    /// The ticked ports whose forward is already saved are left out of the
+    /// returned configs and remembered in [`App::pending_port_skipped`], because
+    /// the submit path calls `validated_port_batch()` and then
+    /// `commit_port_batch(configs)` — keeping that signature is what lets the
+    /// commit's status line still say how many rows were skipped.
     pub(crate) fn validated_port_batch(&mut self) -> Option<Vec<TunnelConfig>> {
+        let batch = self.validated_port_batch_outcome()?;
+        if batch.configs.is_empty() {
+            // Every ticked port is already saved. That is success with a no-op
+            // body, not "no port is ticked": say so and close, instead of
+            // reporting a field the user never left empty.
+            self.set_status(StatusMsg::ok(help::bi(
+                &format!("{} 条转发已存在，未重复创建", batch.skipped.len()),
+                &format!("{} forward(s) already exist; nothing was created", batch.skipped.len()),
+            )));
+            self.close_overlay();
+            return None;
+        }
+        self.pending_port_skipped = batch.skipped;
+        Some(batch.configs)
+    }
+
+    /// Like [`Self::validated_port_batch`], but keeps the ticked ports that were
+    /// skipped because the forward already exists.
+    pub(crate) fn validated_port_batch_outcome(&mut self) -> Option<PortBatch> {
         let form = self.form.clone()?;
         let pick = self.ports.as_ref()?;
         let ports = pick.checked_ports();
@@ -60,7 +89,7 @@ impl App {
         }
         let (base_id, last_id) = self.allocate_port_ids(ports.len())?;
         match self.build_port_batch(&form, &ports, base_id, last_id) {
-            Ok(configs) => Some(configs),
+            Ok(batch) => Some(batch),
             Err(errors) => {
                 eventlog::port_batch_rejected(&errors);
                 if let Some(f) = self.form.as_mut() {
@@ -102,13 +131,18 @@ impl App {
 
     /// Turn every ticked port into a validated config, or collect *all* the
     /// problems.
+    ///
+    /// A port whose forward already exists is skipped instead of created: the
+    /// local port is planned from what is free, so re-scanning a peer can propose
+    /// the same intent under a different local port. The first ticked port of a
+    /// same-identity pair wins; every skipped one is reported back.
     fn build_port_batch(
         &mut self,
         form: &crate::app::FormState,
         ports: &[u16],
         base_id: crate::model::TunnelId,
         last_id: crate::model::TunnelId,
-    ) -> Result<Vec<TunnelConfig>, Vec<String>> {
+    ) -> Result<PortBatch, Vec<String>> {
         let ssh_host = form.ssh_host.value().trim().to_string();
         if ssh_host.is_empty() {
             return Err(vec![help::bi("SSH 主机不能为空", "SSH host must not be empty")]);
@@ -122,23 +156,39 @@ impl App {
         // that points at the wrong row.
         let mut taken = self.taken_local_ports();
         let mut out: Vec<TunnelConfig> = Vec::with_capacity(ports.len());
+        let mut skipped: Vec<String> = Vec::new();
         let mut errors: Vec<String> = Vec::new();
 
         for (id, port) in (base_id..=last_id).zip(ports.iter().copied()) {
             let mut cfg = port_config(form, id, &ssh_host, &remote_host, port, &taken);
             cfg.name = unique_within(&cfg.name, out.iter().map(|c| c.name.clone()).collect());
             cfg.local_port = plan_local(&cfg, &taken).unwrap_or(cfg.local_port);
+            if let Some(existing) = self.duplicate_in_batch(&cfg, &out) {
+                eventlog::action_duplicate_skipped("port-scan", &cfg.name, &existing);
+                skipped.push(cfg.name);
+                continue;
+            }
             taken.push(cfg.local_port);
             if let Err(e) = config::validate_tunnel(&cfg) {
                 errors.push(format!("{}: {e} / Invalid definition", cfg.name));
             }
             out.push(cfg);
         }
-        if errors.is_empty() { Ok(out) } else { Err(errors) }
+        if errors.is_empty() { Ok(PortBatch { configs: out, skipped }) } else { Err(errors) }
     }
 
     /// Create every validated tunnel, persist once, and start them.
+    ///
+    /// Takes the skipped rows recorded by [`Self::validated_port_batch`] so the
+    /// status line can explain a batch smaller than the tick selection.
     pub(crate) fn commit_port_batch(&mut self, configs: Vec<TunnelConfig>) {
+        let skipped = std::mem::take(&mut self.pending_port_skipped);
+        self.commit_port_batch_with_skipped(configs, skipped);
+    }
+
+    /// Create the batch, reporting how many ticked ports were skipped as
+    /// duplicates of a saved forward.
+    pub(crate) fn commit_port_batch_with_skipped(&mut self, configs: Vec<TunnelConfig>, skipped: Vec<String>) {
         let n = configs.len();
         let first_id = configs.first().map(|c| c.id);
         for cfg in &configs {
@@ -153,10 +203,19 @@ impl App {
         }
         self.focus_first_created(first_id);
         let ports: Vec<String> = configs.iter().map(|c| c.remote_port.to_string()).collect();
-        self.set_status(StatusMsg::ok(help::bi(
+        let created = help::bi(
             &format!("已按扫描到的端口创建 {n} 条转发：{}", ports.join(" / ")),
             &format!("Created {n} forwards from the scanned ports: {}", ports.join(" / ")),
-        )));
+        );
+        let text = if skipped.is_empty() {
+            created
+        } else {
+            help::bi(
+                &format!("{created}；跳过 {} 条重复转发", skipped.len()),
+                &format!("{created}; skipped {} duplicate forward(s)", skipped.len()),
+            )
+        };
+        self.set_status(StatusMsg::ok(text));
     }
 
     /// Put the cursor on the first created tunnel so the user lands on the work.
@@ -170,6 +229,17 @@ impl App {
         }
         self.clamp_selection();
     }
+}
+
+/// The configs a ticked port selection produced, plus the rows dropped as
+/// duplicates of an already-saved forward.
+///
+/// `skipped` is kept so "nothing ticked" and "everything ticked is already
+/// saved" stay distinguishable: the first needs a form error, the second is a
+/// successful no-op.
+pub(crate) struct PortBatch {
+    pub configs: Vec<TunnelConfig>,
+    pub skipped: Vec<String>,
 }
 
 /// One config for a ticked port.
@@ -434,5 +504,154 @@ mod tests {
         assert_eq!(unique_within("a", vec![]), "a");
         assert_eq!(unique_within("a", vec!["a".into()]), "a-2");
         assert_eq!(unique_within("a", vec!["a".into(), "a-2".into()]), "a-3");
+    }
+}
+
+#[cfg(test)]
+mod duplicate_tests {
+    use super::*;
+    use crate::config::{ConfigFile, Paths};
+    use crate::model::{PortPick, RemotePort, TunnelStatus};
+
+    fn free_port() -> u16 {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    }
+
+    /// A saved `-L` tunnel from `local_port` to `remote_host:remote_port`.
+    fn saved(
+        id: crate::model::TunnelId,
+        name: &str,
+        local_port: u16,
+        remote_host: &str,
+        remote_port: u16,
+    ) -> TunnelConfig {
+        TunnelConfig {
+            id,
+            name: name.into(),
+            kind: ForwardKind::Local,
+            ssh_host: "dev-box".into(),
+            local_addr: "127.0.0.1".into(),
+            local_port,
+            remote_host: remote_host.into(),
+            remote_port,
+            enabled: false,
+            auto_restart: false,
+            ssh_options: vec![],
+            note: String::new(),
+            created_at: 1,
+        }
+    }
+
+    /// A create form plus a multi-row picker holding `ports`, with `tunnels`
+    /// already saved.
+    fn app_with(tunnels: Vec<TunnelConfig>, ports: &[u16]) -> (tempfile::TempDir, App) {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths { config: dir.path().join("config.toml"), state: dir.path().join("state.toml") };
+        crate::config::save(&paths.config, &ConfigFile { tunnels, ..ConfigFile::default() }).unwrap();
+        let mut app = App::new(paths);
+        app.open_form_create();
+        {
+            let f = app.form.as_mut().unwrap();
+            f.ssh_host.set("dev-box");
+            f.name.set("svc");
+            f.remote_host.set("10.0.0.5");
+        }
+        let mut pick = PortPick::scanning("dev-box", true, 1);
+        let rows = ports.iter().map(|p| RemotePort::new(*p, "127.0.0.1")).collect::<Vec<_>>();
+        assert!(pick.install(1, rows, 0));
+        pick.check_all();
+        app.ports = Some(pick);
+        (dir, app)
+    }
+
+    #[test]
+    fn a_ticked_port_that_is_already_saved_is_skipped() {
+        // The scan proposes 8080 -> 10.0.0.5:8080, which is exactly what is
+        // already saved. Re-creating it would duplicate the forward (possibly
+        // with a bumped local port), so it must be skipped, not created.
+        let port = free_port();
+        let (_d, mut app) = app_with(vec![saved(1, "svc-8080", port, "10.0.0.5", port)], &[port]);
+
+        let batch = app.validated_port_batch_outcome().expect("a batch exists");
+        assert!(batch.configs.is_empty(), "the duplicate must not be planned for creation");
+        assert_eq!(batch.skipped.len(), 1, "and it must be reported: {:?}", batch.skipped);
+    }
+
+    #[test]
+    fn one_duplicate_port_and_one_new_port_create_only_the_new_one() {
+        let dup = free_port();
+        let new = free_port();
+        let (_d, mut app) = app_with(vec![saved(1, "svc-old", dup, "10.0.0.5", dup)], &[dup, new]);
+
+        let configs = app.validated_port_batch().expect("the new port still validates");
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].remote_port, new);
+        assert_eq!(app.pending_port_skipped.len(), 1);
+
+        app.commit_port_batch(configs);
+        assert_eq!(app.tunnels.len(), 2, "the saved tunnel plus the one new forward");
+        let status = app.status.as_ref().map(|s| s.text.clone()).unwrap_or_default();
+        assert!(status.contains("跳过") || status.contains("skip"), "the status must explain the gap: {status:?}");
+    }
+
+    #[test]
+    fn a_persisted_bumped_local_port_is_still_the_same_forward() {
+        // The saved tunnel's local port was bumped to `bumped` on an earlier run
+        // (that bumped value is what got persisted); the scan proposes `port`
+        // again. The local port is a derived value, so this is one forward, not
+        // two — the regression anchor for the real-world duplicate.
+        let port = free_port();
+        let bumped = port.wrapping_add(1).max(1024);
+        let (_d, mut app) = app_with(vec![saved(1, "svc-old", bumped, "10.0.0.5", port)], &[port]);
+        let batch = app.validated_port_batch_outcome().expect("batch");
+        assert!(batch.configs.is_empty(), "the scanned forward is already saved under a bumped port");
+        assert_eq!(batch.skipped.len(), 1);
+    }
+
+    #[test]
+    fn a_different_target_host_is_a_different_forward() {
+        let port = free_port();
+        let (_d, mut app) = app_with(vec![saved(1, "svc-other", port, "10.0.0.9", port)], &[port]);
+        let batch = app.validated_port_batch_outcome().expect("batch");
+        assert_eq!(batch.configs.len(), 1, "the scanned target is another address");
+        assert!(batch.skipped.is_empty());
+    }
+
+    #[test]
+    fn a_different_ssh_host_is_a_different_forward() {
+        let port = free_port();
+        let mut other = saved(1, "other-host", port, "10.0.0.5", port);
+        other.ssh_host = "another-box".into();
+        let (_d, mut app) = app_with(vec![other], &[port]);
+        let batch = app.validated_port_batch_outcome().expect("batch");
+        assert_eq!(batch.configs.len(), 1);
+        assert!(batch.skipped.is_empty());
+    }
+
+    #[test]
+    fn an_all_duplicate_selection_closes_the_form_instead_of_complaining() {
+        // "No port is ticked" describes a field the user did not leave empty; the
+        // honest answer is "these already exist".
+        let port = free_port();
+        let (_d, mut app) = app_with(vec![saved(1, "svc-8080", port, "10.0.0.5", port)], &[port]);
+        assert!(app.port_batch_intent(), "the pane is visible with one tick");
+        assert!(app.validated_port_batch().is_none());
+        assert!(app.form.is_none(), "the form closes: there was nothing wrong to fix");
+        let status = app.status.as_ref().map(|s| s.text.clone()).unwrap_or_default();
+        assert!(status.contains("已存在") || status.contains("already exist"), "{status:?}");
+        assert!(app.tunnels.len() == 1, "and nothing was created");
+    }
+
+    #[test]
+    fn committing_a_fresh_batch_still_works_unchanged() {
+        let (p1, p2) = (free_port(), free_port());
+        let (_d, mut app) = app_with(vec![], &[p1, p2]);
+        let configs = app.validated_port_batch().expect("batch");
+        assert_eq!(configs.len(), 2);
+        assert!(app.pending_port_skipped.is_empty(), "nothing to report when nothing was skipped");
+        app.commit_port_batch(configs);
+        assert_eq!(app.tunnels.len(), 2);
+        assert!(!matches!(app.tunnels[0].status, TunnelStatus::Stopped));
     }
 }
