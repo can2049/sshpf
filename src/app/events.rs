@@ -73,6 +73,7 @@ impl App {
         }
         self.flush_pending_exits();
         self.tick_retries();
+        self.drain_port_scan();
         self.expire_status();
     }
 

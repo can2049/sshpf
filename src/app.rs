@@ -15,8 +15,8 @@ use crate::eventlog;
 use crate::help;
 use crate::logging;
 use crate::model::{
-    BatchAction, FailureInfo, FormMode, ForwardKind, HostPicker, MultiSelect, StatusMsg, TunnelConfig, TunnelId,
-    TunnelView,
+    BatchAction, FailureInfo, FormMode, ForwardKind, HostPicker, MultiSelect, PortPick, StatusMsg, TunnelConfig,
+    TunnelId, TunnelView,
 };
 use crate::ssh::SshHost;
 use crate::tunnel::{Supervisor, TunnelEvent};
@@ -32,6 +32,8 @@ pub mod mouse;
 pub mod overlay;
 pub mod persist;
 pub mod picker;
+pub mod port_batch;
+pub mod port_scan;
 pub mod query;
 pub mod runtime;
 pub mod select;
@@ -169,6 +171,18 @@ pub struct App {
     pub hits: crate::ui::hit::HitMap,
     /// Why reading forwards out of `~/.ssh/config` failed for the open form.
     pub import_error: Option<String>,
+    /// The peer's listening ports, offered for the 远端端口 field (`p`).
+    ///
+    /// `None` means the picker was never opened. Like the host dropdown, it is a
+    /// sub-state of the form rather than an overlay: it fills a field *in* the
+    /// form, so it must stay visible next to it.
+    pub ports: Option<PortPick>,
+    /// The in-flight scan's channel. One at a time is enough: a newer scan
+    /// replaces it and the older answer is dropped by generation.
+    pub(crate) port_rx: Option<Receiver<crate::app::port_scan::PortScanMsg>>,
+    /// Generation counter for scan results, so a slow answer cannot overwrite a
+    /// newer list.
+    pub(crate) port_seq: u64,
 }
 
 impl App {
@@ -234,6 +248,9 @@ impl App {
             select_mode: MultiSelect::new(),
             hits: crate::ui::hit::HitMap::new(),
             import_error: None,
+            ports: None,
+            port_rx: None,
+            port_seq: 0,
         }
     }
 
