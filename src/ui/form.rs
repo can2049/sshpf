@@ -5,10 +5,12 @@
 //! accent-bold focused, and a solid bar while text entry is active — so the stage
 //! is never conveyed by colour alone.
 //!
-//! The import pane is *added* to the form's height rather than borrowed from it
-//! (a pane that squeezed the fields would hide the values being checked against
-//! the rows). When the pane does not fit, the form says the batch will still be
-//! created — silence there would mean creating tunnels the user cannot see.
+//! One optional sub-pane sits *below* the fields — the `~/.ssh/config` import
+//! table or the peer's listening ports — and it is *added* to the form's height
+//! rather than borrowed from it (a pane that squeezed the fields would hide the
+//! values being checked against the rows). Which pane claims that slot, and how
+//! the body splits for it, is [`pane`]'s job; this file only reserves the room
+//! and draws the fields.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -23,10 +25,11 @@ use crate::ui::dropdown::draw_host_dropdown;
 use crate::ui::frame::{centered, clear_and_block, popup_block};
 use crate::ui::hints::{Hint, flow_hints};
 use crate::ui::hit::HitMap;
-use crate::ui::import;
 use crate::ui::layout::{FORM_POPUP_W, form_label_w, form_value_x};
 use crate::ui::palette::{Palette, palette};
 use crate::ui::text::{fit_pair, fit_pair_spaced, warn_once};
+
+pub mod pane;
 
 // ---------------------------------------------------------------------------
 // Overlay: Form
@@ -55,11 +58,12 @@ pub(crate) fn draw_form(frame: &mut Frame, app: &App, area: Rect, hits: &mut Hit
     } else {
         "新建转发 · New tunnel".to_string()
     };
-    let pane_open = pane_open(app);
+    // `sub` rather than `pane`: the module of the same name owns the decision.
+    let sub = pane::pane(app);
     // 110 instead of 74: at 74 the import pane's raw-directive column was clipped
     // (`RemoteForward 9000 12…`), and this is the one screen where a tunnel is
     // defined. `centered` clamps both axes, so a narrow terminal keeps its width.
-    let popup = centered(area, FORM_POPUP_W.min(area.width), form_height(pane_open).min(area.height));
+    let popup = centered(area, FORM_POPUP_W.min(area.width), pane::height(sub).min(area.height));
     let block = popup_block(&title, p);
     let inner = block.inner(popup);
     clear_and_block(frame, popup, block);
@@ -73,7 +77,7 @@ pub(crate) fn draw_form(frame: &mut Frame, app: &App, area: Rect, hits: &mut Hit
 
     let lines = form_field_lines(app, form, p, label_w, value_w, current_idx);
     let mut extra = form_notes(form, p, inner.width as usize);
-    let (body, pane_area) = split_pane(form, inner, pane_open, lines.len() as u16 + extra.len() as u16, &mut extra, p);
+    let (body, pane_area) = pane::split(app, inner, sub, lines.len() as u16 + extra.len() as u16, &mut extra, p);
 
     let used = lines.len() as u16;
     if body.height > used {
@@ -83,7 +87,7 @@ pub(crate) fn draw_form(frame: &mut Frame, app: &App, area: Rect, hits: &mut Hit
     frame.render_widget(Paragraph::new(lines), body);
 
     // Expand the dropdown *inside* the form, anchored under the SSH HOST row.
-    // It is confined to the body so it can never cover the import pane.
+    // It is confined to the body so it can never cover the sub-pane.
     if let Some(picker) = app.picker.as_ref().filter(|pk| pk.open) {
         draw_host_dropdown(frame, app, picker, body, current_idx as u16);
     }
@@ -92,86 +96,9 @@ pub(crate) fn draw_form(frame: &mut Frame, app: &App, area: Rect, hits: &mut Hit
 
     // Drawn last, and outside `body`: it owns its own cursor (a column filter
     // being typed into), which must win over the form field cursor.
-    if let Some(pane) = pane_area {
-        import::draw_pane(frame, app, pane, hits);
+    if let Some(area) = pane_area {
+        pane::draw(frame, app, area, sub, hits);
     }
-}
-
-/// Whether the import pane is shown.
-///
-/// Visibility goes through `App::import_pane_open` so the renderer and the key
-/// handler cannot disagree. Two extra cases are the renderer's to own, because
-/// `import_pane_open` is deliberately just "is there a table worth showing":
-///
-/// * discovery *failed* → the table is empty, but the reason is exactly what the
-///   user needs, so the pane opens to show it;
-/// * `import_open` set on an empty table → the state is reachable (a filter or a
-///   host switch can empty it), and silently collapsing would look like the key
-///   did nothing. `import::draw_empty` has a branch for each.
-///
-/// (`import_error` on its own deliberately does *not* force the pane open:
-/// `App::toggle_import_pane` reports the failure on the status line and leaves
-/// the pane closed, and two places claiming to show the same reason would be
-/// worse than one.)
-fn pane_open(app: &App) -> bool {
-    app.import_pane_open() || app.form.as_ref().is_some_and(|f| f.import_open)
-}
-
-/// Height the popup asks for.
-///
-/// Tall enough to hold the fields *and* the expanded host dropdown: title border
-/// (2) + one line per field + errors/port hint (2) + blank (1) + key hint (1) +
-/// dropdown frame (2) + dropdown rows. The import pane is *added* on top rather
-/// than borrowed from the form, so a pane never squeezes the fields whose values
-/// the user is checking against the rows they tick.
-fn form_height(pane_open: bool) -> u16 {
-    let fields_h = FormField::ORDER.len() as u16;
-    let base_h = fields_h + 4 + 2 + crate::app::HOST_DROPDOWN_ROWS as u16 + 2;
-    base_h + if pane_open { import::PREF_HEIGHT } else { 0 }
-}
-
-/// Split the popup body between the field rows and the import pane.
-///
-/// The pane is reserved out of the bottom, but only after the fields and their
-/// notes have their rows: on a short terminal the pane is what shrinks (and
-/// eventually disappears) so the form stays usable. When it cannot fit at all,
-/// the warning goes into `extra` — see [`invisible_pane_note`].
-fn split_pane(
-    form: &crate::app::FormState,
-    inner: Rect,
-    pane_open: bool,
-    needed: u16,
-    extra: &mut Vec<Line<'static>>,
-    p: Palette,
-) -> (Rect, Option<Rect>) {
-    if !pane_open {
-        return (inner, None);
-    }
-    let room = inner.height.saturating_sub(needed).min(import::PREF_HEIGHT);
-    if room >= import::MIN_HEIGHT {
-        let body = Rect { height: inner.height - room, ..inner };
-        let pane = Rect { x: inner.x, y: inner.y + body.height, width: inner.width, height: room };
-        return (body, Some(pane));
-    }
-    extra.extend(invisible_pane_note(form, inner.width as usize, p));
-    (inner, None)
-}
-
-/// The warning for the one genuinely dangerous state: the pane is hidden but
-/// `import_open` is still true and the submit path keys off it.
-///
-/// `ctrl+s` would create the ticked rows while the user cannot see a single one
-/// of them. Say so instead of silently acting on an invisible table — and point
-/// at the key that gets them out of that state.
-fn invisible_pane_note(form: &crate::app::FormState, width: usize, p: Palette) -> Option<Line<'static>> {
-    if !form.import_open || form.import.is_empty() {
-        return None;
-    }
-    let msg = format!(
-        "⚠ 终端太矮，导入面板未显示；ctrl+s 仍会按已勾选的 {} 条创建。i 收起面板可改用手填",
-        form.import.checked_count()
-    );
-    Some(Line::from(Span::styled(truncate_to_width(&msg, width), p.fg(p.pending))))
 }
 
 /// One `Line` per form field, styled for the three highlight states.

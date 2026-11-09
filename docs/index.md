@@ -31,6 +31,7 @@
 | 加测试 / 跑测试 / 测试放哪 | [testing.md](testing.md) | `src/**/#[cfg(test)]`、`tests/` |
 | 理解某条设计为什么这样 | [design.md](design.md) | — |
 | 改 `~/.ssh/config` 导入逻辑 | [import-forwards.md](import-forwards.md) | `src/ssh/forwards.rs`、`src/app/import.rs` |
+| 改「对端监听端口」选择 / 扫描 | [import-forwards.md](import-forwards.md) | `src/ssh/probe.rs`、`src/app/port_scan.rs`、`src/model/portscan.rs` |
 | 查键位 / 帮助文案 | [keymap.md](keymap.md) | `src/help.rs`、`src/keys/` |
 | 改配置字段 / 持久化 | [README.md](../README.md#配置--configuration) | `src/config.rs` |
 | 改双语文案 / 宽度 / 截断 / 折行 | [agents.md](agents.md#改文案--change-user-facing-text) | `src/text.rs` |
@@ -49,7 +50,7 @@
 | [logging.md](logging.md) | 日志格式、级别、怎么排查 | 事件目录（在 logging/events.md） |
 | [logging/events.md](logging/events.md) | 每个 `event=` 的级别/字段/含义 | 格式与排查配方 |
 | [keymap.md](keymap.md) | 全部按键与鼠标操作 | 实现与设计理由 |
-| [import-forwards.md](import-forwards.md) | 导入规则、去重、坑、批量创建 | 表单交互细节 |
+| [import-forwards.md](import-forwards.md) | 导入规则、去重、坑、批量创建；对端端口扫描的规则（`p`） | 表单交互细节 |
 | [design.md](design.md) | 关键设计决策索引（1 段 + 链接） | 任何展开叙述 |
 | [agents.md](agents.md) | 改码/写作约定与 checklist | 项目背景 |
 | [research/README.md](research/README.md) | 历史调研的定位与目录 | 当前行为 |

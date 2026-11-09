@@ -80,6 +80,7 @@ const KEYS_SRC: &str = concat!(
     include_str!("../src/keys/select.rs"),
     include_str!("../src/keys/form.rs"),
     include_str!("../src/keys/import.rs"),
+    include_str!("../src/keys/ports.rs"),
     include_str!("../src/keys/dropdown.rs"),
     include_str!("../src/keys/misc.rs"),
     // `testkit.rs` is test-only fixtures and binds no keys, so it is deliberately
@@ -98,6 +99,7 @@ const KEY_HANDLER_FILES: &[&str] = &[
     "src/keys/select.rs",
     "src/keys/form.rs",
     "src/keys/import.rs",
+    "src/keys/ports.rs",
     "src/keys/dropdown.rs",
     "src/keys/misc.rs",
 ];
@@ -158,6 +160,12 @@ const HANDLERS: &[(&str, SectionId)] = &[
     ("handle_import_row_key", SectionId::ImportPane),
     ("handle_import_move_key", SectionId::ImportPane),
     ("handle_import_filter_key", SectionId::ImportFilter),
+    ("handle_port_key", SectionId::PortPicker),
+    // `handle_port_key` delegates to two helpers (movement, then actions), the
+    // same shape as the import pane's split: one section, so every one of them
+    // maps to `port_picker` and the section's keys are their union.
+    ("handle_port_move_key", SectionId::PortPicker),
+    ("handle_port_row_key", SectionId::PortPicker),
     ("handle_confirm_key", SectionId::Confirm),
     ("handle_detail_key", SectionId::Detail),
     ("handle_filter_key", SectionId::FilterBar),

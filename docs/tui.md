@@ -123,6 +123,7 @@ TunnelRow(TunnelId)                // ← 而不是行号
 | 确认框 | `ui::confirm::draw_confirm` | 高度按文案**折行后**的行数自适应（`prompt_rows`），避免大片空白 |
 | 详情 | `ui::detail::draw_detail` | `DETAIL_LOG_TAIL = 15` 行日志尾巴；`tunnel_command` 给出等价 `ssh` 命令行 |
 | 导入面板 | `ui::import::draw_pane` | 面板嵌在表单内，`IMPORT_ROWS_VISIBLE = 8` 行滚动窗口 |
+| 对端端口面板 | `ui::ports::draw_port_pane` | 面板嵌在表单内、字段下方，`PORT_ROWS_VISIBLE = 8` 行滚动窗口；扫描中/失败/空/就绪四态各有明确文案，不画空盒 |
 
 帮助浮层的精确排版规则（键列测量、超长 binding 独占一行、note 行整行 prose）见 [design.md](design.md#d13-帮助是数据不是散文) 与 `src/ui/help.rs`。
 

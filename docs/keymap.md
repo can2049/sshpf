@@ -21,6 +21,7 @@ Press `?` anywhere to open the in-app help; it renders the same catalog as this 
 | [主机下拉](#主机下拉--host-dropdown) | 表单里的 `~/.ssh/config` 主机列表 / the host list inside the form |
 | [导入面板](#导入面板--import-pane) | 主机已声明的转发 / forwards already declared by the host |
 | [导入列筛选](#导入列筛选--import-column-filter) | 导入面板某一列的筛选正在输入 / typing one column's filter |
+| [对端端口列表](#对端端口列表--peer-port-list) | `p` 扫描到的对端监听端口 / the peer's listening ports scanned with `p` |
 | [确认框](#确认框--confirmation-dialog) | 破坏性操作前的对话框 / the dialog before a destructive action |
 | [详情 / 日志](#详情--日志--detail--log) | 单条转发的完整诊断 / full diagnostics for one tunnel |
 | [过滤输入](#过滤输入--main-filter) | `/` 打开的主表过滤 / the table filter opened with `/` |
@@ -117,6 +118,7 @@ The default stage: arrows only move the highlight and never change a value.
 | `→` / `l` | `类型` 字段：下一个类型（L/R/D）；`自动重连` 字段：取反 | On `Type`: the next kind (L/R/D); on auto-restart: toggle |
 | `space` | `类型` / `自动重连` 字段：切换；`SSH 主机` 字段：展开 / 收起导入面板 | Cycle `Type`, toggle auto-restart, or toggle the import pane on `SSH host` |
 | `i` | `SSH 主机` 字段：展开 / 收起导入面板 | On `SSH host`: toggle the import pane |
+| `p` | `远端端口` 字段：扫描对端正在监听的端口 | On `Remote port`: list the peer's listening ports |
 | `f2` / `ctrl+h` / `ctrl+o` | `SSH 主机` 字段：打开主机下拉（三个键同效） | On `SSH host`: open the dropdown (three equivalent keys) |
 | `ctrl+s` / `f10` | 保存（`f10` 等价键）。新建：直接保存并立即建连；编辑：先确认，运行中的连接会重建 | Save (`f10` is an alias). Create connects at once; edit asks first and rebuilds a live tunnel |
 | `esc` | 取消；有未保存内容会先确认 | Cancel; asks first if there are unsaved edits |
@@ -230,6 +232,40 @@ One column's filter is being typed. `enter` / `esc` only end the input; the pane
 | `←` / `→` | 换到上一列 / 下一列筛选 | Switch to the previous / next column |
 | `ctrl+r` | 清除全部筛选 | Clear every filter |
 | `ctrl+z` | 撤销上一次筛选改动 | Undo the last filter change |
+
+## 对端端口列表 / Peer port list
+
+在 `远端端口` 字段按 `p` 扫描对端正在监听的端口。`enter` 选中一个填进字段；勾选多行后保存，
+每个端口建一条 `-L` 转发。列表打开期间这些键**归列表**，表单字段不动。
+Pressing `p` on the `Remote port` field scans the peer for listening ports. `enter` fills
+one into the field; ticking rows and saving creates one `-L` tunnel per port. While the list
+is open these keys belong to it and the form's fields stay put.
+
+| 按键 / Key | 中文 | English |
+|---|---|---|
+| `j` / `↓` | 下一行 | Next row |
+| `k` / `↑` | 上一行 | Previous row |
+| `pgdn` / `pgup` | 向下 / 向上翻页 | Page down / up |
+| `g` / `home` | 跳到首行 | Jump to the first row |
+| `G` / `end` | 跳到末行 | Jump to the last row |
+| `space` | 勾选 / 取消当前行 | Tick / untick this row |
+| `a` | 全选 | Tick every row |
+| `U` | 全不选 | Untick every row |
+| `I` | 反选 | Invert every row |
+| `enter` | 填入当前行端口并收起列表 | Fill in this port and close the list |
+| `r` | 重新扫描（保留勾选） | Scan again (ticks are kept) |
+| `esc` | 收起列表（不改字段值） | Close the list without changing the field |
+| `i` | 收起列表（同 `esc`） | Close the list (same as `esc`) |
+
+说明 / Notes:
+
+- 勾选多行后保存，每个端口生成一条 `-L` 转发；`enter` 是"只填这一个"的单选路径。
+  Saving after ticking rows creates one `-L` tunnel per port; `enter` is the single-pick path.
+- `-R` 转发的列表是**只读**的（对端那些端口已被占用），`space` / `a` / `I` 不会勾上任何行。
+  A `-R` forward's list is **read-only** (those ports are already taken on the peer), so
+  `space` / `a` / `I` tick nothing.
+- 改了 `SSH 主机` 或 `类型` 后旧的列表会被丢弃，不会把上一台主机的端口填进来。
+  Changing `SSH host` or `Type` drops the old list, so the previous host's ports cannot leak in.
 
 ## 确认框 / Confirmation dialog
 
