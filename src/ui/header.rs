@@ -88,8 +88,11 @@ fn session_label(app: &App) -> String {
     match app.conn_state() {
         Some(crate::app::remote::ConnState::Lost(_)) => help::bi("已断开/detached", "detached"),
         _ => {
+            // `help::bi` joins the two halves itself, so each argument carries
+            // only its own language: the Chinese half must not repeat the English
+            // one or the title bar reads "客户端 2/client 2 client 2".
             let n = app.remote_client_count().unwrap_or(1);
-            help::bi(&format!("客户端 {n}/client {n}"), &format!("client {n}"))
+            help::bi(&format!("客户端 {n}"), &format!("client {n}"))
         }
     }
 }
