@@ -33,6 +33,11 @@
 | `ssh` | `model`、`text`、`logging`、`eventlog`、`sys` | `app`、`ui`、`keys`、`tunnel` |
 | 叶子层 | 彼此之间尽量少，且只向下 | 任何上层 |
 
+**`ipc` 的位置（client-server 改造阶段 1 引入）**：它被将来的 `server` 与 `client`
+**双向**依赖，所以只能依赖叶子层，绝不许 `use crate::app/ui/keys/tunnel/cli`——
+否则会形成环。它现在**没有任何生产代码调用**（阶段 1 只落地协议层），
+目的正是先把协议与其测试固定下来，再在后续阶段接线。
+
 **本次重构修掉的三个违规**（保留作判例）：
 
 | 违规 | 修法 |
@@ -128,6 +133,12 @@
 
 | 文件 | 放什么 |
 |---|---|
+| `src/ipc.rs` | 模块地图 + re-export（client-server 协议的唯一定义处） |
+| `src/ipc/frame.rs` | `u32` 大端长度前缀、`MAX_FRAME`（256 KiB）、读写一帧 |
+| `src/ipc/msg.rs` | `ClientMsg`/`ServerMsg`、`Op` 命令枚举、`WireError`、`PROTO_VERSION` |
+| `src/ipc/snapshot.rs` | `Snapshot`/`WireTunnel`/`WireStatus`；`Instant` → 毫秒时间戳 |
+| `src/ipc/codec.rs` | 编解码、版本/配置协商、双语可操作错误 |
+| `src/ipc/endpoint.rs` | `config_path` → socket/lock 路径（FNV-1a）、词法规范化 |
 | `src/tunnel.rs` | `Supervisor`、`TunnelEvent`、一线程一 `current_thread` runtime、`catch_unwind` |
 | `src/config.rs` | `ConfigFile`、`Defaults`、`Paths`、原子写、`0600`/`0700` |
 | `src/ssh.rs` | `ssh` 层地图 |
