@@ -21,6 +21,7 @@ use crate::ssh::known_hosts;
 pub fn classify(err: &anyhow::Error) -> FailureInfo {
     let text = format!("{err:#}");
     let lower = text.to_lowercase();
+    let resolution = is_resolution_error(err, &lower);
 
     if let Some(rejected) = find_host_key_rejection(err) {
         let detail = rejected.to_string();
@@ -36,7 +37,7 @@ pub fn classify(err: &anyhow::Error) -> FailureInfo {
             std::io::ErrorKind::TimedOut => FailureKind::Timeout,
             std::io::ErrorKind::AddrInUse => FailureKind::PortInUse,
             std::io::ErrorKind::PermissionDenied => FailureKind::PermissionDenied,
-            _ if lower.contains("lookup address") || lower.contains("name resolution") => FailureKind::DnsFailure,
+            _ if resolution => FailureKind::DnsFailure,
             _ => FailureKind::Unknown,
         },
         Some(russh::Error::RequestDenied) => FailureKind::RemoteForwardFailed,
@@ -49,10 +50,34 @@ pub fn classify(err: &anyhow::Error) -> FailureInfo {
         // text is checked below, but recognise the common spellings here too.
         Some(russh::Error::UnknownKey) => FailureKind::HostKeyMismatch,
         Some(_) => FailureKind::Unknown,
+        None if resolution => FailureKind::DnsFailure,
         None => classify_text(&lower),
     };
 
     FailureInfo { kind, short: short_reason(kind, &text), detail: text }
+}
+
+/// Whether an error, or any cause in its chain, is a failed name lookup.
+///
+/// The message itself cannot be relied on: Windows localises it, so a Chinese
+/// install reports `不知道这样的主机。 (os error 11001)` instead of the English
+/// `failed to lookup address information` that Unix produces. The numeric code
+/// is stable across locales, so it is checked first; the English wording stays
+/// as the fallback for Unix (and for `getaddrinfo` failures raised as text).
+fn is_resolution_error(err: &anyhow::Error, lower: &str) -> bool {
+    let coded = err.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().and_then(std::io::Error::raw_os_error).is_some_and(is_resolution_code)
+    });
+    coded || lower.contains("lookup address") || lower.contains("name resolution")
+}
+
+/// Winsock codes for "the name could not be resolved": `WSAHOST_NOT_FOUND`,
+/// `WSATRY_AGAIN`, `WSANO_RECOVERY` and `WSANO_DATA`.
+///
+/// No `cfg(windows)` is needed: these numbers are not Unix errno values, so the
+/// predicate can be exercised — and is unit-tested — on every platform.
+fn is_resolution_code(code: i32) -> bool {
+    matches!(code, 11001..=11004)
 }
 
 /// Text fallback for errors we authored ourselves (context strings).
@@ -206,6 +231,25 @@ mod tests {
         let info = classify(&err_with("failed to lookup address information: Name or service not known"));
         assert_eq!(info.kind, FailureKind::DnsFailure);
         assert_eq!(info.short, "域名解析失败");
+    }
+
+    #[test]
+    fn classifies_dns_failure_from_a_winsock_code() {
+        // Windows localises the message (`不知道这样的主机。`), so text matching
+        // alone classifies this as Unknown. The code is the stable signal, and
+        // constructing the error directly keeps the test valid on every platform.
+        let e = anyhow::Error::new(std::io::Error::from_raw_os_error(11001)).context("连接目标主机 a:22 失败");
+        let info = classify(&e);
+        assert_eq!(info.kind, FailureKind::DnsFailure, "detail: {}", info.detail);
+        assert_eq!(info.short, "域名解析失败");
+    }
+
+    #[test]
+    fn an_unrelated_uncategorised_io_error_stays_unknown() {
+        // The Winsock range must not turn every Uncategorized I/O failure into a
+        // DNS one: only 11001–11004 are name-lookup failures.
+        let e = anyhow::Error::new(std::io::Error::from_raw_os_error(10054)).context("连接目标主机 a:22 失败");
+        assert_eq!(classify(&e).kind, FailureKind::Unknown);
     }
 
     #[test]

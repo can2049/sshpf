@@ -52,8 +52,14 @@ fn check_mode_writes_a_start_record_with_version_and_paths() {
 }
 
 /// Values may be quoted, so find `key=` and stop at whitespace.
+///
+/// The record quotes a value when it contains whitespace, `"` or a backslash
+/// (see `logging::format::push_value`), which is exactly what a Windows path does:
+/// `config="C:\\Users\\...\\config.toml"`. Strip the quotes so the assertion is
+/// about the path, not about the record's escaping.
 fn middle_of<'a>(line: &'a str, key: &str) -> Option<&'a str> {
-    line.split(' ').find_map(|f| f.strip_prefix(&format!("{key}=")))
+    let raw = line.split(' ').find_map(|f| f.strip_prefix(&format!("{key}=")))?;
+    Some(raw.strip_prefix('"').and_then(|v| v.strip_suffix('"')).unwrap_or(raw))
 }
 
 #[test]
@@ -501,10 +507,16 @@ fn a_panic_inside_the_log_writer_does_not_deadlock_the_child() {
     // degraded path still leaves one line through the pre-`dup`ed descriptor, so a
     // user who reports "it hung" also gets "why" in the file.
     assert!(log.contains("event=test.before_panic"), "records before the panic survive: {log}");
+    // `crash::emergency` is a no-op off Unix: there is no portable equivalent of
+    // the pre-`dup`ed descriptor (`sigaction`/`write(2)`), so the degraded record
+    // only exists there. The no-hang guarantee above still holds on every platform,
+    // because the re-entrancy guard lives in the `sink`, not in the crash writer.
+    #[cfg(unix)]
     assert!(
         log.contains("event=crash.log_reentrant"),
         "the re-entrancy fallback must still leave a line in the log: {log}"
     );
+    #[cfg(unix)]
     assert!(log.contains("cause=crash.panic"), "and say which record was skipped: {log}");
 }
 
