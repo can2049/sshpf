@@ -35,6 +35,22 @@ const MIN_LAST_ERROR: u16 = 4;
 pub(crate) const FORM_LABEL_W: usize = 8;
 /// Wide label column: widest bilingual label, `远端端口 Remote port` = 20 cells.
 pub(crate) const FORM_LABEL_W_BI: usize = 20;
+/// Width the create/edit form popup asks for, before the frame clamps it.
+///
+/// The form used to ask for 74. Its inner width is four cells less than the
+/// popup (two border columns plus one padding cell per side), so 74 gave 70: a
+/// 20-cell bilingual label column left 49 for the value, and the import pane's
+/// `原始指令 Directive` column got 23. Both clipped input the user was checking —
+/// `RemoteForward 9000 127.0.0.1:9001` is 33 cells and was drawn as
+/// `RemoteForward 9000 12…`, which is exactly the column that identifies a row.
+///
+/// 110 gives 106 of inner width, where that column reaches 33 cells and the value
+/// column reaches 85 — enough for a full FQDN such as
+/// `internal-db-prod-01.example.internal` (36) plus room to spare. A narrower
+/// terminal still wins, because the popup is clamped to the frame (see
+/// [`crate::ui::frame::centered`]), so this only ever adds room.
+pub(crate) const FORM_POPUP_W: u16 = 110;
+
 /// How many log lines the detail overlay keeps on screen.
 pub(crate) const DETAIL_LOG_TAIL: usize = 15;
 
@@ -238,6 +254,30 @@ mod tests {
             assert!(!layout.is_empty(), "width {w} returned no columns");
             assert!(column_sum(&layout) <= w, "width {w} overflows: {layout:?}");
         }
+    }
+
+    /// The form popup is wide enough for the labels and values it must show.
+    ///
+    /// Two real strings set the floor, both taken from the import pane that lives
+    /// inside the form: `RemoteForward 9000 127.0.0.1:9001` (33 cells, the
+    /// `原始指令` column) and `internal-db-prod-01.example.internal` (36 cells, a
+    /// field value). The old 74-cell popup clipped both, which is the bug this
+    /// constant exists to prevent, so the numbers are asserted rather than the
+    /// constant: a future label change has to be a decision, not a regression.
+    #[test]
+    fn the_form_popup_is_wide_enough_for_its_longest_real_strings() {
+        // Inner width: popup minus the two border columns and one padding cell
+        // per side.
+        let inner = FORM_POPUP_W - 4;
+        // The bilingual label column is paid for (never degraded to Chinese)...
+        assert_eq!(form_label_w(inner), FORM_LABEL_W_BI, "the form must keep bilingual labels");
+        // ...the value column fits a full FQDN...
+        let value_w = usize::from(inner) - form_value_x(inner);
+        assert!(value_w >= 36, "value column is {value_w} cells; a 36-cell hostname would be clipped");
+        // ...and the import pane's raw-directive column fits a whole `-R` line.
+        // Its share is computed by `ui::import::row::columns`, so this is the
+        // worst case there: 33 cells was measured at this inner width.
+        assert!(inner >= 106, "inner width {inner} is below the 106 that fits a 33-cell directive column");
     }
 
     #[test]

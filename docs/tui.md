@@ -26,7 +26,7 @@
 | 5 | 3 | 键提示 3 行（每条都双语） | `ui::hints::draw_keys` |
 
 浮层按 `App.overlay` 画在最上层：`Help` / `Form` / `Confirm` / `Detail` / `Filter`。
-浮层用 `centered_pct`（帮助 78×84%、详情 88×86%）或 `centered`（表单 74 列宽、确认框按文案宽度），
+浮层用 `centered_pct`（帮助 78×84%、详情 88×86%）或 `centered`（表单固定 110 列宽、确认框按文案宽度），
 `clear_and_block` 先 `Clear` 再画边框——否则下面的表格会透出来。
 
 **分区块取不到时**：`band(rows, i, "what")` 用 `rows.get(i)`，`None` 就记 `ui.render_degraded reason=layout_band_missing` 并返回零矩形（这一块这一帧不画），**不 panic**。
@@ -118,7 +118,7 @@ TunnelRow(TunnelId)                // ← 而不是行号
 | 浮层 | 渲染 | 关键约束 |
 |---|---|---|
 | 帮助 | `ui::help::draw_help` + `help_lines(width, palette)` | 键列宽度**实测**（目录里最宽的 binding +2，钳制 `[10, 22]` 且不超半行）；滚动上限 = `help_lines(..).len() - 可视行` |
-| 表单 | `ui::form::draw_form` | 标签列宽度随弹窗宽度切换（双语 20 列 / 中文 8 列）；光标只在编辑态放置（`place_form_cursor`） |
+| 表单 | `ui::form::draw_form` | 弹窗宽 `layout::FORM_POPUP_W = 110`（窄终端由 `centered` 夹到帧内）；标签列宽度随弹窗宽度切换（双语 20 列 / 中文 8 列）；光标只在编辑态放置（`place_form_cursor`） |
 | 主机下拉 | `ui::dropdown::draw_host_dropdown` | 内嵌在表单里，`HOST_DROPDOWN_ROWS = 8` 的滚动窗口；键处理与渲染**共用**这个常量 |
 | 确认框 | `ui::confirm::draw_confirm` | 高度按文案**折行后**的行数自适应（`prompt_rows`），避免大片空白 |
 | 详情 | `ui::detail::draw_detail` | `DETAIL_LOG_TAIL = 15` 行日志尾巴；`tunnel_command` 给出等价 `ssh` 命令行 |
