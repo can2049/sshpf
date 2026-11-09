@@ -5,6 +5,13 @@
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-09
+
+本次是 minor 版本，只有一件事：为 **client-server 改造**落地协议层。**用户可见行为零变化**
+——没有新键位、没有新配置项、`event=` 名称与界面文案全部未动，该层尚无生产调用点。
+升 minor 而不是 patch，是因为 `pub mod ipc` 是新增的公共 API。
+方案与后续阶段见 [docs/research/client-server.md](docs/research/client-server.md)。
+
 ### 变更
 
 - **client-server 改造阶段 1：新增 `src/ipc/` 协议层。** 落地帧格式（`u32` 大端长度前缀、
