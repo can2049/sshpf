@@ -12,7 +12,6 @@ use std::time::Instant;
 
 use crate::config::{self, ConfigFile, Paths};
 use crate::eventlog;
-use crate::help;
 use crate::logging;
 use crate::model::{
     BatchAction, FailureInfo, FormMode, ForwardKind, HostPicker, MultiSelect, PortPick, StatusMsg, TunnelConfig,
@@ -29,6 +28,7 @@ pub mod form_submit;
 pub mod helpers;
 pub mod import;
 pub mod import_pane;
+pub mod lifecycle;
 pub mod mouse;
 pub mod overlay;
 pub mod persist;
@@ -36,6 +36,7 @@ pub mod picker;
 pub mod port_batch;
 pub mod port_scan;
 pub mod query;
+pub mod remote;
 pub mod runtime;
 pub mod select;
 
@@ -195,6 +196,9 @@ pub struct App {
     /// field is the hand-off between them. Empty for a clean config, which is the
     /// normal case.
     pub folded_on_load: Vec<crate::model::Folded>,
+    /// Set when this process mirrors a server instead of owning the tunnels
+    /// (`app::remote`); `None` is the authoritative mode.
+    pub(crate) remote: Option<remote::Remote>,
 }
 
 impl App {
@@ -267,6 +271,7 @@ impl App {
             port_seq: 0,
             pending_port_skipped: Vec::new(),
             folded_on_load,
+            remote: None,
         }
     }
 
@@ -329,65 +334,6 @@ impl App {
             }
         }
         None
-    }
-
-    pub fn delete_selected(&mut self) {
-        let Some(id) = self.selected_id() else {
-            return;
-        };
-        self.delete_tunnel(id);
-        self.set_status(StatusMsg::info(help::bi("已删除", "Deleted")));
-    }
-
-    /// Remove one tunnel definition and its runtime state.
-    ///
-    /// Split out from [`App::delete_selected`] because the batch path deletes by
-    /// id without moving the cursor between removals (a shuffled cursor would
-    /// make `selected` mean a different tunnel on every iteration).
-    pub fn delete_tunnel(&mut self, id: TunnelId) {
-        if let Some(view) = self.tunnels.iter().find(|t| t.cfg.id == id) {
-            eventlog::tunnel_deleted(&view.cfg);
-        }
-        self.supervisor.stop(id);
-        self.forget_runtime_state(id);
-        self.cfg.tunnels.retain(|t| t.id != id);
-        self.tunnels.retain(|t| t.cfg.id != id);
-        let n = self.visible_indices().len();
-        self.selected = self.selected.min(n.saturating_sub(1));
-        self.persist_quietly();
-    }
-
-    /// `x`: stopping everything is a bulk destructive action.
-    pub fn request_stop_all(&mut self) {
-        if self.counts().off == self.tunnels.len() {
-            self.set_status(StatusMsg::info(help::bi("没有运行中的转发", "No forward is running")));
-            return;
-        }
-        self.ask_confirm(ConfirmAction::StopAll);
-    }
-
-    /// `a`: starting everything opens listeners; confirm once for the batch.
-    pub fn request_start_all(&mut self) {
-        if self.counts().off == 0 {
-            self.set_status(StatusMsg::info(help::bi("没有未启用的转发", "No disabled forward")));
-            return;
-        }
-        self.ask_confirm(ConfirmAction::StartAll);
-    }
-
-    pub fn start_all(&mut self) {
-        let ids: Vec<TunnelId> =
-            self.tunnels.iter().filter(|t| !t.status.is_running_or_pending()).map(|t| t.cfg.id).collect();
-        for id in ids {
-            self.start_tunnel_with(id, "start_all");
-        }
-    }
-
-    pub fn stop_all(&mut self) {
-        let ids: Vec<TunnelId> = self.tunnels.iter().map(|t| t.cfg.id).collect();
-        for id in ids {
-            self.stop_tunnel_with(id, "stop_all");
-        }
     }
 
     /// Stop every tunnel immediately without touching persisted intent.

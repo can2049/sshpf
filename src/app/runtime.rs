@@ -82,6 +82,11 @@ impl App {
             return;
         };
         eventlog::tunnel_start_requested(&cfg, trigger);
+        // A mirror has no supervisor and no authority: the intent travels to the
+        // server, which re-runs every check and owns the resulting state.
+        if self.send_op(crate::ipc::Op::Start { tunnel_id: id }) {
+            return;
+        }
         self.arm_retry(id);
 
         // A refusal has already been reported inside `preflight`; the start ends
@@ -255,6 +260,9 @@ impl App {
             Some(view) => eventlog::tunnel_stopped(&view.cfg, trigger),
             None => eventlog::orphan_event("stop", id),
         }
+        if self.send_op(crate::ipc::Op::Stop { tunnel_id: id }) {
+            return;
+        }
         self.supervisor.stop(id);
         self.forget_runtime_state(id);
         self.set_enabled(id, false);
@@ -264,6 +272,20 @@ impl App {
         }
         self.log(id, LogLevel::Info, help::bi("已停止", "Stopped"));
         self.persist_quietly();
+    }
+
+    /// Bounce one tunnel: stop its live session, then start it again.
+    ///
+    /// One function for both modes, because the three steps must not drift: the
+    /// authority stops its supervisor, a mirror asks the server to do the same
+    /// in one command (`Restart`), which is why the server has that `Op` at all.
+    pub(crate) fn restart_tunnel(&mut self, id: TunnelId, trigger: &str) {
+        if self.send_op(crate::ipc::Op::Restart { tunnel_id: id }) {
+            return;
+        }
+        self.supervisor.stop(id);
+        self.forget_runtime_state(id);
+        self.start_tunnel_with(id, trigger);
     }
 
     /// Space: start immediately, but ask before dropping a live tunnel.

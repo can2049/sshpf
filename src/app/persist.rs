@@ -22,7 +22,17 @@ use super::App;
 impl App {
     // -- persistence -------------------------------------------------------
 
+    /// Write the definitions to `config.toml`.
+    ///
+    /// A mirror must not: `config.toml` belongs to the server, and a client
+    /// writing its own possibly-stale copy would overwrite the authority's file —
+    /// the precise "stale view wins over the present" failure the client-server
+    /// split exists to prevent. The command that caused this call has already been
+    /// sent to the server, which persists on its own.
     pub fn persist(&mut self) -> Result<(), String> {
+        if self.is_mirror() {
+            return Ok(());
+        }
         for view in &self.tunnels {
             if let Some(slot) = self.cfg.find_mut(view.cfg.id) {
                 slot.enabled = view.cfg.enabled;
@@ -45,6 +55,11 @@ impl App {
     }
 
     pub fn save_state(&self) {
+        // Same rule as `persist`: `state.toml` describes the authority's tunnels,
+        // and only the authority may describe them.
+        if self.is_mirror() {
+            return;
+        }
         let mut st = config::StateFile { last_run: now_unix(), ..Default::default() };
         for view in &self.tunnels {
             st.last_state.insert(view.cfg.id.to_string(), view.status.key().to_string());
