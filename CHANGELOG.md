@@ -7,6 +7,17 @@
 
 ### 修复
 
+- **`ctrl+s` / `f10` 在任何子焦点下都能真正保存。** 实测反馈「为 cloud_pc 填好 3081 端口
+  转发，`ctrl+s` 之后端口没有得到转发」，而日志**一片空白**：键在分发层就被吃掉了。
+  原因是 `ctrl+s` 是 `Char('s')` 而字符本身不是控制字符，主机下拉框与导入面板列筛选末尾的
+  `Char(c) if !c.is_control()` 兜底分支把它当普通文本——查询框里多出 `s`、筛选里出现 `s`，
+  保存没有发生，`submit_form` 从未执行。现在保存键优先于子焦点的文本输入，并记
+  `event=form.save_key_swallowed` 留痕。见 [docs/design.md](docs/design.md) D35。
+- **新增两个可查的日志事件，把「保存根本没发生」与「保存被拒绝」分开。**
+  `form.save_attempted`（INFO：`route` / `pane_open` / `rows` / `checked` / `touched` /
+  `complete`）在保存键到达表单时写一条，`form.save_key_swallowed`（WARN：`focus`）在子焦点
+  吃掉保存键时写一条。此前两种情况在磁盘上长得一模一样——都是空的。见
+  [docs/logging/events.md](docs/logging/events.md)。
 - **清空导入面板勾选后，手填的转发不再被「没有勾选任何转发」挡住**：勾选数为 0 的面板没有可执行
   内容，让位给完整的手填表单（手填表单也不完整时才仍报该错）→ [import-save.md](docs/import-save.md#提交归属默认提议-vs-明确指令)
 - **加一个新端口转发时，同一台主机已有的转发不再被顺手重建一遍。** 导入面板原来把

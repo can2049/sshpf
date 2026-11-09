@@ -243,3 +243,25 @@ D32 的守卫拦得住**新建**的重复，拦不住两种已经发生的重复
 两条判断标准贯穿两处：**同一份身份算法**（`model::tunnel::identity_of`，`-L` 不含本地端口）与**不留沉默**（面板写明「已存在：X」，载入折叠记 `event=config.deduped` 并在状态栏说明）。表格无故变短、某行无故不可勾，都会被读成 bug；说明白才是一次修复。
 
 → [dedup.md](dedup.md#已写进配置的重复载入时折叠--fold-duplicates-on-load) · [import-pane.md](import-pane.md#已存在的行--rows-that-already-exist) · `src/model/dedup.rs`、`src/model/import/row.rs`、`src/app/import_pane.rs`
+
+## D35 子焦点不能吞掉保存键：`ctrl+s` 不是字母
+
+`ctrl+s` 是 `KeyCode::Char('s')` 带 CONTROL 修饰。字符本身**不是**控制字符，所以任何
+`Char(c) if !c.is_control()` 的兜底分支都会把它当普通文本。表单里有两个这样的分支：
+主机下拉框的查询框、导入面板的列筛选。结果是「填好 3081，按 `ctrl+s`，端口没有建立」，
+而且**日志完全空白**——键在分发层就被吃掉了，`submit_form` 从未执行，`tunnel.created`
+自然也不会出现。这比创建失败更难查：失败至少有错误信息，吞键什么都没有。
+
+修法是在每个子焦点入口先问同一个判定 `keys::is_save_key`，命中就 `return false` 交还
+表单（并且记一条 `form.save_key_swallowed`，让「键没到表单」与「到了被拒」在日志里
+分开）。两个子焦点都必须改：校验必须对着用户真正在用的那份界面，而"用户在用"包括
+他正把光标停在某个筛选框里。
+
+顺带一个易错的次级入口：面板开着时，表单字段上的 `←`/`→` 会先被面板拿去切列，一次
+误触就进入筛选输入态。所以这条修复不能只覆盖"用户主动打开筛选"的路径。
+
+原则：**保存键的语义优先于任何子焦点的文本输入**。子焦点是搜索/筛选的工具，而
+`ctrl+s` 表达的是"保存我正在看的这份表单"，两者不冲突时以保存为准；被吃的键必须留下
+痕迹，否则「没反应」无法与「没按」区分。
+
+→ [keymap.md](keymap.md) · `src/keys.rs::is_save_key`、`src/keys/dropdown.rs`、`src/keys/import.rs`、`src/eventlog/user.rs`

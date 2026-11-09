@@ -47,6 +47,10 @@ pub(super) const IMPORT_PANE: HelpSection = HelpSection {
             "ctrl+s 实际由表单一侧执行（面板不吞这个键）：保存时按勾选的 N 行生成 N 条隧道。",
             "ctrl+s is handled by the form itself, not the pane: saving turns the N ticked rows into N tunnels.",
         ),
+        HelpItem::note(
+            "正在输入某列筛选时，ctrl+s / f10 也照样保存，不会变成筛选里的字母 s。",
+            "While typing a column filter, ctrl+s / f10 still save instead of becoming the letter s.",
+        ),
     ],
 };
 

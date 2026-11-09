@@ -156,6 +156,16 @@ A text field is taking input. `esc` here does **not** close the form, it only en
   ended first, then the form is submitted, so the letter `s` is never typed into the field.
   This used to be broken — `ctrl+s` inserted `s` into the field being edited (silent data
   corruption) and `f10` did nothing at all, while the footer kept advertising `ctrl+s`.
+- **`ctrl+s` / `f10` 在任何子焦点下都能保存**：主机下拉框开着、导入面板某列筛选正在
+  输入、或对端端口列表开着时，保存键都属于表单，都会真的保存。这里曾经有个静默缺陷：
+  `ctrl+s` 是 `Char('s')`，字符本身不是控制字符，于是下拉框与列筛选末尾的
+  `Char(c) if !c.is_control()` 兜底分支把它当普通输入吃掉——查询框里多出 `s`、筛选里
+  出现 `s`，保存没有发生，**也没有任何日志**（详见 `docs/design.md` D35）。
+  `ctrl+s` / `f10` save from **any** sub-focus: with the host dropdown open, while typing an
+  import column filter, or with the peer port list open, the save key belongs to the form.
+  This used to fail silently — `ctrl+s` is a `Char('s')` whose char is not a control
+  character, so the `Char(c) if !c.is_control()` catch-all typed it into a text buffer and
+  nothing was saved (and nothing was logged).
 - 在 `远端端口` 输入会联动推荐本地端口；手改过 `本地端口` 后不再被推荐覆盖。
   Typing the remote port derives the local-port suggestion; once the local port is
   hand-edited the suggestion stops overwriting it.
