@@ -32,5 +32,9 @@ name = "codec"
 path = "src/codec.rs"
 
 [[bin]]
+name = "e2e"
+path = "src/e2e.rs"
+
+[[bin]]
 name = "clock"
 path = "src/clock.rs"

@@ -40,7 +40,7 @@
 | [pure-rust-ssh-spike.md](pure-rust-ssh-spike.md) | 三种转发的端到端实测 | §8 是库缺陷复现证据 |
 | [client-server.md](client-server.md) | **client-server 架构调研总览**：为什么做、方案、代价、路线图、不做清单 | 另有 [client-server/](client-server/) 三篇展开与 [client-server-spike/](client-server-spike/) 实测 |
 | [client-server/](client-server/) | 协议字段（`protocol.md`）、生命周期与选举（`lifecycle.md`）、迁移计划（`migration.md`） | 设计文档，非当前行为 |
-| `client-server-spike/` | client-server 假设的可运行探针（40 条断言全 PASS） | 独立工程，可丢弃 |
+| `client-server-spike/` | client-server 假设的可运行探针（52 条断言全 PASS，含真实多进程 e2e） | 独立工程，可丢弃 |
 | `spike/` | 上述实测用的可丢弃工程与探针程序 | 不参与构建，不进 crates.io 包 |
 
 `spike/` 不在 `cargo build` 的路径上：它的 `Cargo.toml` 是独立工程，`spike/sshd/run.sh` 起一个临时 sshd。不要把它当作可维护代码。

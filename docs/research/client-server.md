@@ -153,7 +153,8 @@ client 依据快照里的 `client_count`，而快照会过期：它以为自己�
 A 认为是最后 → 用户按 y → B 在此之前连上 → A 的 Bye 到达 → server 计数 2-1=1 > 0 → 不退出 ✅
 ```
 
-**协议上根本没有让 client 拥有决定权**，所以这不是靠时序运气。
+**协议上根本没有让 client 拥有决定权**，所以这不是靠时序运气。该交错已用**三个独立 OS 进程**
+实测复现（`e2e`：A 观察到 `count==1` → B 先连上 → A 才发 `Bye{last_exit:true}` → server 不退出）。
 
 ### 无法提示的不对称（必须承认）
 
@@ -170,7 +171,7 @@ client 崩溃、`SIGKILL`、终端被杀、SSH 断开——**没有机会弹确�
 
 ## 5. 实测证据 / Evidence
 
-40 条断言全 PASS，来自 5 个可运行二进制（[client-server-spike/](client-server-spike/README.md)）：
+**52 条断言全 PASS**，来自 6 个可运行二进制（[client-server-spike/](client-server-spike/README.md)）：
 
 | 二进制 | 证明了什么 | 关键数字 |
 |---|---|---|
@@ -179,9 +180,11 @@ client 崩溃、`SIGKILL`、终端被杀、SSH 断开——**没有机会弹确�
 | `lifecycle` | 最后 client 退出才关服；宽限内新 client 取消；**陈旧 `last_exit` 不关服** | 宽限 300 ms 内正确取消 |
 | `codec` | 50 隧道 round-trip 无损；TOML 三项限制实测确认 | 帧 9 722 B / 1 MiB 上限 |
 | `clock` | client 时钟偏移 ±5 分钟**不影响** age | 三种偏移同结果 |
+| `e2e` | **真实 server 进程 + 真实 client 进程**：3 client 一致、逐步退出、最后一个走掉才关服；**跨进程陈旧 `last_exit` 不关服** | 12 条断言，3 个独立进程构造竞态 |
 
-**未证实**（诚实清单在 spike README）：Windows 全项、真实 SSH 隧道多 client 行为、
-进程级端到端（`broadcast`/`lifecycle` 用线程与模型，非真 server 进程）、NFS 上的 `flock` 语义。
+**未证实**（诚实清单在 spike README）：Windows 全项、真实 SSH 隧道介入的多 client 行为、
+≥3 client 的慢消费者跨进程表现、NFS 上的 `flock` 语义。
+（进程级端到端已由 `e2e` 补上：真实 server/client 进程 + 跨进程竞态。）
 
 ## 6. 代价盘点 / Costs
 

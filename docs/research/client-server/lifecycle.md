@@ -299,6 +299,7 @@ Connected ──EOF/write fail──► Disconnected ──用户按 ↵──�
 
 | 问题 | 现状 |
 |---|---|
-| 并发选举的实测数字（8 进程抢占唯一性、残留恢复耗时） | 由 [spike](../client-server-spike/README.md) 实测；本文档的时序是设计意图 |
+| 并发选举的实测数字（8 进程抢占唯一性、残留恢复耗时） | 已由 [spike](../client-server-spike/README.md) 实测：8 进程恰好 1 个赢 |
+| 本页的关服时序与跨进程竞态 | 已由 spike 的 `lifecycle`（线程模型）与 `e2e`（真实多进程）双重验证 |
 | 宽限窗口默认值 5s 是否合适 | 需真实使用反馈；先给可配置项 |
 | Windows | `std` 无 named pipe API，本 PR 不做，见 [migration.md](migration.md) |

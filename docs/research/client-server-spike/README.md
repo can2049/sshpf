@@ -17,6 +17,7 @@ cargo run --bin broadcast    # 多 client 一致性 + 慢消费者隔离
 cargo run --bin lifecycle    # 最后 client 退出 + 陈旧 last_exit 竞态
 cargo run --bin codec        # 帧 codec round-trip + 体积 + TOML 限制
 cargo run --bin clock        # 时钟纪律（client 时钟偏移不影响 age）
+cargo run --bin e2e          # 真实 server 进程 + 真实 client 进程端到端（含跨进程竞态）
 cargo test                   # 9 个单元测试（codec / wire / frame）
 ```
 
@@ -108,6 +109,36 @@ t5  server 重新计数 = 2-1 = 1 > 0  →  不退出
 **为什么重要**：`TunnelStatus` 里的 `Instant` 不能跨进程。协议只传 `since_ms` + `server_now_ms`，
 client **完全不读自己的墙钟**——这是"两台机器时钟差多少都不影响显示"的根本原因。
 
+### `e2e` — 真实多进程端到端（12 PASS）
+
+前面几个二进制用线程与内存模型证明**逻辑**；这个用**真实 OS 进程**证明规则能穿过进程边界
+（独立地址空间、真正的 `flock`、真正的 socket EOF）。
+
+| 断言 | 结论 | 关键数字 |
+|---|---|---|
+| 真 server 进程绑定 socket 并持有锁 | **成立** | 独立进程，`try_lock` 成功 |
+| 3 个真 client 进程都观察到 3 个 client 已连接 | **成立** | 各自写 marker 文件 |
+| 每个 client 的快照**完全相同** | **成立** | `rev=3 count=3 tunnels=3` |
+| 每个 client 的 revision **严格递增** | **成立** | 3/3 |
+| 走掉 2 个 client 后 server **继续运行** | **成立** | 剩 1 个时仍存活 |
+| 最后一个 client 走掉 → server **自行退出** | **成立** | 退出原因记录为 `last_client` |
+| **跨进程陈旧 `last_exit` 竞态**：A 观察到自己是唯一 client，B 在 A 告别前连上，A 仍发 `last_exit=true` | **成立**：server **不退出** | 3 个独立进程构造该交错 |
+| 之后 B 真正离开 → server 才退出 | **成立** | 原因仍为 `last_client` |
+
+这个交错是手工构造的**真实进程时序**，不是模拟：
+
+```text
+t0  server 进程 up
+t1  client A 进程连上，观察到 client_count == 1  →  写 a.solo（此刻它就该显示风险提示）
+t2  client B 进程连上（count 变 2）
+t3  A 发 Bye{last_exit: true}（携带已过期的观察）
+t4  server 重新计数 = 2-1 = 1 > 0  →  不退出  ✅
+t5  B 发 Bye  →  count = 0  →  server 退出  ✅
+```
+
+**这是用户那条风险提示能安全存在的最终证据**：提示诚实，但过期视图在任何进程交错下都不能
+停掉别人的转发。
+
 ## 未证实 / Not proven
 
 诚实清单。以下**没有**实测证据，不要当成已验证：
@@ -116,7 +147,7 @@ client **完全不读自己的墙钟**——这是"两台机器时钟差多少�
 |---|---|
 | Windows 上任何一条 | 无 Windows 环境；`std` 无 named pipe API，方案本身需要另设计 |
 | 真实 SSH 隧道在多 client 下的行为 | spike 用模型状态替代，未接 `russh`；隧道层不受本改动影响（`Supervisor` 原样复用） |
-| 真正的 server 进程 + 真 client 进程端到端 | `election` 用了真进程，但 `broadcast`/`lifecycle` 用线程与模型；进程级端到端留给迁移阶段 3 |
+| ~~真正的 server 进程 + 真 client 进程端到端~~ | **已证实**（`e2e`，12 条断言）。仍留白：真实 SSH 隧道介入、≥3 client 的慢消费者跨进程表现 |
 | 网络文件系统上的 `flock` 语义 | 未测。若 `config_path` 在 NFS 上，`flock` 行为可能不同；缓存目录应在本地盘 |
 | 长时间运行的内存/句柄增长 | 未做 soak；`Supervisor` 既有 30 次启停无泄漏的结论仍适用，但 IPC 层未测 |
 | TOML 编码吞吐在极端规模下 | 1000 条隧道编码未计时；当前规模（几十条）远不是瓶颈 |
