@@ -308,22 +308,36 @@ pub fn verify_path(host: &str, port: u16, server_key: &PublicKey, path: &Path) -
         }
     }
 
-    let mut saw_host = false;
+    // Entries are keyed by `host` **and algorithm**, exactly like OpenSSH: a host
+    // legitimately has one `ssh-ed25519` *and* one `ecdsa-sha2-nistp256` line, and
+    // negotiating the other one is not a key change. Only a *different key under
+    // the same algorithm* is a change.
+    //
+    // This used to record any non-matching entry as `Changed`, which reported a
+    // false "possible man-in-the-middle" for the ordinary case of a server
+    // offering several algorithms while `known_hosts` holds only one of them —
+    // measured on a host whose only entry was ECDSA: OpenSSH connected under
+    // `StrictHostKeyChecking=yes` while sshpf refused the same session.
     let mut changed_line = None;
     for e in entries.iter().filter(|e| !e.revoked && !e.cert_authority) {
         if !host_field_matches(&e.hosts, &wanted) {
             continue;
         }
-        saw_host = true;
         if same_key(&e.key, server_key) {
             return HostKeyVerdict::Trusted;
         }
-        changed_line.get_or_insert(e.line_no);
+        // Same algorithm + different key material = a genuine replacement.
+        if e.key.algorithm() == server_key.algorithm() {
+            changed_line.get_or_insert(e.line_no);
+        }
     }
 
+    // No `Changed` means either the host has no entry at all, or it only has
+    // entries under *other* algorithms. Both are `Unknown`: nothing is recorded
+    // for this key, so the connection needs the same trust decision as a host
+    // never seen before (learn it, or refuse it under `Strict`).
     match changed_line {
         Some(line) => HostKeyVerdict::Changed { line },
-        None if saw_host => HostKeyVerdict::Unknown, // same host, different algorithm
         None => HostKeyVerdict::Unknown,
     }
 }
@@ -381,6 +395,9 @@ mod tests {
 
     const KEY_A: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICsMBDhtVmpjA0bCZd/VKZGm+ZlWHaIdTFWca6QP35EN";
     const KEY_B: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ";
+    /// A different *algorithm* for the same host — the case that used to be
+    /// misreported as a changed key.
+    const KEY_ECDSA: &str = "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBOTx8hm89xA3Wg6fNTi9QU6deJHYW2EjimXszmMH3QVp8xJCjvnprJ3MK3twYXqP61zUjL6KMZi6wkXgqrtHA3w=";
 
     fn key(b64_line: &str) -> PublicKey {
         PublicKey::from_openssh(b64_line).unwrap()
@@ -578,6 +595,24 @@ mod tests {
         assert!(f.read().contains("[h.example.com]:2222"), "got: {}", f.read());
     }
 
+    /// The mirror of [`learn_does_not_append_a_changed_key`]: a *different
+    /// algorithm* for a known host is not a change, so learning it must append
+    /// (OpenSSH keeps one line per host+algorithm). Refusing to append here would
+    /// leave the second algorithm permanently un-learnable.
+    #[test]
+    fn learn_appends_a_second_algorithm_for_the_same_host() {
+        let f = TempFile::with(&format!("h.example.com {KEY_A}\n"));
+        learn_path("h.example.com", 22, &key(KEY_ECDSA), f.path()).unwrap();
+        let content = f.read();
+        assert_eq!(
+            content.lines().filter(|l| !l.is_empty()).count(),
+            2,
+            "second algorithm must be learned: {content:?}"
+        );
+        assert_eq!(verify_path("h.example.com", 22, &key(KEY_A), f.path()), HostKeyVerdict::Trusted);
+        assert_eq!(verify_path("h.example.com", 22, &key(KEY_ECDSA), f.path()), HostKeyVerdict::Trusted);
+    }
+
     #[test]
     fn learn_is_idempotent() {
         let f = TempFile::empty();
@@ -655,6 +690,36 @@ mod tests {
         assert!(!body.contains('='), "fingerprint must not be padding-padded: {body}");
         assert_eq!(fa, fingerprint(&a), "the same key must fingerprint identically");
         assert_ne!(fa, fingerprint(&b), "two different keys collided");
+    }
+
+    /// Regression: a host whose `known_hosts` entry is ECDSA, when the server
+    /// presents its ED25519 key, is **not** a changed key — OpenSSH keys entries
+    /// by `host + algorithm` and connects happily. We used to record the
+    /// non-matching line as `Changed`, i.e. accuse the user of a possible
+    /// man-in-the-middle attack on an ordinary multi-algorithm server.
+    ///
+    /// Measured on a real host: OpenSSH accepted it under
+    /// `StrictHostKeyChecking=yes` while sshpf refused the same session.
+    #[test]
+    fn a_different_algorithm_is_unknown_not_changed() {
+        let f = TempFile::with(&format!("[127.0.0.1]:22200 {KEY_ECDSA}\n"));
+        // Server presents ed25519; only an ecdsa entry is recorded.
+        assert_eq!(verify_path("127.0.0.1", 22200, &key(KEY_A), f.path()), HostKeyVerdict::Unknown);
+        // And the reverse direction: ed25519 recorded, ecdsa presented.
+        let g = TempFile::with(&format!("[127.0.0.1]:22200 {KEY_A}\n"));
+        assert_eq!(verify_path("127.0.0.1", 22200, &key(KEY_ECDSA), g.path()), HostKeyVerdict::Unknown);
+        // The genuine change — same algorithm, different key — is still caught.
+        assert_eq!(verify_path("127.0.0.1", 22200, &key(KEY_B), g.path()), HostKeyVerdict::Changed { line: 1 });
+    }
+
+    /// A host with entries under *both* algorithms stays trusted for each of them;
+    /// adding the second algorithm must not invalidate the first.
+    #[test]
+    fn multiple_algorithms_are_all_trusted() {
+        let f = TempFile::with(&format!("[127.0.0.1]:22200 {KEY_A}\n[127.0.0.1]:22200 {KEY_ECDSA}\n"));
+        assert_eq!(verify_path("127.0.0.1", 22200, &key(KEY_A), f.path()), HostKeyVerdict::Trusted);
+        assert_eq!(verify_path("127.0.0.1", 22200, &key(KEY_ECDSA), f.path()), HostKeyVerdict::Trusted);
+        assert_eq!(verify_path("127.0.0.1", 22200, &key(KEY_B), f.path()), HostKeyVerdict::Changed { line: 1 });
     }
 
     #[test]
