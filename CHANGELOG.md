@@ -5,6 +5,11 @@
 
 ## [Unreleased]
 
+### 修复
+
+- **手填的「新建转发」不再被自动展开的导入面板吞掉**（未被动过的面板只是默认提议，完整的手填
+  表单才是明确指令）；**新增转发也不再重复堆积**，判定比意图不比端口，见 [docs/dedup.md](docs/dedup.md)。
+
 ### 变更
 
 - **给 AI agent 的协作约束：一条改动一个 worktree。** 文档新增「一特性一 worktree」
@@ -12,6 +17,8 @@
   开发新特性、修复问题一律在 `.agents/worktrees/<分支名>` 的独立 worktree + 独立分支里做，
   不在共享 checkout 里改；**PR 合并后立即删除该 worktree 与本地/远端分支**，不留僵尸分支。
   纯文档约定变更，无代码、无行为变化。
+- 新增事件 `action.duplicate_skipped`；`docs/import-forwards.md` 按职责拆为 import-pane /
+  import-save / port-scan 三篇，`design.md` 加 D32/D33。
 
 ## [0.5.0] - 2026-11-09
 

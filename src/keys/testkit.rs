@@ -87,16 +87,19 @@ pub(super) fn form_app() -> (tempfile::TempDir, App) {
 pub(super) fn import_app() -> (tempfile::TempDir, App) {
     let (d, mut app) = app_with(vec![]);
     app.open_form_create();
+    // The target port follows the listen port: two `-L` rows that differ only in
+    // their local listen port are one forward by design (see `app::duplicate`), so
+    // a fixture that repeated one target would collapse the batch it means to test.
     let forwards = (0..3)
         .map(|i| crate::model::SshForward {
             kind: crate::model::ForwardKind::Local,
             listen_addr: "127.0.0.1".into(),
             listen_port: 18001 + i,
             target_host: "10.0.0.1".into(),
-            target_port: 80,
+            target_port: 18001 + i,
             host_alias: "dev-box".into(),
             line: (i as usize) + 1,
-            raw: format!("LocalForward {} 10.0.0.1:80", 18001 + i),
+            raw: format!("LocalForward {} 10.0.0.1:{}", 18001 + i, 18001 + i),
         })
         .collect();
     {
@@ -112,16 +115,17 @@ pub(super) fn import_app() -> (tempfile::TempDir, App) {
 /// A create form with a host and a *default-open* pane holding three rows.
 pub(super) fn default_open_import_app() -> (tempfile::TempDir, App) {
     let (d, mut app) = form_app();
+    // Distinct targets, so the three rows are three forwards (see `import_app`).
     let forwards = (0..3)
         .map(|i| crate::model::SshForward {
             kind: crate::model::ForwardKind::Local,
             listen_addr: "127.0.0.1".into(),
             listen_port: 19001 + i,
             target_host: "10.0.0.1".into(),
-            target_port: 80,
+            target_port: 19001 + i,
             host_alias: "testhost".into(),
             line: (i as usize) + 1,
-            raw: format!("LocalForward {} 10.0.0.1:80", 19001 + i),
+            raw: format!("LocalForward {} 10.0.0.1:{}", 19001 + i, 19001 + i),
         })
         .collect();
     {

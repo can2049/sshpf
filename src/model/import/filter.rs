@@ -10,6 +10,11 @@
 //! change anything (clearing an already-empty filter) deliberately does *not*
 //! push a snapshot, so undo never looks broken.
 //!
+//! Filtering is also an **intentional act on the pane**: narrowing the view says
+//! the user is working with these rows, so every real filter change marks the
+//! table [`touched`](super::table::ImportTable::touched). The submit router uses
+//! that to tell a default tick apart from an instruction.
+//!
 //! Belongs here: filter text, matching, undo.
 //! Does not belong: cursor/selection (`super::table`), rendering.
 
@@ -42,6 +47,7 @@ impl ImportTable {
 
     /// Replace one column's filter, recording an undo point.
     pub fn set_filter(&mut self, col: ImportColumn, text: impl Into<String>) {
+        self.touch();
         self.snapshot();
         if let Some(slot) = self.filters.get_mut(col.index()) {
             *slot = text.into();
@@ -50,6 +56,7 @@ impl ImportTable {
     }
 
     pub fn filter_char(&mut self, col: ImportColumn, c: char) {
+        self.touch();
         self.snapshot();
         if let Some(slot) = self.filters.get_mut(col.index()) {
             slot.push(c);
@@ -64,6 +71,7 @@ impl ImportTable {
         if self.filters[index].is_empty() {
             return;
         }
+        self.touch();
         self.snapshot();
         self.filters[index].pop();
         self.after_filter_change();
@@ -77,6 +85,7 @@ impl ImportTable {
         if self.filters[index].is_empty() {
             return;
         }
+        self.touch();
         self.snapshot();
         self.filters[index].clear();
         self.after_filter_change();
@@ -94,6 +103,7 @@ impl ImportTable {
         if !self.has_filters() {
             return;
         }
+        self.touch();
         self.snapshot();
         self.filters = std::array::from_fn(|_| String::new());
         self.after_filter_change();
@@ -105,6 +115,7 @@ impl ImportTable {
         match self.history.pop() {
             Some(prev) => {
                 self.filters = prev;
+                self.touch();
                 self.after_filter_change();
                 true
             }
@@ -161,6 +172,42 @@ mod tests {
     use crate::model::SshForward;
     use crate::model::col_match;
     use crate::model::fixtures::sample_table;
+
+    #[test]
+    fn every_filter_change_marks_the_table_touched() {
+        // Filtering is the user narrowing the view they are working with, so it
+        // must count as an intention — otherwise someone who filtered down to the
+        // one row they wanted would still lose `ctrl+s` to a complete typed form.
+        let mut t = sample_table();
+        t.filter_char(ImportColumn::Kind, 'L');
+        assert!(t.touched, "typing into a filter is a deliberate act");
+
+        // Undo restores filters but not the history: it is still a user action.
+        let mut t = sample_table();
+        t.set_filter(ImportColumn::Kind, "L");
+        assert!(t.touched);
+        let mut t = sample_table();
+        t.clear_filter(ImportColumn::Kind);
+        assert!(!t.touched, "clearing an already-empty filter changed nothing, so it is not a decision");
+
+        let mut t = sample_table();
+        t.set_filter(ImportColumn::Kind, "L");
+        t.clear_all_filters();
+        assert!(t.touched);
+    }
+
+    #[test]
+    fn undoing_a_filter_marks_the_table_touched() {
+        // `undo_filter` rolls the text back but it is still the user working the
+        // pane. (A table with an empty undo stack is untouched by construction:
+        // no filter change ever happened, so there is nothing to pop.)
+        let mut t = sample_table();
+        t.set_filter(ImportColumn::Kind, "L");
+        t.touched = false; // isolate the undo call from the set_filter call
+        assert!(t.undo_filter());
+        assert!(t.touched, "undoing a filter is still the user expressing intent");
+        assert!(!t.undo_filter(), "an empty stack must report false");
+    }
 
     #[test]
     fn column_filters_are_anded_and_case_insensitive() {

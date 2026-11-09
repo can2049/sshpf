@@ -14,6 +14,11 @@
 //!   a default. It only auto-opens when there is at least one *importable* row.
 //! * Discovery is **not repeated** for the same host: re-running it would throw
 //!   away the user's tick marks and filters on every keystroke.
+//! * The auto-open is an *offer*, not an instruction. Everything the user does to
+//!   the pane deliberately — opening it by hand, focusing a column filter, ticking
+//!   or unticking rows — marks the table
+//!   `touched`, and only a touched table outranks a complete hand-filled form on
+//!   `ctrl+s`. See `form_submit`'s module docs for the routing rule.
 
 use crate::app::{App, FormMode};
 use crate::eventlog;
@@ -103,6 +108,12 @@ impl App {
     ///
     /// Loads the table first if it is stale, so the pane can never display rows
     /// belonging to a different host.
+    ///
+    /// A *manual* open marks the table [`touched`](crate::model::ImportTable::touched):
+    /// the user went out of their way to put these rows on screen, which is a
+    /// stronger statement of intent than the auto-open default. Collapsing does
+    /// not clear the flag — having moved the pane at all is what makes the pane
+    /// outrank a hand-filled form.
     pub fn toggle_import_pane(&mut self) {
         self.refresh_import_for_current_host();
         let Some(form) = self.form.as_mut() else {
@@ -121,6 +132,9 @@ impl App {
             return;
         }
         form.import_open = !form.import_open;
+        if form.import_open {
+            form.import.touched = true;
+        }
         form.import.end_filter();
     }
 
@@ -145,10 +159,14 @@ impl App {
     /// `is_editing_field()` rather than by draw order — so a mouse click on a
     /// header while a field was being edited would otherwise show the filter
     /// cursor in the pane while every keystroke still went into the field.
+    ///
+    /// Marks the table touched: focusing a column filter is the user working the
+    /// pane, not merely looking at the default offer.
     pub fn begin_import_filter(&mut self, col: ImportColumn) {
         if let Some(form) = self.form.as_mut() {
             form.end_edit();
             form.import.begin_filter(col);
+            form.import.touched = true;
             form.import_open = true;
         }
     }
@@ -341,6 +359,30 @@ mod tests {
         app.form.as_mut().unwrap().set_import_table("dev-box", table);
         app.form.as_mut().unwrap().import_open = true;
         (dir, app)
+    }
+
+    #[test]
+    fn opening_the_pane_by_hand_marks_the_rows_as_used() {
+        // Auto-open is an offer, so it leaves `touched` false. Opening by hand is
+        // the user saying "show me these rows", which must count.
+        let (_d, mut app) = app_fresh();
+        app.open_form_create();
+        app.form.as_mut().unwrap().ssh_host.set("dev-box");
+        app.install_import_rows("dev-box", vec![show(free_port())]);
+        app.close_import_pane();
+        assert!(!app.form.as_ref().unwrap().import.touched);
+
+        app.toggle_import_pane();
+        assert!(app.import_pane_open());
+        assert!(app.form.as_ref().unwrap().import.touched, "a manual open is a user action");
+    }
+
+    #[test]
+    fn focusing_a_column_filter_marks_the_rows_as_used() {
+        let (_d, mut app) = app_with_import(vec![show(free_port())]);
+        assert!(!app.form.as_ref().unwrap().import.touched, "precondition: untouched table");
+        app.begin_import_filter(ImportColumn::Listen);
+        assert!(app.form.as_ref().unwrap().import.touched);
     }
 
     #[test]

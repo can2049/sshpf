@@ -105,6 +105,7 @@
 | `action.batch` | INFO | `action` `marked` `changed` | 批量操作完成；`changed` 是**真正生效**的条数，不是标记数 |
 | `action.requested` | DEBUG | `action` `detail` | 弹出了确认框 |
 | `action.target_missing` | WARN | `action` | 确认框的目标隧道已不存在：删除被判过期、或按 id 操作时条目已被删。确认框仍会弹，但里面没有名字 |
+| `action.duplicate_skipped` | INFO | `source` `name` `existing` | 一次创建被跳过：候选转发与 `existing` 是同一个转发（见 [../dedup.md](../dedup.md)）。`source` 是 `form` / `import` / `port-scan`。INFO 而非 WARN：跳过冗余正是预期结果，但这行解释了「勾了 3 条怎么只建了 2 条」 |
 | `import.committed` | INFO | `host` `created` | 从 `~/.ssh/config` 导入成功 |
 | `import.rejected` | WARN | `problems` `msg` | 导入校验失败，一条都没建 |
 | `import.click_stale` | DEBUG | `row` | 鼠标命中的导入行已不在当前筛选视图内（hit 图比点击早一帧），本次点击丢弃 |

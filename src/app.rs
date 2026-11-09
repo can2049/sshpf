@@ -22,6 +22,7 @@ use crate::ssh::SshHost;
 use crate::tunnel::{Supervisor, TunnelEvent};
 
 pub mod confirm;
+pub mod duplicate;
 pub mod events;
 pub mod form;
 pub mod form_submit;
@@ -183,6 +184,10 @@ pub struct App {
     /// Generation counter for scan results, so a slow answer cannot overwrite a
     /// newer list.
     pub(crate) port_seq: u64,
+    /// Port-batch rows skipped as duplicates of an already-saved forward, kept
+    /// from `validated_port_batch` to the `commit_port_batch` that follows it in
+    /// the same submit, so the status line can report the count.
+    pub(crate) pending_port_skipped: Vec<String>,
 }
 
 impl App {
@@ -251,6 +256,7 @@ impl App {
             ports: None,
             port_rx: None,
             port_seq: 0,
+            pending_port_skipped: Vec::new(),
         }
     }
 

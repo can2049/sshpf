@@ -18,7 +18,11 @@
 //! * The ticked rows are a **default, not a running listener**. The tunnels are
 //!   only created when the user submits the form, so "default select all" cannot
 //!   open ports behind the user's back.
-//! * One `TunnelConfig` is one forward, so N ticked rows create N tunnels. The
+//! * One `TunnelConfig` is one forward, so N ticked rows create N tunnels — minus
+//!   the rows that duplicate a forward that is already saved (or another row of
+//!   the same batch). The local-port planner bumps a busy listen port, which used
+//!   to make a re-import of the same `LocalForward` look like a new forward; the
+//!   duplicate check is what stops that second definition from being created. The
 //!   submit path therefore validates and inserts *in a batch*: a partial write
 //!   (three tunnels created, then a validation error on the fourth) would leave
 //!   a state the user never asked for, so everything is validated up front and
@@ -68,11 +72,19 @@ impl App {
     /// reserves the id range, and [`Self::build_import_batch`] turns each ticked
     /// row into a config and collects every problem.
     pub fn validated_import_batch(&mut self) -> Option<Vec<TunnelConfig>> {
+        self.validated_import_batch_outcome().map(|batch| batch.configs)
+    }
+
+    /// Like [`Self::validated_import_batch`], but keeps the rows that were
+    /// skipped because the forward is already saved.
+    ///
+    /// The submit path needs to distinguish "nothing was ticked" from "everything
+    /// ticked is already saved": only the first is a user error.
+    pub(crate) fn validated_import_batch_outcome(&mut self) -> Option<ImportBatch> {
         let (ssh_host, forwards) = self.import_intent()?;
         let (base_id, last_id) = self.allocate_import_ids(forwards.len())?;
-        let configs = self.build_import_batch(&ssh_host, &forwards, base_id, last_id);
-        match configs {
-            Ok(configs) => Some(configs),
+        match self.build_import_batch(&ssh_host, &forwards, base_id, last_id) {
+            Ok(batch) => Some(batch),
             Err(errors) => {
                 crate::eventlog::import_rejected(&errors);
                 self.set_form_errors(errors);
@@ -128,6 +140,13 @@ impl App {
     /// Turn every ticked row into a validated config, or collect *all* the
     /// problems and create nothing.
     ///
+    /// Rows whose forward is already saved are skipped, not created: the local
+    /// listen port is a derived value the planner may bump (and a bump from an
+    /// earlier run is persisted), so re-importing the same `LocalForward` would
+    /// otherwise create a second entry for one intent. The first row of a
+    /// same-identity pair wins, and every skipped row is reported back to the
+    /// caller (see [`ImportBatch`]).
+    ///
     /// All-or-nothing on purpose: a partial write (three tunnels created, then a
     /// validation error on the fourth) would leave a state the user never asked
     /// for.
@@ -137,60 +156,70 @@ impl App {
         forwards: &[SshForward],
         base_id: crate::model::TunnelId,
         last_id: crate::model::TunnelId,
-    ) -> Result<Vec<TunnelConfig>, Vec<String>> {
+    ) -> Result<ImportBatch, Vec<String>> {
         // Ports already claimed by other managed tunnels, so the batch does not
         // fight over one port with the tunnels it is replacing. Grows as we
         // assign, so two rows cannot be handed the same local port.
         let mut taken: Vec<u16> = self.taken_local_ports();
         let mut out: Vec<TunnelConfig> = Vec::with_capacity(forwards.len());
+        let mut skipped: Vec<String> = Vec::new();
         let mut errors: Vec<String> = Vec::new();
 
         for (next_id, forward) in (base_id..=last_id).zip(forwards.iter()) {
-            let cfg = self.import_row_config(next_id, forward, ssh_host, &taken, &out, &mut errors);
+            let cfg = self.prepare_import_row(next_id, forward, ssh_host, &taken, &out);
+            if let Some(existing) = self.duplicate_in_batch(&cfg, &out) {
+                crate::eventlog::action_duplicate_skipped("import", &cfg.name, &existing);
+                skipped.push(cfg.name);
+                continue;
+            }
+            self.check_import_row(&cfg, &out, &mut errors);
             if cfg.kind != ForwardKind::Remote {
                 taken.push(cfg.local_port);
             }
             out.push(cfg);
         }
 
-        if errors.is_empty() { Ok(out) } else { Err(errors) }
+        if errors.is_empty() { Ok(ImportBatch { configs: out, skipped }) } else { Err(errors) }
     }
 
-    /// Build one row of the batch and append anything wrong with it to `errors`.
+    /// Build one row of the batch, before anything about it is checked.
     ///
-    /// `out` is the batch built so far — needed because two imported rows can
-    /// describe the same listen port (a `Host *` default plus a specific block),
-    /// and creating both would fail at bind time instead of here.
-    fn import_row_config(
+    /// `out` is the batch accepted so far, which keeps names unique within the
+    /// batch itself (not just against the already-saved tunnels).
+    fn prepare_import_row(
         &self,
         id: crate::model::TunnelId,
         forward: &SshForward,
         ssh_host: &str,
         taken: &[u16],
         out: &[TunnelConfig],
-        errors: &mut Vec<String>,
     ) -> TunnelConfig {
         let mut cfg = self.config_from_forward(id, forward, taken);
         cfg.ssh_host = ssh_host.to_string();
-        // Keep names unique within the batch itself, not just against the
-        // already-saved tunnels.
         cfg.name = unique_within(&cfg.name, out.iter().map(|c| c.name.clone()).collect());
-        if let Err(e) = config::validate_tunnel(&cfg) {
+        cfg
+    }
+
+    /// Append anything wrong with a built row to `errors`.
+    ///
+    /// `out` is the batch built so far — needed because two imported rows can
+    /// describe the same listen port (a `Host *` default plus a specific block),
+    /// and creating both would fail at bind time instead of here.
+    fn check_import_row(&self, cfg: &TunnelConfig, out: &[TunnelConfig], errors: &mut Vec<String>) {
+        if let Err(e) = config::validate_tunnel(cfg) {
             // `e` is the Chinese validator message (`src/config.rs`, not our
             // scope); append the English category so the row is bilingual.
             errors.push(format!("{}: {e} / Invalid definition", cfg.name));
         }
         // Collision against already-saved tunnels, then against the rest of this
         // batch.
-        let conflict =
-            self.listen_conflict(&cfg).or_else(|| out.iter().find_map(|other| listen_collision(&cfg, other)));
+        let conflict = self.listen_conflict(cfg).or_else(|| out.iter().find_map(|other| listen_collision(cfg, other)));
         if let Some(conflict) = conflict {
             errors.push(help::bi(
                 &format!("{}: 监听地址与「{conflict}」冲突", cfg.name),
                 &format!("{}: listen endpoint collides with \"{conflict}\"", cfg.name),
             ));
         }
-        cfg
     }
 
     /// Report validation problems into the open form (the batch creates nothing).
@@ -200,8 +229,12 @@ impl App {
         }
     }
 
-    /// Create every validated tunnel, persist once, and start them.
-    pub(crate) fn commit_import_batch(&mut self, configs: Vec<TunnelConfig>) {
+    /// Create the batch, reporting how many duplicate rows were skipped.
+    ///
+    /// `skipped` names the ticked rows that were dropped because the same forward
+    /// is already saved. They are mentioned in the status so a batch that created
+    /// fewer tunnels than rows are ticked is explained rather than mysterious.
+    pub(crate) fn commit_import_batch_with_skipped(&mut self, configs: Vec<TunnelConfig>, skipped: Vec<String>) {
         let n = configs.len();
         let first_id = configs.first().map(|c| c.id);
         let host = configs.first().map(|c| c.ssh_host.clone()).unwrap_or_default();
@@ -225,30 +258,32 @@ impl App {
             }
         }
         self.clamp_selection();
-        if n == 1 {
-            let name = configs.first().map(|c| c.name.clone()).unwrap_or_default();
-            self.set_status(StatusMsg::ok(help::bi(
-                &format!("已创建 1 条转发：{name}"),
-                &format!("Created 1 forward: {name}"),
-            )));
-        } else {
-            self.set_status(StatusMsg::ok(help::bi(
-                &format!("已创建 {n} 条转发（来自 ~/.ssh/config）"),
-                &format!("Created {n} forwards (from ~/.ssh/config)"),
-            )));
-        }
+        self.set_status(StatusMsg::ok(import_batch_status(&configs, skipped.len())));
     }
 
     /// Create-form submit when the import pane is in charge.
     ///
     /// Validates the whole batch first so a rejected row cannot leave the user
-    /// with "four of five tunnels created and one error". Every "nothing to do"
-    /// path reports the same phrase, because from the user's side they are one
-    /// situation: they pressed save with no row ticked.
+    /// with "four of five tunnels created and one error". A batch whose every
+    /// ticked row duplicates an already-saved forward creates nothing *and is not
+    /// an error*: the user asked for something that is already true, so the form
+    /// closes with a status saying so. Only "no row ticked at all" is reported
+    /// into the form.
     pub(crate) fn commit_form_create_from_import(&mut self) {
-        let configs = self.validated_import_batch();
-        match configs {
-            Some(configs) if !configs.is_empty() => self.commit_import_batch(configs),
+        let batch = self.validated_import_batch_outcome();
+        match batch {
+            Some(batch) if !batch.configs.is_empty() => {
+                self.commit_import_batch_with_skipped(batch.configs, batch.skipped);
+            }
+            Some(batch) if !batch.skipped.is_empty() => {
+                // Every ticked forward already exists: nothing to create, and
+                // nothing is wrong either.
+                self.set_status(StatusMsg::ok(help::bi(
+                    &format!("{} 条转发已存在，未重复创建", batch.skipped.len()),
+                    &format!("{} forward(s) already exist; nothing was created", batch.skipped.len()),
+                )));
+                self.close_overlay();
+            }
             Some(_) | None => {
                 // Validation reported its own problems into `form.errors`; only
                 // speak up when it did not (no rows ticked, no host).
@@ -260,6 +295,36 @@ impl App {
             }
         }
     }
+}
+
+/// The configs a ticked import produced, plus the rows dropped as duplicates.
+///
+/// `skipped` keeps "nothing ticked" (a user error) distinguishable from
+/// "everything ticked is already saved" (success with a no-op body).
+pub(crate) struct ImportBatch {
+    pub configs: Vec<TunnelConfig>,
+    pub skipped: Vec<String>,
+}
+
+/// The import-commit status line: created count, plus how many were skipped.
+fn import_batch_status(configs: &[TunnelConfig], skipped: usize) -> String {
+    let n = configs.len();
+    let created = if n == 1 {
+        let name = configs.first().map(|c| c.name.clone()).unwrap_or_default();
+        help::bi(&format!("已创建 1 条转发：{name}"), &format!("Created 1 forward: {name}"))
+    } else {
+        help::bi(
+            &format!("已创建 {n} 条转发（来自 ~/.ssh/config）"),
+            &format!("Created {n} forwards (from ~/.ssh/config)"),
+        )
+    };
+    if skipped == 0 {
+        return created;
+    }
+    help::bi(
+        &format!("{created}；跳过 {skipped} 条重复转发"),
+        &format!("{created}; skipped {skipped} duplicate forward(s)"),
+    )
 }
 
 /// A name not already used by `siblings` (the rest of the batch).
@@ -366,16 +431,20 @@ mod tests {
         l.local_addr().unwrap().port()
     }
 
+    /// A discovered `-L` row. The target port follows the listen port so two rows
+    /// are genuinely two forwards: rows that differ only in the local listen port
+    /// are one forward by design (see `app::duplicate`), and a fixture that
+    /// collapsed them would test the wrong thing everywhere.
     fn show(port: u16) -> SshForward {
         SshForward {
             kind: ForwardKind::Local,
             listen_addr: "127.0.0.1".into(),
             listen_port: port,
             target_host: "10.0.0.1".into(),
-            target_port: 80,
+            target_port: port,
             host_alias: "dev-box".into(),
             line: 1,
-            raw: format!("LocalForward {port} 10.0.0.1:80"),
+            raw: format!("LocalForward {port} 10.0.0.1:{port}"),
         }
     }
 
@@ -455,10 +524,13 @@ mod tests {
     }
 
     #[test]
-    fn an_open_pane_still_wins_over_a_perfectly_valid_single_form() {
-        // The counterpart: while the pane is on screen, its ticks are the intent.
-        // Otherwise filling the fields too would silently create one tunnel
-        // instead of the batch the user is looking at.
+    fn a_touched_open_pane_wins_over_a_perfectly_valid_single_form() {
+        // The pane auto-opens and auto-ticks, so an *untouched* pane is only a
+        // suggestion and a complete hand-typed form outranks it (see
+        // `form_submit`'s router). Once the user changes a tick, though, the pane
+        // is what "save" means and the port fields are ignored — otherwise filling
+        // them too would silently create one tunnel instead of the batch the user
+        // is looking at.
         let (p1, p2) = (free_port(), free_port());
         let (_d, mut app) = app_with_import(vec![show(p1), show(p2)]);
         {
@@ -468,8 +540,11 @@ mod tests {
             f.remote_port.set("8080");
             f.local_port.set(free_port().to_string());
         }
+        // Touch the pane: re-affirm "all of these" (a deliberate key press, which
+        // is what `touched` records).
+        app.form.as_mut().unwrap().import.check_all_visible();
         app.submit_form();
-        assert_eq!(app.tunnels.len(), 2, "the visible batch decides");
+        assert_eq!(app.tunnels.len(), 2, "the visible batch decides once the user touched it");
         assert!(app.tunnels.iter().all(|t| t.cfg.name != "manual"));
     }
 
@@ -478,13 +553,15 @@ mod tests {
         let (p1, p2) = (free_port(), free_port());
         let (_d, mut app) = app_with_import(vec![show(p1), show(p2)]);
         // Fill the single-tunnel fields so the form itself is valid too: the
-        // import path must win over them, not fight with them.
+        // import path must win over them once the pane is touched, not fight with
+        // them.
         {
             let f = app.form.as_mut().unwrap();
             f.name.set("ignored");
             f.local_port.set("19000");
             f.remote_port.set("80");
         }
+        app.form.as_mut().unwrap().import.check_all_visible();
         app.submit_form();
         assert_eq!(app.tunnels.len(), 2, "one tunnel per ticked row, form fields ignored");
         assert!(app.form.is_none(), "the form closes on success");
@@ -627,14 +704,31 @@ mod tests {
 
     #[test]
     fn two_rows_in_one_batch_never_get_the_same_local_port() {
-        // Both rows ask for the same listen port (possible when `Host *` repeats
-        // a specific block's forward). The second must be steered elsewhere
-        // instead of handing two tunnels the same port.
+        // Two rows asking for the same listen port for *different* targets
+        // (possible when `Host *` repeats a block). The second must be steered
+        // elsewhere instead of handing two tunnels the same port — and it must
+        // not be mistaken for a duplicate: a different target is a different
+        // forward.
         let p = free_port();
-        let (_d, mut app) = app_with_import(vec![show(p), show(p)]);
+        let mut other_target = show(p);
+        other_target.target_host = "10.0.0.2".into();
+        let (_d, mut app) = app_with_import(vec![show(p), other_target]);
         let configs = app.validated_import_batch().unwrap();
         assert_eq!(configs.len(), 2);
         assert_ne!(configs[0].local_port, configs[1].local_port, "the scan must account for the batch itself");
+    }
+
+    #[test]
+    fn two_identical_rows_of_one_batch_collapse_to_one_tunnel() {
+        // The same directive listed twice (`Host *` repeating a block): one
+        // forward, so it must produce one tunnel rather than two rows fighting
+        // over the same intent.
+        let p = free_port();
+        let (_d, mut app) = app_with_import(vec![show(p), show(p)]);
+        let batch = app.validated_import_batch_outcome().unwrap();
+        assert_eq!(batch.configs.len(), 1);
+        assert_eq!(batch.skipped.len(), 1);
+        assert_eq!(app.validated_import_batch().map(|v| v.len()), Some(1), "the plain accessor agrees");
     }
 
     #[test]
@@ -741,16 +835,18 @@ mod hardening_tests {
         (dir, App::new(paths))
     }
 
+    /// A discovered `-L` row whose target port follows its listen port, so two
+    /// rows are two forwards (rows differing only in the local port are one).
     fn show(port: u16) -> SshForward {
         SshForward {
             kind: ForwardKind::Local,
             listen_addr: "127.0.0.1".into(),
             listen_port: port,
             target_host: "10.0.0.1".into(),
-            target_port: 80,
+            target_port: port,
             host_alias: "dev-box".into(),
             line: 1,
-            raw: format!("LocalForward {port} 10.0.0.1:80"),
+            raw: format!("LocalForward {port} 10.0.0.1:{port}"),
         }
     }
 
@@ -913,7 +1009,7 @@ mod hardening_tests {
     fn commit_import_batch_with_an_empty_vec_is_a_no_op() {
         // `configs.first()` would be `None`; the cursor bookkeeping must cope.
         let (_d, mut app) = app_fresh();
-        app.commit_import_batch(Vec::new());
+        app.commit_import_batch_with_skipped(Vec::new(), Vec::new());
         assert!(app.tunnels.is_empty());
         assert_eq!(app.selected, 0);
     }
@@ -943,5 +1039,197 @@ mod hardening_tests {
         assert_eq!(app.tunnels.len(), 2);
         assert!(app.selected_tunnel().is_some(), "the cursor must land on something");
         assert!(matches!(app.tunnels[0].status, TunnelStatus::Starting { .. } | TunnelStatus::Failed { .. }));
+    }
+}
+
+#[cfg(test)]
+mod duplicate_tests {
+    use super::*;
+    use crate::config::{ConfigFile, Paths};
+    use crate::model::ImportTable;
+
+    fn free_port() -> u16 {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    }
+
+    /// A saved `-L` tunnel on `ssh_host` with the given local/remote endpoints.
+    fn saved(
+        id: crate::model::TunnelId,
+        name: &str,
+        ssh_host: &str,
+        local_port: u16,
+        remote: (&str, u16),
+    ) -> TunnelConfig {
+        TunnelConfig {
+            id,
+            name: name.into(),
+            kind: ForwardKind::Local,
+            ssh_host: ssh_host.into(),
+            local_addr: "127.0.0.1".into(),
+            local_port,
+            remote_host: remote.0.into(),
+            remote_port: remote.1,
+            enabled: false,
+            auto_restart: false,
+            ssh_options: vec![],
+            note: String::new(),
+            created_at: 1,
+        }
+    }
+
+    /// An app whose imported table holds `rows`, and whose saved config already
+    /// holds `tunnels`.
+    fn app_with_saved(tunnels: Vec<TunnelConfig>, rows: Vec<SshForward>) -> (tempfile::TempDir, App) {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths { config: dir.path().join("config.toml"), state: dir.path().join("state.toml") };
+        crate::config::save(&paths.config, &ConfigFile { tunnels, ..ConfigFile::default() }).unwrap();
+        let mut app = App::new(paths);
+        app.open_form_create();
+        app.form.as_mut().unwrap().ssh_host.set("cloud_pc");
+        app.form.as_mut().unwrap().set_import_table("cloud_pc", ImportTable::new(rows));
+        app.form.as_mut().unwrap().import_open = true;
+        (dir, app)
+    }
+
+    fn local_forward(from_port: u16, target: (&str, u16)) -> SshForward {
+        SshForward {
+            kind: ForwardKind::Local,
+            listen_addr: "127.0.0.1".into(),
+            listen_port: from_port,
+            target_host: target.0.into(),
+            target_port: target.1,
+            host_alias: "cloud_pc".into(),
+            line: 12,
+            raw: format!("LocalForward {from_port} {}:{}", target.0, target.1),
+        }
+    }
+
+    #[test]
+    fn the_reported_case_a_persisted_bumped_local_port_is_not_a_new_forward() {
+        // The user's real config, exactly: `cloud_pc-L-18789` was created while
+        // 18789 was busy, so the **bumped** local port (18790) is what sits in
+        // config.toml — the original request is not recorded anywhere. `~/.ssh/config`
+        // still declares `LocalForward 18789 127.0.0.1:18789`, so a re-import asks
+        // for 18789 while the saved tunnel holds 18790. That mismatch must not
+        // hide the duplicate: the local port is a derived value, not identity.
+        let port = free_port();
+        let bumped = port.wrapping_add(1).max(1024);
+        let saved = saved(1, "cloud_pc-L", "cloud_pc", bumped, ("127.0.0.1", port));
+        let (_d, mut app) = app_with_saved(vec![saved], vec![local_forward(port, ("127.0.0.1", port))]);
+
+        let batch = app.validated_import_batch_outcome().expect("a batch exists");
+        assert!(batch.configs.is_empty(), "the duplicate must not be planned for creation");
+        assert_eq!(batch.skipped.len(), 1, "and it must be reported as skipped: {:?}", batch.skipped);
+        assert!(batch.skipped[0].contains(&port.to_string()));
+
+        // The old accessor keeps its shape and is equally empty.
+        assert!(app.validated_import_batch().is_none_or(|v| v.is_empty()));
+        app.commit_form_create_from_import();
+        assert_eq!(app.tunnels.len(), 1, "nothing was created, the saved tunnel is still the only one");
+        assert!(app.form.is_none(), "the form closes: there was nothing wrong with what the user asked for");
+    }
+
+    #[test]
+    fn one_duplicate_and_one_new_row_creates_only_the_new_one() {
+        let dup_port = free_port();
+        let new_port = free_port();
+        let saved = saved(1, "cloud_pc-L-old", "cloud_pc", dup_port, ("127.0.0.1", dup_port));
+        let (_d, mut app) = app_with_saved(
+            vec![saved],
+            vec![local_forward(dup_port, ("127.0.0.1", dup_port)), local_forward(new_port, ("10.0.0.9", 8080))],
+        );
+
+        let batch = app.validated_import_batch_outcome().expect("batch");
+        assert_eq!(batch.configs.len(), 1, "only the genuinely new forward is created");
+        assert_eq!(batch.configs[0].remote_host, "10.0.0.9");
+        assert_eq!(batch.skipped.len(), 1);
+        assert!(batch.skipped[0].contains(&dup_port.to_string()));
+
+        app.commit_form_create_from_import();
+        assert_eq!(app.tunnels.len(), 2, "the saved tunnel plus the one new forward");
+    }
+
+    #[test]
+    fn the_status_says_how_many_rows_were_skipped() {
+        let dup_port = free_port();
+        let saved = saved(1, "cloud_pc-L-old", "cloud_pc", dup_port, ("127.0.0.1", dup_port));
+        let (_d, mut app) = app_with_saved(
+            vec![saved],
+            vec![local_forward(dup_port, ("127.0.0.1", dup_port)), local_forward(free_port(), ("10.0.0.9", 8080))],
+        );
+        app.commit_form_create_from_import();
+        let status = app.status.as_ref().map(|s| s.text.clone()).unwrap_or_default();
+        assert!(status.contains('1'), "the status should mention the skipped row: {status:?}");
+        assert!(status.contains("跳过") || status.contains("skip"), "{status:?}");
+    }
+
+    #[test]
+    fn two_rows_of_one_batch_that_are_the_same_forward_collapse_to_one() {
+        // `Host *` repeating a block: same forward twice in one import batch.
+        let port = free_port();
+        let (_d, mut app) = app_with_saved(
+            vec![],
+            vec![local_forward(port, ("127.0.0.1", port)), local_forward(port, ("127.0.0.1", port))],
+        );
+        let batch = app.validated_import_batch_outcome().expect("batch");
+        assert_eq!(batch.configs.len(), 1, "the first row wins, the second is the same forward");
+        assert_eq!(batch.skipped.len(), 1);
+    }
+
+    #[test]
+    fn the_same_directive_reimported_after_an_in_process_bump_is_skipped() {
+        // The other half of the same bug: the saved tunnel holds the plain port and
+        // *this* import is the one that gets bumped (the port is taken by the saved
+        // tunnel itself). Same forward either way.
+        let port = free_port();
+        let saved = saved(1, "cloud_pc-L", "cloud_pc", port, ("127.0.0.1", port));
+        let (_d, mut app) = app_with_saved(vec![saved], vec![local_forward(port, ("127.0.0.1", port))]);
+        let batch = app.validated_import_batch_outcome().expect("a batch exists");
+        assert!(batch.configs.is_empty(), "the planned port differs but the forward is the same");
+        assert_eq!(batch.skipped.len(), 1);
+    }
+
+    #[test]
+    fn two_declarations_differing_only_in_the_local_port_collapse_into_one() {
+        // Documented known boundary: `-L`'s local listen port is not identity, so
+        // one remote target yields one forward even when `~/.ssh/config` declares
+        // two local listeners for it. Deliberate: a missed duplicate leaves the
+        // user unable to clear the duplicate row at all.
+        let port = free_port();
+        let (_d, mut app) = app_with_saved(
+            vec![],
+            vec![local_forward(port, ("10.0.0.1", 80)), {
+                let mut second = local_forward(port.wrapping_add(7).max(1024), ("10.0.0.1", 80));
+                second.line = 13;
+                second
+            }],
+        );
+        let batch = app.validated_import_batch_outcome().expect("batch");
+        assert_eq!(batch.configs.len(), 1, "one target, one forward");
+        assert_eq!(batch.skipped.len(), 1);
+    }
+
+    #[test]
+    fn a_different_remote_end_still_gets_created() {
+        // Counter-example borrowed from the identity rules: the local side is the
+        // same, but a different remote target is a different forward.
+        let port = free_port();
+        let saved = saved(1, "cloud_pc-L-web", "cloud_pc", port, ("10.0.0.1", 80));
+        let (_d, mut app) = app_with_saved(vec![saved], vec![local_forward(port, ("10.0.0.2", 80))]);
+        let batch = app.validated_import_batch_outcome().expect("batch");
+        assert_eq!(batch.configs.len(), 1, "a different target is a different forward");
+        assert!(batch.skipped.is_empty());
+    }
+
+    #[test]
+    fn a_different_ssh_host_still_gets_created() {
+        let port = free_port();
+        let mut other_host = saved(1, "dev-box-L", "dev-box", port, ("127.0.0.1", port));
+        other_host.name = "dev-box-L".into();
+        let (_d, mut app) = app_with_saved(vec![other_host], vec![local_forward(port, ("127.0.0.1", port))]);
+        let batch = app.validated_import_batch_outcome().expect("batch");
+        assert_eq!(batch.configs.len(), 1, "a forward on another host is another forward");
+        assert!(batch.skipped.is_empty());
     }
 }

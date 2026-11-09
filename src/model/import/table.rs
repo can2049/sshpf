@@ -7,7 +7,8 @@
 //! The per-column filters and their undo stack live in [`super::filter`], but
 //! they are the same `ImportTable`: both files contribute an `impl` block.
 //!
-//! Belongs here: row storage, cursor/scroll invariants, selection.
+//! Belongs here: row storage, cursor/scroll invariants, selection, the `touched`
+//! flag that tells a *default* tick apart from a user instruction.
 //! Does not belong: filtering (see `super::filter`), rendering, key handling.
 
 use super::row::{ImportColumn, ImportRow};
@@ -31,6 +32,20 @@ pub struct ImportTable {
     /// Filter snapshots for undo (`z`). Newest last. `pub(super)` because the
     /// filter half of this type lives in `super::filter`.
     pub(super) history: Vec<[String; ImportColumn::COUNT]>,
+    /// Whether the user has expressed an intention *about these rows*.
+    ///
+    /// `false` means the tick marks are only the default the table arrived with
+    /// (every importable row ticked, see [`ImportTable::new`]). `true` means the
+    /// user ticked, unticked, re-ticked, inverted, or changed a filter — i.e. the
+    /// selection is their instruction rather than the offered default.
+    ///
+    /// The submit path needs this distinction: an untouched pane is a
+    /// *proposal*, so a complete hand-filled form may outrank it; once touched,
+    /// the pane's ticks are what the user means by "save". Nothing in the table
+    /// reads it — it is a message from the interaction layer to the router — and
+    /// cursor movement deliberately does not set it: looking at rows is not
+    /// choosing them.
+    pub touched: bool,
 }
 
 impl ImportTable {
@@ -51,6 +66,9 @@ impl ImportTable {
             filters: std::array::from_fn(|_| String::new()),
             editing: None,
             history: Vec::new(),
+            // Freshly discovered rows are the *default offer*; only a user action
+            // turns them into an instruction.
+            touched: false,
         }
     }
 
@@ -134,7 +152,18 @@ impl ImportTable {
 
     // -- selection ---------------------------------------------------------
 
+    /// Record that the user has expressed an intention about these rows.
+    ///
+    /// Called by every selection/filter mutator that a *key press or click* can
+    /// reach. Deliberately not called from navigation (`move_cursor`, `home`,
+    /// `end`, `clamp_cursor`, `ensure_visible`) or construction: those only move
+    /// a highlight or establish the default.
+    pub(super) fn touch(&mut self) {
+        self.touched = true;
+    }
+
     pub fn toggle_cursor(&mut self) {
+        self.touch();
         if let Some(&idx) = self.visible().get(self.cursor)
             && let Some(row) = self.rows.get_mut(idx)
             && row.importable()
@@ -148,6 +177,7 @@ impl ImportTable {
     /// Filtered, not all: with a filter active the user is looking at a subset,
     /// and a "全选" that silently checked hidden rows would be a footgun.
     pub fn check_all_visible(&mut self) {
+        self.touch();
         for idx in self.visible() {
             if let Some(row) = self.rows.get_mut(idx)
                 && row.importable()
@@ -158,6 +188,7 @@ impl ImportTable {
     }
 
     pub fn uncheck_all_visible(&mut self) {
+        self.touch();
         for idx in self.visible() {
             if let Some(row) = self.rows.get_mut(idx) {
                 row.checked = false;
@@ -166,6 +197,7 @@ impl ImportTable {
     }
 
     pub fn invert_visible(&mut self) {
+        self.touch();
         for idx in self.visible() {
             if let Some(row) = self.rows.get_mut(idx)
                 && row.importable()
@@ -198,6 +230,38 @@ mod tests {
     use super::*;
     use crate::model::ForwardKind;
     use crate::model::fixtures::{fwd, sample_table};
+
+    #[test]
+    fn a_fresh_table_is_untouched_and_navigation_cannot_change_that() {
+        // `touched` answers "did the user express an intention about these
+        // rows?". Looking at them is not an intention: the submit router lets a
+        // complete hand-filled form outrank an untouched pane, so a cursor move
+        // must never silently hand the pane the save key.
+        let mut t = sample_table();
+        assert!(!t.touched, "discovered rows are a default offer");
+        t.move_cursor(2);
+        t.home();
+        t.end();
+        t.ensure_visible(2);
+        t.clamp_cursor();
+        assert!(!t.touched, "navigation must not look like a decision");
+    }
+
+    #[test]
+    fn every_selection_change_marks_the_table_touched() {
+        // One test per mutator the key handler can reach: each is a deliberate
+        // act on the ticks, so each must set the flag.
+        for mutate in [
+            ImportTable::toggle_cursor as fn(&mut ImportTable),
+            ImportTable::uncheck_all_visible,
+            ImportTable::check_all_visible,
+            ImportTable::invert_visible,
+        ] {
+            let mut t = sample_table();
+            mutate(&mut t);
+            assert!(t.touched, "{} must mark the table touched", std::any::type_name_of_val(&mutate));
+        }
+    }
 
     #[test]
     fn every_importable_row_starts_checked() {
