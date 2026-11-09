@@ -64,7 +64,24 @@ pub fn endpoint_for(config_path: &Path) -> Endpoint {
 /// `runtime_dir` is preferred because it is per-user (`0700`), cleared at
 /// logout, and never world-writable — `/tmp` is `1777`, so a socket there would
 /// be reachable by anyone who guesses the name.
+///
+/// `$SSHPF_SOCKET_DIR` overrides the whole thing. It exists for tests: two test
+/// binaries sharing one `$XDG_RUNTIME_DIR` would share one lock file and one
+/// socket name per config, so they would elect each other's servers (and a
+/// leftover worker would make the next run fail for reasons unrelated to the
+/// code under test). It is also the documented workaround when `$HOME` is on a
+/// filesystem where the runtime dir is unusable.
 fn socket_dir() -> PathBuf {
+    socket_dir_with(std::env::var_os("SSHPF_SOCKET_DIR"))
+}
+
+/// The pure half of [`socket_dir`], so the override can be tested without
+/// mutating process-global state (`std::env::set_var` is `unsafe` in edition
+/// 2024, and this crate confines `unsafe` to the crash writer).
+fn socket_dir_with(override_dir: Option<std::ffi::OsString>) -> PathBuf {
+    if let Some(dir) = override_dir {
+        return PathBuf::from(dir);
+    }
     match dirs::runtime_dir() {
         Some(base) => base.join("sshpf"),
         None => std::env::temp_dir().join("sshpf-ipc"),
@@ -187,6 +204,25 @@ mod tests {
         let normalized = normalize(Path::new("/../../config.toml"));
         assert!(normalized.is_absolute(), "{normalized:?}");
         assert!(normalized.ends_with("config.toml"));
+    }
+
+    /// The override must win, because it is the only way two test binaries can
+    /// share one machine without electing each other's servers.
+    #[test]
+    fn the_socket_dir_can_be_overridden_for_isolation() {
+        let dir = std::env::temp_dir().join("sshpf-sockdir-override-test");
+        assert_eq!(
+            socket_dir_with(Some(dir.clone().into_os_string())),
+            dir,
+            "an explicit override must be honoured verbatim"
+        );
+    }
+
+    #[test]
+    fn without_an_override_the_runtime_dir_is_used() {
+        let dir = socket_dir_with(None);
+        let expected_base = dirs::runtime_dir().unwrap_or_else(std::env::temp_dir);
+        assert!(dir.starts_with(&expected_base), "{dir:?} must live under {expected_base:?}");
     }
 
     #[test]

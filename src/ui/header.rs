@@ -21,6 +21,7 @@ use ratatui::widgets::Paragraph;
 
 use crate::app::App;
 use crate::config;
+use crate::help;
 use crate::model::{LogLevel, now_hms};
 use crate::text::{display_width, truncate_to_width};
 use crate::ui::frame::band;
@@ -45,19 +46,24 @@ pub(crate) fn draw_title(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         format!("ssh-config: {} hosts", app.hosts.len())
     };
+    // Which process owns the state, and how many windows are sharing it. This is
+    // not decoration: closing the last client stops every forward, so the user
+    // has to be able to see that they are one of several — or the only one.
+    let session = session_label(app);
     // Progressive disclosure: the absolute config path is the first thing to go
     // when it would collide with the clock, then the host count.
     let left = if area.width >= 84 {
         format!(
-            " sshpf {}  ·  {}  ·  cfg: {} ",
+            " sshpf {}  ·  {}  ·  {}{session}  ·  cfg: {} ",
             env!("CARGO_PKG_VERSION"),
             ssh_hosts,
+            "",
             config::display_path(&app.paths.config),
         )
     } else if area.width >= 46 {
-        format!(" sshpf {}  ·  {} ", env!("CARGO_PKG_VERSION"), ssh_hosts)
+        format!(" sshpf {}  ·  {}  ·  {session}", env!("CARGO_PKG_VERSION"), ssh_hosts)
     } else {
-        format!(" sshpf {} ", env!("CARGO_PKG_VERSION"))
+        format!(" sshpf {}  ·  {session}", env!("CARGO_PKG_VERSION"))
     };
     let left = truncate_to_width(&left, left_area.width as usize);
     frame.render_widget(
@@ -67,6 +73,25 @@ pub(crate) fn draw_title(frame: &mut Frame, app: &App, area: Rect) {
 
     let clock = truncate_to_width(&now_hms(), clock_area.width as usize);
     frame.render_widget(Paragraph::new(Line::from(Span::styled(clock, p.fg(p.dim)))), clock_area);
+}
+
+/// `server` when this process owns the tunnels, `client 2/3` when it is one of
+/// several windows on a shared server.
+///
+/// The count is the server's, not a local guess, so two windows always agree
+/// about how many are open. A client whose link has dropped says so here too:
+/// a table that quietly stops updating is worse than one that admits it is stale.
+fn session_label(app: &App) -> String {
+    if !app.is_mirror() {
+        return help::bi("服务端/server", "server");
+    }
+    match app.conn_state() {
+        Some(crate::app::remote::ConnState::Lost(_)) => help::bi("已断开/detached", "detached"),
+        _ => {
+            let n = app.remote_client_count().unwrap_or(1);
+            help::bi(&format!("客户端 {n}/client {n}"), &format!("client {n}"))
+        }
+    }
 }
 
 pub(crate) fn draw_counters(frame: &mut Frame, app: &App, area: Rect) {
