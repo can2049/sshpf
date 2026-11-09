@@ -9,6 +9,7 @@ This repository is written for AI agents first and humans second. Everything bel
 | 你的任务 | 打开 |
 |---|---|
 | **任何任务的第一步** | [`docs/index.md`](docs/index.md) — 任务 → 文档 → 代码 的查找表 |
+| **要改代码（新特性 / 修 bug）** | 先开 worktree：见下节「一特性一 worktree」 |
 | 不知道新功能该放哪个模块 | [`docs/architecture.md`](docs/architecture.md) |
 | 要改按键 / 帮助文案 | [`docs/agents.md`](docs/agents.md#加按键--add-a-key) + [`docs/keymap.md`](docs/keymap.md) |
 | 要改渲染 / 加面板 | [`docs/tui.md`](docs/tui.md) |
@@ -17,6 +18,20 @@ This repository is written for AI agents first and humans second. Everything bel
 | 要写测试 / 跑测试 | [`docs/testing.md`](docs/testing.md) |
 | 想知道「为什么不用 unwrap / unsafe 在哪」 | [`docs/security.md`](docs/security.md) |
 | 提交前自检 | [`docs/agents.md`](docs/agents.md#提交前自检--pre-flight-checklist) |
+
+## 一特性一 worktree / One worktree per change
+
+**开发新特性、修复问题，先新开一个 worktree + 分支再动手**。不在共享 checkout 里改代码：未提交改动、git index、`target/` 都是共享的，几个人（agent 或人）在里面并行，谁 checkout 一下、谁 `cargo fmt --all` 一下，就把别人的工作打断了。
+
+```bash
+git worktree add .agents/worktrees/feat/my-feature -b feat/my-feature origin/main
+# …开发、自检、提交、push、PR、CI 绿、合并…
+# PR 合并后必须清理：worktree 和分支都不留
+git worktree remove .agents/worktrees/feat/my-feature
+git branch -d feat/my-feature && git push origin --delete feat/my-feature
+```
+
+残留的 worktree / 分支会被当成「这条线还在进行中」，所以**合并即清理**是硬要求，不是收尾礼貌。目录命名、完整生命周期与清理清单见 [`docs/agents.md`](docs/agents.md#一特性一-worktree--one-worktree-per-change)。
 
 ## 六条硬约定 / Six hard rules
 
