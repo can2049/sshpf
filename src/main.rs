@@ -289,15 +289,25 @@ mod tests {
         }
     }
 
+    /// A signal this platform lets `signal_hook` register and `raise`, but which
+    /// is not one of [`sys::quit_signals`], so the flags flipped here cannot
+    /// interfere with the test harness.
+    #[cfg(unix)]
+    const SCRATCH_SIGNAL: i32 = signal_hook::consts::SIGUSR1;
+    /// Windows has no `SIGUSR1`. `SIGABRT` is a real CRT signal that is not in
+    /// `quit_signals`; the test registers a handler **before** raising it, so the
+    /// default abort action never runs.
+    #[cfg(windows)]
+    const SCRATCH_SIGNAL: i32 = signal_hook::consts::SIGABRT;
+
     /// The registration itself must not panic on the platform's own quit signals,
-    /// and a registered signal must flip both flags. Uses `SIGUSR1` (never in
-    /// `quit_signals`) so the assertion cannot interfere with the test harness.
+    /// and a registered signal must flip both flags.
     #[test]
     fn a_registered_flag_is_written_and_remembers_the_signal() {
         use std::sync::atomic::AtomicUsize;
         let quit = Arc::new(AtomicBool::new(false));
         let received = Arc::new(AtomicUsize::new(0));
-        let sig = signal_hook::consts::SIGUSR1;
+        let sig = SCRATCH_SIGNAL;
         assert!(
             signal_hook::flag::register_usize(sig, received.clone(), sig as usize).is_ok(),
             "flag::register_usize must accept a real signal"
