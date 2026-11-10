@@ -6,7 +6,7 @@
 
 > 历史设计稿（2026-11），写于 `src/ipc/` 落地之前。**§8.2 的兼容变更规则仍被 `src/ipc/mod.rs` 引用为契约**；
 > 其余细节以 `src/ipc/` 代码为准。两处已知偏差：传输层最终是**回环 TCP + 令牌**而非 UDS；
-> 端点用 hash 命名而非转义路径（见 [../../client-server.md](../../client-server.md) §9）。
+> 端点用 hash 命名而非转义路径（该方案已回退，原运行模型文档已删除；现行见 [../../architecture.md](../../architecture.md#进程模型--process-model)）。
 > 文中"实测"数字来自 Linux 探针（Rust 1.99.1 / `toml 1.2.x`），是当时值。
 
 ## 0. 一页结论

@@ -10,6 +10,22 @@
 
 ## [Unreleased]
 
+### 移除（**行为变更**）
+
+- **client-server 架构整体删除，回归单进程。** 一个 `sshpf` 进程拥有全部隧道：启动的那个
+  交互进程既持有转发也写 `config.toml`，不再有后台服务进程、视图进程、选举、令牌、快照广播。
+  删除 `src/ipc/`、`src/server/`、`src/client/`、`src/app/mirror.rs`、`src/app/server_api.rs`、
+  `src/eventlog/server.rs`、`src/sys/signals.rs` 与 `tests/client_server.rs`（30 个文件、约
+  4800 行 code）。
+- **CLI 参数 `--server` / `--keep-server` / `--attach-from` 删除**，环境变量 `SSHPF_IPC_DIR`
+  删除。三个参数现在是未知参数（退出码 2）。`--no-restore` 保留，语义回到"本进程启动时不自动
+  恢复 enabled 的转发"。
+- **用户可感知的三个行为变了**：① 不再有"多窗口共享同一份状态"——同一份配置开两个进程会各自
+  抢端口；② 不再有"关掉最后一个窗口才停转发"——进程退出即停掉它的全部转发；③ 标题栏不再显示
+  `客户端 N/client N`，固定显示 `单进程/owner`。
+- **日志事件 `server.*` 与 `client.*` 全部删除**（12 个）；`app.signal_unavailable` 保留，
+  改由 `main.rs` 直接写。事件词表从 71 个降到 59 个。
+
 ### 变更
 
 - **文档合并**：`import-forwards.md` / `import-pane.md` / `import-save.md` / `port-scan.md`

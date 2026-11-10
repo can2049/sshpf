@@ -1,7 +1,7 @@
 # client-server 架构调研总览 / Client-server study
 
 > **这份文档回答**：为什么要把"每个窗口自己转发"改成 client-server、实测证据是什么、有哪些代价、哪些事**不做**。
-> **不负责**：当前行为——见 [../client-server.md](../client-server.md)（该文是当前事实来源）；协议字段见 [client-server/protocol.md](client-server/protocol.md)、生命周期见 [client-server/lifecycle.md](client-server/lifecycle.md)、施工清单见 [client-server/migration.md](client-server/migration.md)。
+> **不负责**：当前行为——见 [../../docs/architecture.md#进程模型--process-model](../architecture.md#进程模型--process-model)（原 `docs/client-server.md` 已随 v0.9 回退删除）；协议字段见 [client-server/protocol.md](client-server/protocol.md)、生命周期见 [client-server/lifecycle.md](client-server/lifecycle.md)、施工清单见 [client-server/migration.md](client-server/migration.md)。
 > **相关代码路径**：`src/server/`、`src/client/`、`src/ipc/`、`src/app/mirror.rs`。
 
 > 历史调研（2026-11），写在改造之前。**方案已落地，但实现与本文有出入**：
@@ -185,7 +185,7 @@ client 崩溃、`SIGKILL`、终端被杀、SSH 断开——**没有机会弹确�
 | 协议版本 | `proto_version: 1` | 已到 2 | 后续变更按 [protocol.md](client-server/protocol.md) §8.2 的规则 bump |
 
 **结论**：本文的**判断**（全量快照、锁即真相、server 权威、最后 client 提示）全部成立并落地；
-**传输机制**被换掉了。当前事实见 [../client-server.md](../client-server.md)。
+**传输机制**被换掉了。当前该方案已回退，见 [../architecture.md](../architecture.md#进程模型--process-model)。
 
 ## 10. 文档地图
 

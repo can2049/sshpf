@@ -24,9 +24,6 @@
 | 改鼠标点击行为 | [tui.md](tui.md#命中图--hit-map) | `src/ui/hit.rs`、`src/app/mouse.rs` |
 | 改隧道启动 / 停止 / 重试 | [runtime.md](runtime.md) | `src/app/runtime.rs`、`src/tunnel.rs` |
 | 改连通性检测 / 休眠后不重连 | [runtime.md](runtime.md#健康检查--health-checks) | `src/ssh/client/health.rs` |
-| 改「谁拥有隧道」/ 多窗口共享状态 | [client-server.md](client-server.md) | `src/server/`、`src/client/`、`src/app/mirror.rs` |
-| 改 client-server 协议（消息/字段/版本） | [client-server.md](client-server.md) 与 [research/client-server/protocol.md](research/client-server/protocol.md) | `src/ipc/` |
-| 查「第二个窗口为什么连不上 / 状态为什么不一致」 | [client-server.md](client-server.md#排障--recipes) 与 [logging/events.md](logging/events.md) 的 `server.*`、`client.*` | `src/client/`、`src/server/election.rs` |
 | 改 SSH 连接 / 认证 / 主机密钥 | [runtime.md](runtime.md) 与 [design.md](design.md)；主机密钥策略见 [security.md](security.md#主机密钥--host-keys) | `src/ssh/`、`src/ssh/hostkey_conf.rs` |
 | 加一个日志事件 / 改字段 | [agents.md](agents.md#加日志事件--add-a-log-event) → [logging/events.md](logging/events.md) | `src/eventlog/` |
 | 查某个 `event=` 是什么意思 | [logging/events.md](logging/events.md) | `src/eventlog/` |
@@ -64,7 +61,6 @@
 | [keymap.md](keymap.md) | 全部按键与鼠标操作 | 实现与设计理由 |
 | [import.md](import.md) | **导入与新增全链**：发现、作用域、行去重、面板交互、`touched`、筛选、`ctrl+s` 归属、字段映射、端口顺延、对端端口扫描 | 转发身份去重与载入折叠（在 dedup） |
 | [dedup.md](dedup.md) | 转发**身份**去重：判据、三个入口、留痕、已写进配置的重复怎么折叠 | 行去重与面板交互（在 import） |
-| [client-server.md](client-server.md) | 一个 server 多个 client：角色、选举、传输层、令牌、宽限窗口、命令重新校验 | 帧格式与消息字段（在 research 协议文档） |
 | [design.md](design.md) | 关键设计决策索引（1 段 + 链接） | 任何展开叙述 |
 | [agents.md](agents.md) | 改码/写作约定与 checklist | 项目背景 |
 | [research/README.md](research/README.md) | 历史调研的定位与目录 | 当前行为 |
