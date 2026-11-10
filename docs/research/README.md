@@ -28,6 +28,10 @@ client-server 改造。结论已经落实进代码，本目录只保留**为什�
 |---|---|
 | **`russh` known_hosts 四处误判**（通配/Tab/行首空格漏判、**`@revoked` 放行被吊销的密钥**）+ 复现输出 | [pure-rust-ssh-spike.md](pure-rust-ssh-spike.md) §8 |
 | `ssh2-config` 的 `Match` **静默污染前一个 `Host`**（复现输入/输出，本项目自研兜底的依据） | [pure-rust-ssh-spike.md](pure-rust-ssh-spike.md) §11、[pure-rust-ssh-config.md](pure-rust-ssh-config.md) §3.2 |
+| **"已在依赖树里"的可复用 crate 清单**（`unicode-width`/`ssh-key`/`glob`/`data-encoding` 经谁引入，决定"零新增"）| [oss-replacement-audit.md](oss-replacement-audit.md) §3 |
+| **`ssh-key` 解析器的两个阻塞点**（不给行号 + `trim_end`/`split_once(' ')` 空格敏感，直接换会带回 Tab/行首空格 bug）| [oss-replacement-audit.md](oss-replacement-audit.md) §1.1 |
+| **`fast-socks5` 从不自己连上游**（`read_command` 后交还目标地址，正合本项目形状）| [oss-replacement-audit.md](oss-replacement-audit.md) §1.3 |
+| **`text.rs:28` 指向的 `design.md` 依据不存在**（grep 无 `unicode`/`width`/`emoji`）| [oss-replacement-audit.md](oss-replacement-audit.md) §5 |
 | `tcpip_forward` 非 0 端口成功时返回 `Ok(0)` 的封装规则 | [pure-rust-ssh-spike.md](pure-rust-ssh-spike.md) §4 |
 | `ring` vs `aws-lc-rs` 跨平台构建对比（9×gcc vs 59×gcc+NASM+CMake） | [pure-rust-ssh-spike.md](pure-rust-ssh-spike.md) §10 |
 | 系统 `ssh -v` 七类失败 stderr 原文（v1 分类规则的出处） | [tech-options.md](tech-options.md) §2.2 |
@@ -52,6 +56,7 @@ client-server 改造。结论已经落实进代码，本目录只保留**为什�
 | [pure-rust-ssh-spike.md](pure-rust-ssh-spike.md) | **实测主档**：三种转发 + ProxyJump 跑通、性能数字、known_hosts 缺陷（§8）、错误分类 | 312 |
 | [pure-rust-ssh-russh.md](pure-rust-ssh-russh.md) | `russh` API 速查：哪项能力对哪个函数、签名陷阱 | 78 |
 | [pure-rust-ssh-config.md](pure-rust-ssh-config.md) | config/密钥/agent/known_hosts 生态选型：候选 crate 对比、六处缺陷、依赖增量 | 377 |
+| [oss-replacement-audit.md](oss-replacement-audit.md) | **自研逻辑盘点**：哪些 SSH/基础设施逻辑能换开源 crate、逐条否决理由、建议（SOCKS5 减代码 / `unicode-width` 修 bug）、**两处自我更正** | 330 |
 | [client-server.md](client-server.md) | client-server 调研总览：为什么做、代价、52 条断言、**本文预测 vs 实际落地** | 196 |
 | [client-server/protocol.md](client-server/protocol.md) | 帧格式、消息全集、命令、TOML 限制、体积预算、**§8.2 兼容变更契约** | 348 |
 | [client-server/lifecycle.md](client-server/lifecycle.md) | 选举顺序、计数与宽限、关服时序、信号、崩溃重连 | 259 |
