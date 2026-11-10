@@ -159,4 +159,4 @@ panic 走 hook（链式调用上一个，所以 ratatui 恢复终端照常生效
 ## D37 宽度用 `unicode-width` 量字符串，不手维护区间表、不逐字符相加
 原先 `text.rs` 手维护一张 East-Asian 宽度区间表，并假设 `display_width` = 各字符宽度之和。两个假设都是错的：① 表只返回 1 或 2，**永远不返回 0**，于是组合符（combining mark）、零宽连接符（ZWJ）、变体选择符都被当成占一列；② **字符串宽度不是逐字符相加**——ZWJ 序列 `👨‍👩‍👧` 是一个 2 列字形，逐字符相加得 8。表格里带 emoji 的行因此整体错位。
 现在 `char_width` / `display_width` 直接走 `unicode-width`（UAX #11）。**零新增依赖**：它早已在依赖树里（经 `ratatui-core`），提升为直接依赖只是让本模块与终端、ratatui 用同一把尺子。代价是三条连带规则，都写进了 `src/text.rs` 的头注释：字符宽度可能是 **0**；`display_width` 必须**量整串**；因此 `truncate_to_width` 与 `wrap` 用**前缀测量**而不是累加，否则会超出预算或截断字形。
-→ `src/text.rs` · 见 [research/oss-replacement-audit.md](research/oss-replacement-audit.md) §2.1
+→ `src/text.rs`、`Cargo.toml`（`unicode-width`）
