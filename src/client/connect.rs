@@ -21,6 +21,17 @@
 //! bind a second copy of the same ports. [`AttachError::may_spawn`] is where that
 //! decision is made once, instead of at every call site.
 //!
+//! # Why the error code does not decide it
+//!
+//! "Nobody home" cannot be read reliably off a dial result. A refused loopback
+//! connect does not always report as `ConnectionRefused`: on a Windows host with a
+//! network filter in the path it can take about two seconds to come back, which
+//! outlasts [`ipc::CONNECT_TIMEOUT`] and surfaces as `TimedOut` instead. Treating
+//! that as "a server is running" leaves the user with a timeout and no server,
+//! forever. So an ambiguous dial failure is put to the singleton lock
+//! ([`ipc::no_live_server`]), which holds the answer directly: a live server holds
+//! it for its whole life and the kernel frees it when the process dies.
+//!
 //! Belongs here: reading the endpoint files, dialling, and the greeting.
 //! Does not belong: moving frames ([`super::link`]), reconnecting
 //! ([`super::reconnect`]), what a frame means to the UI ([`super::sync`]), or
@@ -99,8 +110,33 @@ impl AttachError {
     ///
     /// Deliberately narrow: only "nobody is home". A refused token or a version
     /// mismatch means a server *is* running.
+    ///
+    /// [`AttachError::NoServer`] is produced only after the lock has agreed that
+    /// nothing is serving (see [`classify`]), so this answer is authoritative rather
+    /// than inferred from an error code.
     pub fn may_spawn(&self) -> bool {
         matches!(self, AttachError::NoServer(_))
+    }
+
+    /// Whether waiting could still turn this into a connection.
+    ///
+    /// This is *not* [`Self::may_spawn`] and must not be folded into it: the two
+    /// answer different questions. `may_spawn` asks "is nobody serving, so I should
+    /// start one?" — the answer to that is a fact about the lock. This asks "is this
+    /// failure consistent with a server that exists but is not ready, so a caller
+    /// already waiting for one should keep waiting?" — and a timeout while a server
+    /// is booting is exactly that, even though it is not a reason to spawn.
+    ///
+    /// Getting this wrong is what made a freshly spawned server unusable: the child
+    /// holds the lock the moment it elects itself but has not bound yet, so a dial
+    /// during that window is a timeout that classifies as [`AttachError::Io`]. Treated
+    /// as final, it aborted the spawn wait on the spot and the user saw a timeout
+    /// instead of the server that was starting right behind it.
+    ///
+    /// Only a peer that *answered* and refused us is final: it will answer the same
+    /// way a moment later.
+    pub fn worth_waiting_out(&self) -> bool {
+        matches!(self, AttachError::NoServer(_) | AttachError::Io(_))
     }
 
     /// Whether a server was reached at all.
@@ -159,7 +195,7 @@ fn open(endpoint: &Endpoint) -> Result<(TcpStream, String), AttachError> {
     let token = ipc::read_token(endpoint).map_err(|e| {
         AttachError::NoServer(io::Error::new(e.kind(), format!("{}: {e}", endpoint.token_path.display())))
     })?;
-    let stream = ipc::connect(endpoint).map_err(classify)?;
+    let stream = ipc::connect(endpoint).map_err(|e| classify(endpoint, e))?;
     Ok((stream, token))
 }
 
@@ -208,10 +244,32 @@ fn reject(e: &ipc::ProtocolError) -> AttachError {
 }
 
 /// Classify a discovery/connect failure into "nobody home" or a real failure.
-fn classify(e: io::Error) -> AttachError {
+///
+/// # Why the error kind is not the whole answer
+///
+/// The obvious rule — refused or missing means "nobody home" — is unreliable,
+/// because a refused loopback connect does not always *report* as refused. On a
+/// Windows host with a network filter driver in the path, a refused connect to
+/// `127.0.0.1` can take around two seconds, which is longer than
+/// [`ipc::CONNECT_TIMEOUT`], so the call gives up first and yields `TimedOut`.
+/// Taking that at face value strands the user: the client decides a server must be
+/// running, refuses to spawn, and prints a timeout while nothing is listening at all.
+///
+/// So the kind only settles the cases it genuinely settles. Otherwise the lock
+/// decides ([`ipc::no_live_server`]), which answers the actual question — "is
+/// anything serving?" — instead of guessing it from a symptom.
+fn classify(endpoint: &Endpoint, e: io::Error) -> AttachError {
     match e.kind() {
+        // Certain: no file, or the listener actively turned us away.
         io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => AttachError::NoServer(e),
-        _ => AttachError::Io(e),
+        // Ambiguous: a timeout can be a filter delaying a refusal, so ask the lock.
+        // An unusable lock is reported as `Io` — spawning cannot help when the
+        // endpoint directory is that broken.
+        _ => match ipc::no_live_server(endpoint) {
+            Ok(true) => AttachError::NoServer(e),
+            Ok(false) => AttachError::Io(e),
+            Err(_) => AttachError::Io(e),
+        },
     }
 }
 
@@ -254,6 +312,60 @@ mod tests {
         let text = err.message();
         assert!(text.contains("没有正在运行的 sshpf 服务端"), "{text}");
         assert!(text.contains("No sshpf server is running"), "{text}");
+    }
+
+    /// The bug this guards: a stale endpoint whose port nothing listens on, where the
+    /// refusal arrives too late to be recognised as one.
+    ///
+    /// Windows can take ~2 s to report a refused loopback connect when a filter
+    /// driver is in the path, which outlasts `CONNECT_TIMEOUT` and surfaces as
+    /// `TimedOut`. Classifying that by error kind alone said "a server must be
+    /// running", so the client skipped the spawn and exited with a timeout while the
+    /// port was dead — the exact failure users hit. The lock is what settles it.
+    #[test]
+    fn a_dial_timeout_with_a_free_lock_is_still_no_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint = endpoint_in(dir.path(), "deadlock");
+        // A published port nobody listens on: the stale-endpoint shape.
+        let (listener, port) = ipc::bind_loopback().expect("bind to learn a free port");
+        ipc::write_port(&endpoint, port).expect("publish");
+        ipc::write_token(&endpoint, "t").expect("token");
+        drop(listener); // the port is now dead, but the files still name it
+
+        // Feed `classify` the error a slow refusal produces, without depending on
+        // this host actually being slow: the kind is the input that matters.
+        let timed_out = io::Error::new(io::ErrorKind::TimedOut, "connection timed out");
+        let err = classify(&endpoint, timed_out);
+        assert!(err.may_spawn(), "a free lock proves nothing is serving, so spawning is right");
+        assert_eq!(err.code(), "no_server", "the user must not be told the server is unreachable");
+    }
+
+    /// The mirror image, and the reason the lock is consulted instead of simply
+    /// treating every timeout as "nobody home": while a server is starting up it
+    /// holds the lock but may not accept yet, and that must not spawn a second one.
+    #[test]
+    fn a_dial_timeout_with_a_held_lock_is_not_our_problem_to_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint = endpoint_in(dir.path(), "busy");
+        let held = ipc::try_become_singleton(&endpoint.lock_path).expect("acquire");
+        assert!(held.is_some(), "the test must actually hold the lock");
+        let timed_out = io::Error::new(io::ErrorKind::TimedOut, "connection timed out");
+        let err = classify(&endpoint, timed_out);
+        assert!(!err.may_spawn(), "a held lock means someone is serving or starting up");
+        assert_eq!(err.code(), "io");
+    }
+
+    /// A refusal is recognised without touching the lock, so the common fast path
+    /// stays exactly as it was.
+    #[test]
+    fn a_refused_connection_needs_no_lock_consultation() {
+        let dir = tempfile::tempdir().unwrap();
+        // Deliberately no lock file is created: consulting it would create one.
+        let endpoint = endpoint_in(dir.path(), "refused-no-lock");
+        let refused = io::Error::new(io::ErrorKind::ConnectionRefused, "refused");
+        let err = classify(&endpoint, refused);
+        assert!(err.may_spawn());
+        assert!(!endpoint.lock_path.exists(), "a plain refusal must not create lock files as a side effect");
     }
 
     #[test]

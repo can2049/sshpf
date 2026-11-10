@@ -59,6 +59,6 @@ pub use snapshot::{
     level_from_token, level_token,
 };
 pub use transport::{
-    CONNECT_TIMEOUT, HANDSHAKE_TIMEOUT, bind_loopback, connect, generate_token, prepare_dir, read_port, read_token,
-    remove_files, try_become_singleton, write_port, write_token,
+    CONNECT_TIMEOUT, HANDSHAKE_TIMEOUT, bind_loopback, connect, generate_token, no_live_server, prepare_dir, read_port,
+    read_token, remove_files, try_become_singleton, write_port, write_token,
 };

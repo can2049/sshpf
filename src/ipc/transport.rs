@@ -150,6 +150,42 @@ pub fn try_become_singleton(lock_path: &std::path::Path) -> io::Result<Option<Fi
     }
 }
 
+/// Whether *no* server is serving this endpoint's config, decided by the lock.
+///
+/// This is the authority for "should a client start a server?", which is a
+/// different question from "did the dial succeed". A dial can fail for reasons that
+/// say nothing about whether a server exists — most importantly, on some Windows
+/// hosts a **refused** loopback connect takes longer than [`CONNECT_TIMEOUT`] to
+/// come back, so it surfaces as `TimedOut` instead of `ConnectionRefused`. Reading
+/// that as "a server is running" strands the user: the client refuses to spawn,
+/// prints a timeout, and exits while nothing at all is listening.
+///
+/// The lock answers the question directly. A live server holds it for its whole
+/// life and the kernel releases it the moment the process dies, so *being able to
+/// take it* proves nobody is serving. That is the same fact the election relies on,
+/// asked without the guesswork.
+///
+/// The lock is taken and dropped immediately: the caller only wants the answer, and
+/// the server it goes on to spawn runs its own election.
+///
+/// * `Ok(true)` — nothing is serving; starting a server is the right move.
+/// * `Ok(false)` — a server holds the lock: serving already, or still starting up.
+/// * `Err(_)` — the lock cannot be used at all, so the question is unanswerable.
+///   Callers must not read this as "go ahead and spawn": a directory broken enough
+///   to fail the lock would fail the child's election in exactly the same way.
+pub fn no_live_server(endpoint: &Endpoint) -> io::Result<bool> {
+    match try_become_singleton(&endpoint.lock_path) {
+        Ok(Some(lock)) => {
+            // Dropped at once: holding it would make the server we are about to
+            // spawn lose its own election.
+            drop(lock);
+            Ok(true)
+        }
+        Ok(None) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 /// Whether a failed [`File::try_lock`] means "already locked" rather than a real
 /// I/O problem.
 ///
@@ -273,6 +309,34 @@ mod tests {
         drop(held);
         let again = try_become_singleton(&endpoint.lock_path).expect("re-acquire");
         assert!(again.is_some(), "process death / drop must free the lock");
+    }
+
+    #[test]
+    fn an_unlocked_endpoint_reports_no_live_server() {
+        // The first-run / post-crash case: nothing serves this config, so a client
+        // must be told to start one.
+        let (_d, endpoint) = temp_endpoint("nobody");
+        assert!(no_live_server(&endpoint).expect("a usable lock must answer"), "nothing is serving");
+    }
+
+    #[test]
+    fn a_held_lock_reports_a_live_server() {
+        // A server holds this for its whole life, so the answer must be "someone is
+        // already serving" and the caller must not spawn a second one.
+        let (_d, endpoint) = temp_endpoint("someone");
+        let held = try_become_singleton(&endpoint.lock_path).expect("acquire");
+        assert!(held.is_some(), "the test must actually hold the lock");
+        assert!(!no_live_server(&endpoint).expect("a usable lock must answer"), "a held lock means someone serves");
+    }
+
+    /// The probe must not keep the lock it took, or the server the caller then spawns
+    /// would lose its own election and exit, leaving the client with nothing.
+    #[test]
+    fn the_no_live_server_probe_releases_the_lock_it_borrowed() {
+        let (_d, endpoint) = temp_endpoint("borrow");
+        assert!(no_live_server(&endpoint).expect("first probe"));
+        let after = try_become_singleton(&endpoint.lock_path).expect("the probe must have released it");
+        assert!(after.is_some(), "a borrowed lock must be dropped before returning");
     }
 
     #[test]
