@@ -188,6 +188,4 @@ grep -E 'event=(action\.target_missing|import\.click_stale)' "$L"
 
 ## 隐私
 
-写：主机名、端口、用户名、失败原因、路径、版本、pid、栈。**从不写**：私钥内容、passphrase、`known_hosts` 内容、任何从 agent 读出的密钥材料。
-
-主机名和用户名仍是敏感信息，报 bug 前如果不方便公开，可以先 `sed -E 's/(host|name)=[^ ]*/\1=REDACTED/g'` 处理一遍。权限与脱敏的完整边界见 [security.md](security.md#日志脱敏--redaction)。
+写：主机名、端口、用户名、失败原因、路径、版本、pid、栈。**从不写**私钥、passphrase、`known_hosts` 内容、任何从 agent 读出的密钥材料。主机名和用户名仍属敏感：报 bug 前可用 `sed -E 's/(host|name)=[^ ]*/\1=REDACTED/g'` 处理一遍。完整的写/不写对照表与权限边界见 [security.md](security.md#日志脱敏--redaction)。

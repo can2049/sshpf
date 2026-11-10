@@ -50,13 +50,10 @@
 | `d` | 删除当前行（先确认） | Delete the selected row (asks first) |
 | `enter` / `l` | 打开详情 / 完整日志 | Open the detail / full-log overlay |
 | `/` | 按名称或 SSH 主机过滤 | Filter by name or SSH host |
-| `a` | 全部启用（先确认） | Enable all (asks first) |
-| `x` | 全部停用（先确认） | Disable all (asks first) |
-| `?` | 打开 / 关闭本帮助 | Open / close this help |
+| `a` / `x` | 全部启用 / 全部停用（均先确认） | Enable all / disable all (both ask first) |
 | `v` / `V` | 进入 / 退出多选模式（两个键同效） | Enter / leave selection mode (`v` and `V` are aliases) |
 | `esc` | 清除过滤（不清除列表内容） | Clear the filter (it never clears the list) |
-| `q` | 退出 sshpf（先确认） | Quit sshpf (asks first) |
-| `ctrl+c` | 等同 `q`：先弹退出确认，**不会**直接退出 | Same as `q`: asks before quitting, never quits outright |
+| `q` / `ctrl+c` | 退出 sshpf（先确认）；`ctrl+c` 等同 `q`，**不会**直接退出 | Quit sshpf (asks first); `ctrl+c` never quits outright |
 
 说明 / Notes:
 
@@ -75,10 +72,7 @@
 | `J` / `shift+↓` / `K` / `shift+↑` | 从锚点向下 / 向上扩选到光标 | Extend the marks down / up from the anchor |
 | `space` | 勾选 / 取消当前行（**不是**启停） | Mark / unmark this row (it does **not** start or stop it) |
 | `a` | 全选切换，只作用于筛选后可见行 | Toggle select-all, visible rows only |
-| `s` | 批量启用（先确认） | Batch start (asks first) |
-| `x` | 批量停用（先确认） | Batch stop (asks first) |
-| `R` | 批量重启（先确认） | Batch restart (asks first) |
-| `D` | 批量删除（先确认） | Batch delete (asks first) |
+| `s` / `x` / `R` / `D` | 批量启用 / 停用 / 重启 / 删除（全先确认）；大写不与单行 `r`/`d` 混淆 | Batch start / stop / restart / delete (all ask first) |
 
 说明 / Notes:
 
@@ -95,8 +89,7 @@
 | `tab` / `shift+tab` | 下一个 / 上一个字段 | Next / previous field |
 | `↓` / `↑` | 下移 / 上移字段高亮 | Move the field highlight down / up |
 | `enter` | 执行字段动作：文本字段进入编辑；`类型` 循环下一类型；`自动重连` 取反；`SSH 主机` 展开下拉 | Act on the field: edit text, cycle `Type`, toggle auto-restart, open the host list |
-| `←` / `h` | `类型` 字段：上一个类型（L/R/D）；`自动重连` 字段：取反 | On `Type`: the previous kind (L/R/D); on auto-restart: toggle |
-| `→` / `l` | `类型` 字段：下一个类型（L/R/D）；`自动重连` 字段：取反 | On `Type`: the next kind (L/R/D); on auto-restart: toggle |
+| `←` / `h` / `→` / `l` | `类型` 字段：上一个 / 下一个类型（L/R/D）；`自动重连` 字段：取反 | On `Type`: previous / next kind (L/R/D); on auto-restart: toggle |
 | `space` | `类型` / `自动重连` 字段：切换；`SSH 主机` 字段：展开 / 收起导入面板 | Cycle `Type`, toggle auto-restart, or toggle the import pane on `SSH host` |
 | `i` | `SSH 主机` 字段：展开 / 收起导入面板 | On `SSH host`: toggle the import pane |
 | `p` | `远端端口` 字段：扫描对端正在监听的端口 | On `Remote port`: list the peer's listening ports |
@@ -116,10 +109,8 @@
 | 按键 / Key | 中文 | English |
 |---|---|---|
 | 任意字符 | 插入到光标处 | Type to insert at the cursor |
-| `backspace` | 删除光标前一个字符 | Delete the character before the cursor |
-| `delete` | 删除光标后一个字符 | Delete the character after the cursor |
-| `←` / `→` | 光标左移 / 右移 | Move the cursor left / right |
-| `home` / `end` | 光标到行首 / 行尾 | Cursor to the start / end of the line |
+| `backspace` / `delete` | 删除光标前 / 后一个字符 | Delete the character before / after the cursor |
+| `←` / `→` / `home` / `end` | 光标左移 / 右移 / 到行首 / 到行尾 | Move the cursor left / right / to start / end |
 | `enter` / `esc` | 结束编辑，留在本字段 | Stop editing, stay on this field |
 | `tab` / `shift+tab` | 结束编辑并切到下一 / 上一字段 | Stop editing and move to the next / previous field |
 | `ctrl+s` / `f10` | 保存（结束字段编辑后提交） | Save (ends the field edit, then submits) |
@@ -142,8 +133,7 @@
 | `home` / `end` | 第一台 / 最后一台主机 | First / last host |
 | 任意字符 | 过滤主机（别名 / 地址 / 用户名） | Filter hosts by alias, address or user |
 | `backspace` | 删除一个查询字符 | Delete a query character |
-| `enter` | 选定该主机并收起下拉 | Pick this host and collapse the list |
-| `esc` | 收起下拉，**不改**字段值 | Collapse without changing the field |
+| `enter` / `esc` | 选定该主机并收起 / 收起且**不改**字段值 | Pick this host / collapse without changing the field |
 
 ## 导入面板 / Import pane
 
@@ -153,14 +143,10 @@
 |---|---|---|
 | `j` / `↓` / `k` / `↑` / `pgdn` / `pgup` / `g` / `home` / `G` / `end` | 移动 / 翻页 / 首尾行 | Move / page / first & last row |
 | `space` | 勾选 / 取消当前行 | Tick / untick the current row |
-| `a` | 全选（只作用于筛选后可见行） | Tick all visible rows |
-| `U` | 全不选（只作用于可见行） | Untick all visible rows |
-| `I` | 反选（只作用于可见行） | Invert the visible rows |
+| `a` / `U` / `I` | 全选 / 全不选 / 反选（都只作用于可见行） | Tick all / untick all / invert, visible rows only |
 | `f` | 切到下一列筛选（循环：类型→监听→目标→原始指令→类型） | Start filtering the next column (cycles) |
 | `←` / `→` | 上一列 / 下一列筛选 | Previous / next filter column |
-| `F` | 清除当前列筛选；没有筛选时提示「没有筛选可清除」 | Clear this column's filter; says so when there is none |
-| `ctrl+r` | 清除**全部**筛选 | Clear **every** filter |
-| `z` | 撤销上一次筛选改动（LIFO） | Undo the last filter change (LIFO) |
+| `F` / `ctrl+r` / `z` | 清除本列 / 清除**全部**筛选 / 撤销上一次改动（LIFO） | Clear this column / clear **every** filter / undo (LIFO) |
 | `esc` | 先退出筛选输入；不在输入时收起面板 | Leave filter input first; otherwise close the pane |
 | `i` | 收起面板 | Close the pane |
 | `ctrl+s` | 保存：勾选 N 行就生成 N 条隧道 | Save: one tunnel per ticked row |
@@ -180,8 +166,7 @@
 |---|---|---|
 | 任意字符 | 追加到当前列筛选（实时过滤） | Append to the current filter (filters live) |
 | `backspace` | 删除一个字符 | Delete a character |
-| `enter` | 结束筛选输入（面板不收起） | End filter input (the pane stays open) |
-| `esc` | 结束筛选输入（面板不收起） | End filter input (the pane stays open) |
+| `enter` / `esc` | 结束筛选输入（面板不收起） | End filter input (the pane stays open) |
 | `←` / `→` | 换到上一列 / 下一列筛选 | Switch to the previous / next column |
 | `ctrl+r` | 清除全部筛选 | Clear every filter |
 | `ctrl+z` | 撤销上一次筛选改动 | Undo the last filter change |
@@ -194,13 +179,10 @@
 |---|---|---|
 | `j` / `↓` / `k` / `↑` / `pgdn` / `pgup` / `g` / `home` / `G` / `end` | 移动 / 翻页 / 首尾行 | Move / page / first & last row |
 | `space` | 勾选 / 取消当前行 | Tick / untick this row |
-| `a` | 全选 | Tick every row |
-| `U` | 全不选 | Untick every row |
-| `I` | 反选 | Invert every row |
+| `a` / `U` / `I` | 全选 / 全不选 / 反选 | Tick all / untick all / invert |
 | `enter` | 填入当前行端口并收起列表 | Fill in this port and close the list |
 | `r` | 重新扫描（保留勾选） | Scan again (ticks are kept) |
-| `esc` | 收起列表（不改字段值） | Close the list without changing the field |
-| `i` | 收起列表（同 `esc`） | Close the list (same as `esc`) |
+| `esc` / `i` | 收起列表（不改字段值） | Close the list without changing the field |
 
 说明 / Notes:
 
