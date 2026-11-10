@@ -54,9 +54,10 @@ pub const BACKOFF_MAX: Duration = Duration::from_secs(5);
 
 /// Wait for a just-spawned server, attaching as soon as it accepts.
 ///
-/// Every failure that means "nobody home" is expected while the child boots.
-/// Anything else — a refused token, a protocol mismatch — is returned immediately,
-/// because waiting longer cannot fix it.
+/// Every failure that a booting child can still outgrow is expected here: "nobody
+/// home" while it has not bound yet, and a timeout while it holds the lock but is
+/// still starting up. Anything a *peer that answered* said — a refused token, a
+/// protocol mismatch — is returned immediately, because waiting longer cannot fix it.
 pub fn wait_for_spawn(endpoint: &Endpoint) -> Result<Connection, AttachError> {
     wait_within(endpoint, SPAWN_BUDGET, SPAWN_POLL)
 }
@@ -68,8 +69,8 @@ pub fn wait_within(endpoint: &Endpoint, budget: Duration, poll: Duration) -> Res
     loop {
         match attach(endpoint) {
             Ok(connection) => return Ok(connection),
-            // Still booting, and there is time left: the normal path.
-            Err(e) if !e.may_spawn() => return Err(e),
+            // A refusal is final; a booting child may still answer, so keep waiting.
+            Err(e) if !e.worth_waiting_out() => return Err(e),
             Err(_) if Instant::now() >= deadline => return Err(not_ready(budget)),
             Err(_) => thread::sleep(poll),
         }
@@ -210,5 +211,55 @@ mod tests {
         assert!(SPAWN_BUDGET >= Duration::from_secs(3), "{SPAWN_BUDGET:?} is too tight for a cold start");
         assert!(SPAWN_BUDGET <= Duration::from_secs(10), "{SPAWN_BUDGET:?} leaves a user waiting too long");
         assert!(SPAWN_POLL * 10 < SPAWN_BUDGET, "the poll interval must fit many times into the budget");
+    }
+
+    /// A child that has elected itself holds the lock but may not have bound yet, so
+    /// the first dials in that window time out and classify as `Io`. Treating an `Io`
+    /// as final aborted the wait on the spot and reported a timeout instead of the
+    /// server that was starting behind it — so the wait must outlast it.
+    #[test]
+    fn a_booting_server_that_holds_the_lock_is_waited_for_not_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint = endpoint_in(dir.path(), "booting");
+        // The shape of a child mid-boot: it holds the lock, but no listener yet.
+        let held = ipc::try_become_singleton(&endpoint.lock_path).expect("acquire");
+        assert!(held.is_some(), "the test must actually hold the lock");
+
+        let started = Instant::now();
+        let err = wait_within(&endpoint, Duration::from_millis(300), Duration::from_millis(10))
+            .expect_err("a server that never binds must still be reported");
+        // It must have waited out the budget rather than returning on the first dial.
+        assert!(started.elapsed() >= Duration::from_millis(250), "it must not give up on the first timeout");
+        // And then say the server was started but never became ready, not "unreachable".
+        let text = err.message();
+        assert!(text.contains("没有就绪"), "{text}");
+        assert!(!err.may_spawn(), "a server exists; spawning another cannot help");
+    }
+
+    /// The distinction that must survive the change: an answer that *refuses* us is
+    /// final even while waiting, and stays distinguishable from a booting child.
+    #[test]
+    fn a_refusal_still_ends_the_wait_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint = endpoint_in(dir.path(), "still-refused");
+        let (listener, port) = ipc::bind_loopback().expect("bind");
+        ipc::write_port(&endpoint, port).expect("port");
+        ipc::write_token(&endpoint, "t").expect("token");
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let _ = ipc::read_client_msg(&mut stream);
+            let denial = ipc::ServerMsg::Error {
+                code: "bad_token".into(),
+                error: ipc::WireError {
+                    code: "bad_token".into(), zh: "令牌不匹配".into(), en: "bad token".into()
+                },
+            };
+            let _ = ipc::write_message(&mut stream, &denial);
+        });
+        let started = Instant::now();
+        let err = wait_within(&endpoint, Duration::from_secs(30), Duration::from_millis(10))
+            .expect_err("a refusal is final even mid-wait");
+        assert!(started.elapsed() < Duration::from_secs(5), "a refusal must not consume the budget");
+        assert!(!err.worth_waiting_out(), "a peer that answered will answer the same way again");
     }
 }
