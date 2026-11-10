@@ -12,15 +12,15 @@ use std::time::Instant;
 
 use crate::config::{self, ConfigFile, Paths};
 use crate::eventlog;
+use crate::help;
 use crate::logging;
 use crate::model::{
-    BatchAction, FailureInfo, FormMode, ForwardKind, HostPicker, MultiSelect, PortPick, StatusMsg, TunnelConfig,
-    TunnelId, TunnelView,
+    FailureInfo, FormMode, ForwardKind, HostPicker, MultiSelect, PortPick, StatusMsg, TunnelConfig, TunnelId,
+    TunnelView,
 };
 use crate::ssh::SshHost;
 use crate::tunnel::{Supervisor, TunnelEvent};
 
-pub mod authority;
 pub mod confirm;
 pub mod duplicate;
 pub mod events;
@@ -29,7 +29,7 @@ pub mod form_submit;
 pub mod helpers;
 pub mod import;
 pub mod import_pane;
-pub mod lifecycle;
+pub mod mirror;
 pub mod mouse;
 pub mod overlay;
 pub mod persist;
@@ -37,12 +37,13 @@ pub mod picker;
 pub mod port_batch;
 pub mod port_scan;
 pub mod query;
-pub mod remote;
 pub mod runtime;
 pub mod select;
+pub mod server_api;
 
 pub(crate) use helpers::deadline_after;
 pub use helpers::{backoff, build_views, sanitize_config};
+pub use mirror::Mirror;
 
 pub use form::{EditMode, FormState};
 
@@ -75,50 +76,10 @@ pub const MAX_RETRY_SECS: u64 = 24 * 60 * 60;
 pub const MAX_EVENTS_PER_FRAME: usize = 4096;
 
 /// Which overlay (if any) currently captures keys.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Overlay {
-    None,
-    Help,
-    /// Create/edit form. The SSH-host dropdown lives *inside* this overlay
-    /// (`App::picker`), so it does not need its own variant.
-    Form,
-    /// Destructive-action confirmation.
-    Confirm {
-        action: ConfirmAction,
-        prompt: String,
-    },
-    /// Scrollable full detail for one tunnel.
-    Detail(TunnelId),
-    /// Inline filter editing on the main table.
-    Filter,
-}
-
-/// A destructive or otherwise consequential action awaiting confirmation.
 ///
-/// Anything that (a) loses data, (b) drops live connections, or (c) is hard to
-/// notice afterwards goes through this gate. Cheap, reversible, in-place
-/// actions (moving the cursor, filtering) deliberately do not.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ConfirmAction {
-    /// Remove one tunnel definition (loses the config entry).
-    Delete(TunnelId),
-    /// Stop one running tunnel (drops its live connections).
-    Stop(TunnelId),
-    /// Stop every running tunnel.
-    StopAll,
-    /// Restart one tunnel (briefly drops its connections).
-    Restart(TunnelId),
-    /// Start every stopped tunnel (opens many listeners at once).
-    StartAll,
-    /// Save edits to an existing tunnel (replaces its running process).
-    ApplyEdit(TunnelId),
-    /// Discard unsaved edits (loses typed input).
-    DiscardForm,
-    /// Apply one operation to every marked tunnel in selection mode.
-    Batch { action: BatchAction, count: usize },
-    /// Quit the program (kills all children).
-    Quit,
-}
+/// Defined in [`overlay`] alongside the code that opens and closes overlays; it is
+/// re-exported here because `App` holds one and every handler names it.
+pub use overlay::{ConfirmAction, Overlay};
 
 /// Per-tunnel reconnect bookkeeping, shared with the runtime module.
 #[derive(Debug, Clone, Copy)]
@@ -197,9 +158,20 @@ pub struct App {
     /// field is the hand-off between them. Empty for a clean config, which is the
     /// normal case.
     pub folded_on_load: Vec<crate::model::Folded>,
-    /// Set when this process mirrors a server instead of owning the tunnels
-    /// (`app::remote`); `None` is the authoritative mode.
-    pub(crate) remote: Option<remote::Remote>,
+    /// The client-server outbox, when this process is a **mirror** rather than the
+    /// owner of the tunnels.
+    ///
+    /// `None` is the single-process owner: every mutation acts on this process's
+    /// own `Supervisor`. `Some` means the truth lives in a server and every
+    /// mutating method must forward instead of acting — see [`app::mirror`].
+    pub(crate) mirror: Option<Mirror>,
+    /// How many clients the server says are attached (from the latest snapshot).
+    ///
+    /// Drives the "you are the last client" warning on quit. Always `1` for an
+    /// owner, which is exactly right: a single-process sshpf has one client.
+    pub client_count: u32,
+    /// Whether the server outlives its clients (mirrors the snapshot's flag).
+    pub keep_server: bool,
 }
 
 impl App {
@@ -218,25 +190,10 @@ impl App {
     /// from `~/.ssh/config` are resolved where each hop is dialled, because a
     /// `ProxyJump` chain verifies hops separately.
     pub fn with_host_key_policy(paths: Paths, host_key_policy: crate::ssh::known_hosts::HostKeyPolicy) -> Self {
-        let mut folded_on_load = Vec::new();
-        let mut cfg = match config::load_with_report(&paths.config) {
-            Ok((cfg, folded)) => {
-                eventlog::config_loaded(&config::display_path(&paths.config), cfg.tunnels.len(), &[]);
-                folded_on_load = folded;
-                cfg
-            }
-            Err(e) => {
-                // The user's definitions are about to be invisible; the log is
-                // the only place that survives to explain it afterwards.
-                eventlog::config_load_failed(&config::display_path(&paths.config), &e.to_string(), "empty_config");
-                eprintln!("警告: {e}; 以空配置启动\nWarning: {e}; starting with an empty config");
-                ConfigFile::default()
-            }
-        };
-        // `config.toml` is hand-editable, so its numeric fields are input rather
-        // than invariants. Clamp them once, here, instead of trusting them at
-        // every arithmetic site downstream.
-        sanitize_config(&mut cfg);
+        // Loading the file and building the shell are two separate concerns (and
+        // together they used to be one function too long to review), so the load —
+        // including its degraded-but-usable failure path — is its own step.
+        let (cfg, folded_on_load) = Self::load_config_for(&paths);
         let (event_tx, event_rx) = mpsc::channel();
         let tunnels = build_views(&cfg);
         App {
@@ -272,8 +229,39 @@ impl App {
             port_seq: 0,
             pending_port_skipped: Vec::new(),
             folded_on_load,
-            remote: None,
+            mirror: None,
+            // A process that owns its tunnels has exactly one client: itself.
+            client_count: 1,
+            keep_server: false,
         }
+    }
+
+    /// Load the config file, repairing it, and report what the repair did.
+    ///
+    /// A malformed file is **not** fatal: the user's definitions are invisible but
+    /// the program still starts, because a TUI that refuses to run because it cannot
+    /// parse its own config gives the user no way to fix it. The failure is recorded
+    /// and printed once.
+    ///
+    /// `config.toml` is hand-editable, so its numeric fields are input rather than
+    /// invariants. They are clamped here, once, instead of trusting them at every
+    /// arithmetic site downstream.
+    fn load_config_for(paths: &Paths) -> (ConfigFile, Vec<crate::model::Folded>) {
+        let (mut cfg, folded_on_load) = match config::load_with_report(&paths.config) {
+            Ok((cfg, folded)) => {
+                eventlog::config_loaded(&config::display_path(&paths.config), cfg.tunnels.len(), &[]);
+                (cfg, folded)
+            }
+            Err(e) => {
+                // The user's definitions are about to be invisible; the log is
+                // the only place that survives to explain it afterwards.
+                eventlog::config_load_failed(&config::display_path(&paths.config), &e.to_string(), "empty_config");
+                eprintln!("警告: {e}; 以空配置启动\nWarning: {e}; starting with an empty config");
+                (ConfigFile::default(), Vec::new())
+            }
+        };
+        sanitize_config(&mut cfg);
+        (cfg, folded_on_load)
     }
 
     // -- mutation ----------------------------------------------------------
@@ -337,8 +325,88 @@ impl App {
         None
     }
 
+    pub fn delete_selected(&mut self) {
+        let Some(id) = self.selected_id() else {
+            return;
+        };
+        self.delete_tunnel(id);
+        self.set_status(StatusMsg::info(help::bi("已删除", "Deleted")));
+    }
+
+    /// Remove one tunnel definition and its runtime state.
+    ///
+    /// Split out from [`App::delete_selected`] because the batch path deletes by
+    /// id without moving the cursor between removals (a shuffled cursor would
+    /// make `selected` mean a different tunnel on every iteration).
+    pub fn delete_tunnel(&mut self, id: TunnelId) {
+        if let Some(view) = self.tunnels.iter().find(|t| t.cfg.id == id) {
+            eventlog::tunnel_deleted(&view.cfg);
+        }
+        // A mirror asks the owner to delete: the config file is the server's to
+        // write, and removing the row locally would make the table disagree with
+        // the file until the next snapshot put it back.
+        if self.forward(crate::ipc::Op::Delete { tunnel_id: id }) {
+            return;
+        }
+        self.supervisor.stop(id);
+        self.forget_runtime_state(id);
+        self.cfg.tunnels.retain(|t| t.id != id);
+        self.tunnels.retain(|t| t.cfg.id != id);
+        let n = self.visible_indices().len();
+        self.selected = self.selected.min(n.saturating_sub(1));
+        self.persist_quietly();
+    }
+
+    /// `x`: stopping everything is a bulk destructive action.
+    pub fn request_stop_all(&mut self) {
+        if self.counts().off == self.tunnels.len() {
+            self.set_status(StatusMsg::info(help::bi("没有运行中的转发", "No forward is running")));
+            return;
+        }
+        self.ask_confirm(ConfirmAction::StopAll);
+    }
+
+    /// `a`: starting everything opens listeners; confirm once for the batch.
+    pub fn request_start_all(&mut self) {
+        if self.counts().off == 0 {
+            self.set_status(StatusMsg::info(help::bi("没有未启用的转发", "No disabled forward")));
+            return;
+        }
+        self.ask_confirm(ConfirmAction::StartAll);
+    }
+
+    pub fn start_all(&mut self) {
+        if self.forward(crate::ipc::Op::StartAll) {
+            return;
+        }
+        let ids: Vec<TunnelId> =
+            self.tunnels.iter().filter(|t| !t.status.is_running_or_pending()).map(|t| t.cfg.id).collect();
+        for id in ids {
+            self.start_tunnel_with(id, "start_all");
+        }
+    }
+
+    pub fn stop_all(&mut self) {
+        if self.forward(crate::ipc::Op::StopAll) {
+            return;
+        }
+        let ids: Vec<TunnelId> = self.tunnels.iter().map(|t| t.cfg.id).collect();
+        for id in ids {
+            self.stop_tunnel_with(id, "stop_all");
+        }
+    }
+
     /// Stop every tunnel immediately without touching persisted intent.
     pub fn shutdown(&mut self) {
+        // A mirror owns no `Supervisor`, so there is nothing here to stop — the
+        // tunnels belong to the server and outlive this process by design. It says
+        // goodbye (`Bye`) through the connection thread instead; the server
+        // decides, by recounting, whether that goodbye ends the server.
+        // Inspecting the supervisor here would be the bug the split exists to
+        // prevent, so this branch is deliberately first.
+        if self.is_mirror() {
+            return;
+        }
         let up = self.tunnels.iter().filter(|t| t.status.is_active()).count();
         logging::info("app.shutdown", &[("tunnels_active", &up), ("running", &self.supervisor.running_count())]);
         self.supervisor.stop_all();

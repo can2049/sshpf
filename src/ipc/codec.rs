@@ -117,7 +117,7 @@ pub fn check_version(peer: u32) -> Result<(), ProtocolError> {
 /// Check that the client asked for the config this server actually serves.
 ///
 /// The endpoint name is derived from the config path, so two different configs
-/// could in principle collide on one socket. Comparing the real path turns that
+/// could in principle collide on one endpoint. Comparing the real path turns that
 /// from "someone else's tunnels appear in your table" into an error.
 pub fn check_config(expected: &str, asked: &str) -> Result<(), ProtocolError> {
     if expected == asked {
@@ -127,6 +127,28 @@ pub fn check_config(expected: &str, asked: &str) -> Result<(), ProtocolError> {
         "server_config_mismatch",
         format!("这个服务端提供的是配置 {expected}，而客户端请求的是 {asked}。"),
         format!("This server serves {expected}, but the client asked for {asked}."),
+    ))
+}
+
+/// Check the token a client presented against the one this server publishes.
+///
+/// A loopback port is reachable by every local user, so this — not the socket —
+/// is the permission boundary. A wrong token is refused before any state is sent,
+/// and the message deliberately does not echo either token: the log is written to
+/// disk and must not become a copy of the secret.
+pub fn check_token(expected: &str, presented: &str) -> Result<(), ProtocolError> {
+    // Constant-time comparison would matter if the tokens were short-lived
+    // secrets facing a remote attacker; here both sides are local processes and
+    // the token never leaves the machine, so a plain equality is the honest
+    // choice: it does not claim a protection it does not need.
+    if expected == presented && !expected.is_empty() {
+        return Ok(());
+    }
+    Err(ProtocolError::new(
+        "bad_token",
+        "服务端拒绝了这次连接：访问令牌不匹配。请退出所有 sshpf 后重新启动。",
+        "The server refused this connection: the access token did not match. \
+         Quit every sshpf instance, then start again.",
     ))
 }
 
@@ -207,6 +229,32 @@ mod tests {
     #[test]
     fn a_matching_config_is_accepted() {
         assert_eq!(check_config("/a", "/a"), Ok(()));
+    }
+
+    #[test]
+    fn a_matching_token_is_accepted() {
+        assert_eq!(check_token("abc123", "abc123"), Ok(()));
+    }
+
+    #[test]
+    fn a_wrong_token_is_refused() {
+        let err = check_token("abc123", "abc124").expect_err("a wrong token must be refused");
+        assert_eq!(err.code, "bad_token");
+    }
+
+    #[test]
+    fn an_empty_published_token_never_authorises_anyone() {
+        // If the token file were somehow empty, `"" == ""` must not read as "the
+        // client is welcome": that would silently disable the only local boundary.
+        assert!(check_token("", "").is_err(), "an empty token must authorise nobody");
+    }
+
+    #[test]
+    fn the_token_error_does_not_echo_the_secret() {
+        let err = check_token("good-secret", "bad-secret").expect_err("must be refused");
+        assert!(!err.error.zh.contains("good-secret"), "{}", err.error.zh);
+        assert!(!err.error.en.contains("good-secret"), "{}", err.error.en);
+        assert!(!err.error.en.contains("bad-secret"), "{}", err.error.en);
     }
 
     #[test]

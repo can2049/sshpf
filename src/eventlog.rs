@@ -19,6 +19,7 @@
 //! | [`tunnel`] | one tunnel's lifecycle, plus per-connection forwarding | `tunnel.ready`, `tunnel.retry_scheduled`, `forward.target_failed` |
 //! | [`ssh`] | `~/.ssh/config` discovery, endpoint resolution, `known_hosts` trust decisions | `sshconfig.loaded`, `knownhosts.rejected` |
 //! | [`user`] | user intent (confirmations, imports) and degraded-but-alive UI paths | `action.applied`, `ui.slow_frame`, `form.kind_index_invalid` |
+//! | [`server`] | which process serves, who is connected, and when it shuts down | `server.start`, `server.client_connected`, `client.connected` |
 //!
 //! Add a function to the matching file and `pub use` it below; never inline a
 //! `logging::info("some.event", …)` at a call site.
@@ -34,17 +35,21 @@
 //! * `debug` — high-volume detail (per-connection forwards, frame timing).
 
 pub mod process;
+pub mod server;
 pub mod ssh;
 pub mod tunnel;
 pub mod user;
 
 pub use process::{
-    app_exit, app_start, cli_error, cli_mode, client_attach_failed, client_attached, client_disconnected,
-    client_server_spawned, config_deduped, config_defaults_clamped, config_defaults_clamped_on, config_load_failed,
-    config_loaded, config_perms_tightened, config_repaired, config_save_failed, id_space_exhausted,
-    id_space_exhausted_on, orphan_event, server_client_connected, server_client_disconnected, server_election_lost,
-    server_grace_cancelled, server_grace_started, server_shutdown_begin, server_stale_socket_removed, server_start,
-    state_save_failed,
+    app_exit, app_start, cli_error, cli_mode, config_deduped, config_defaults_clamped, config_defaults_clamped_on,
+    config_load_failed, config_loaded, config_perms_tightened, config_repaired, config_save_failed, id_space_exhausted,
+    id_space_exhausted_on, orphan_event, state_save_failed,
+};
+pub use server::{
+    client_bye, client_connected, client_disconnected, client_reconnect, client_spawn_failed, client_spawned,
+    server_client_connected, server_client_disconnected, server_command_rejected, server_connection_refused,
+    server_election_lost, server_grace_cancelled, server_grace_started, server_session_ended, server_shutdown_begin,
+    server_stale_endpoint_removed, server_started, signal_unavailable,
 };
 pub use ssh::{
     host_key_ignored_changed, host_key_learned, host_key_policy_name, host_key_rejected, host_resolve_failed,

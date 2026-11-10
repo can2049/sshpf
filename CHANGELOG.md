@@ -5,54 +5,64 @@
 
 ## [Unreleased]
 
-本次是 **client-server 运行时**落地（阶段 2–4）：一份配置只有一个后台服务进程，多个窗口共享
-同一份状态。修的是「开第二个 `sshpf` 就报端口被占用、无法再打开」——旧版每个进程都自己拥有
-隧道并抢同一批本地端口，第二个自然撞车。方案见
-[docs/research/client-server.md](docs/research/client-server.md)。
+本次是 **client-server 运行时**落地：一份配置只有一个后台服务进程，多个窗口共享同一份状态。
+修的是「开第二个 `sshpf` 就报端口被占用、无法再打开」——旧版每个进程都自己拥有隧道并抢同一批
+本地端口，第二个自然撞车。**Windows 与 Linux 走同一套代码路径**。
+
+方案与取舍见 [docs/client-server.md](docs/client-server.md)（该文档是当前事实来源；
+`docs/research/` 里的 UDS 方案已不作为实现依据）。
 
 ### 新增
 
 - **一份配置一个服务进程，任意多个客户端窗口共享状态。** 每个 `sshpf` 进程不再自己拥有隧道：
-  第一个窗口自动拉起 detached 的 `sshpf --server`，之后的窗口都连上它。于是
-  **第二个窗口显示的就是第一个窗口的状态**，任何窗口的操作（启停 / 新建 / 编辑 / 删除 / 批量）
-  都会广播到所有窗口。新增 `src/server/`（权威进程）与 `src/client/`（连接与拉起）。
-- **新 CLI 参数 `--server`（前台跑服务端，供调试 / systemd）与 `--keep-server`（最后一个
-  客户端退出后服务端常驻）。** `USAGE` 双语同步。
+  第一个窗口自动拉起分离式的 `sshpf --server`，之后的窗口都连上它。于是**第二个窗口显示的就是
+  第一个窗口的状态**，任何窗口的操作（启停 / 新建 / 编辑 / 删除 / 批量）都会广播到所有窗口。
+  新增 `src/server/`（权威进程）与 `src/client/`（连接与拉起）。
+- **传输层用回环 TCP，两个平台同一套代码。** `std` 在 Windows 上不提供 Unix 域套接字，而回环
+  TCP 两端通用，因此只有一套发现协议和一套失败模式。端点由 `config_path` 派生为 `port` /
+  `token` / `lock` 三个文件。
+- **`127.0.0.1` 不是权限边界，令牌才是。** 本机任何用户都能连任何回环端口，所以服务端每次启动
+  生成 128-bit 令牌写入私有目录（Unix `0600`/`0700`），客户端必须在握手时出示，
+  错误令牌回 `bad_token` 且不回显密钥。
+- **单例选举**：活着的服务端全程持有 `File::try_lock`，进程死亡（含 `SIGKILL` /
+  `TerminateProcess`）时内核自动释放——不需要 pid 文件或心跳。抢到锁才清残留端点
+  （顺序即安全性）。
+- **新 CLI 参数 `--server`（前台跑服务端，供调试）与 `--keep-server`（最后一个客户端退出后
+  服务端常驻）。** `USAGE` 双语同步。前台 `--server` 响应 `Ctrl-C`/`SIGTERM` 并**有序关服**。
 - **最后一个客户端退出前的风险提示**：只有 `client_count == 1` 且确有运行中转发时，退出确认
-  才升级为「这是最后一个客户端：退出后所有端口转发都会停止」。别的窗口还在时文案逐字不变
-  ——避免「确认疲劳」。
-- **标题栏显示本进程角色**：`服务端/server`，或 `客户端 N/client N`；断连时显示
-  `已断开/detached`，避免「界面不更新但看起来正常」。
-- **单例选举**：活着的服务端全程持有 `flock`，进程死亡（含 `SIGKILL`）时内核自动释放——不需要
-  pid 文件或心跳。抢到锁才 unlink 残留 socket（顺序即安全性）。
+  才升级为「这是最后一个客户端：退出后所有 N 条端口转发都会停止」。`Bye{last_exit}` 只是
+  **提议**，服务端必须重新计数后才关服——过期视图没有破坏权。
+- **宽限窗口**：主动 `Bye` 0.5s、异常断连 5s；期间任何客户端连上即取消关服。
+- **标题栏显示本进程角色**：`服务端/server`，或 `客户端 N/client N`（N 来自快照，是服务端的
+  计数而非本地猜测）。
 - **共享状态靠全量快照 + 单调 `revision`**，用户意图靠 `Command`/`Reply`，且**服务端一律重新
-  校验**（校验 / 端口冲突 / 去重 / id 分配），过期视图不能拥有破坏权。
-- **新日志事件**：`server.start` / `server.election_lost` / `server.stale_socket_removed` /
+  校验**（校验 / 端口冲突 / 去重 / id 分配）。
+- **新日志事件**：`server.start` / `server.election_lost` / `server.stale_endpoint_removed` /
   `server.client_connected` / `server.client_disconnected` / `server.grace_started` /
-  `server.grace_cancelled` / `server.shutdown_begin` / `client.attached` / `client.attach` /
-  `client.server_spawned` / `client.disconnected` / `client.attach_failed`。
-- **新环境变量 `SSHPF_SOCKET_DIR`**：socket/lock 目录（默认 `$XDG_RUNTIME_DIR/sshpf`），
-  用于测试隔离与 `$HOME` 特殊布局。
-- **`ClientMsg::Hello` 增加可选 `host_key_policy`**（协议加法，旧客户端仍可解析），服务端只记
-  不一致、不据此改变自己的策略。
+  `server.grace_cancelled` / `server.shutdown_begin` / `server.connection_refused` /
+  `server.session_ended` / `server.command_rejected` / `client.connected` / `client.spawned` /
+  `client.reconnect` / `client.disconnected` / `client.bye`。
+- **新环境变量 `SSHPF_IPC_DIR`**：client/server 端点目录（默认 `$XDG_RUNTIME_DIR/sshpf`），
+  用于测试隔离。
+- **`ClientMsg::Hello` 携带 `token`；新增 `Ping`/`Pong` 保活**，让服务端能发现已死的客户端
+  （Windows 上被杀掉的窗口不会给 FIN，只有写才能发现）。
 
 ### 变更
 
-- **`App` 增加镜像半边（`src/app/remote/`）**：`remote: Option<Remote>` 为 `Some` 时本实例是
+- **`App` 增加镜像半边（`src/app/mirror.rs`）**：`mirror: Option<Mirror>` 为 `Some` 时本实例是
   客户端镜像——状态来自快照，意图变成命令。渲染层与键位分发**读取点不变**。
 - **`main` 的模式分派**：`--server` 走服务端；否则作为客户端先 attach 再取终端。
   attach 提前到 `take_terminal` 之前，因此无 tty 的环境（CI、`ssh host sshpf` 无 `-t`）
   也会先尝试连接，而不是先报终端错误。
 - **客户端不写盘**：`config.toml` / `state.toml` 只由服务端写，避免过期镜像覆盖权威文件。
 - **恢复 `enabled` 隧道只在服务端做**：客户端若也恢复，每开一个窗口就会把所有隧道重启一遍。
+- **重连不会重新拉起服务端**：拉起会跑 `restore_enabled`，等于因为一次连接抖动就复活用户刚
+  停掉的转发。
 
-### 修复
+### 已知边界
 
-- **开第二个窗口报「端口已被占用」、无法再打开**：根因是每个进程都是独立 owner。现在第二个
-  窗口附着到已有服务端，不再抢端口。
-- **`portscan.closed` 事件此前未写进 `docs/logging/events.md`**：新增测试
-  `every_logged_event_is_in_the_catalogue` 机器校验「源码里每个 `event=` 都有文档行」，
-  发现并补齐。该测试同时防止今后再漏。
+- **server 模式下暂不支持端口扫描（`p`）**：扫描结果要装进表单，而服务端没有表单。
+  回 `unsupported` 明确拒绝，不静默无反应。
 
 ## [0.7.0] - 2026-11-09
 

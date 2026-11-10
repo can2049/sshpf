@@ -27,7 +27,7 @@ use super::snapshot::Snapshot;
 /// Bumped whenever a change would make an older peer misinterpret a frame. Not a
 /// compatibility matrix: the client and the server are the same binary on the
 /// same machine, so a mismatch only happens mid-upgrade and is refused outright.
-pub const PROTO_VERSION: u32 = 1;
+pub const PROTO_VERSION: u32 = 2;
 
 /// Client → server.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -41,18 +41,12 @@ pub enum ClientMsg {
         /// Which config the client believes it is attaching to, so a hash
         /// collision between two configurations is detected rather than served.
         config_path: String,
-        /// The host-key policy this client was started with
-        /// (`--ignore-host-key-changes`), as a stable token.
+        /// The shared secret read from the endpoint's token file.
         ///
-        /// Optional and additive: an older client omits it and the server keeps
-        /// its own policy. It exists so a client whose flag cannot be honoured
-        /// can be *told* that, instead of silently getting the server's stricter
-        /// or looser behaviour. It cannot change the policy of a running server —
-        /// tunnels are dialled with one policy per server, and letting one client
-        /// loosen trust for everyone else's connections would be a security
-        /// defect, not a feature.
-        #[serde(default)]
-        host_key_policy: Option<String>,
+        /// Loopback is reachable by every local user, so the port is not the
+        /// permission boundary — this is. A wrong token is refused before any
+        /// state is sent.
+        token: String,
     },
     /// A state-changing request.
     #[serde(rename = "command")]
@@ -75,6 +69,15 @@ pub enum ClientMsg {
         /// a stale view can never stop someone else's forwards.
         last_exit: bool,
     },
+    /// Keep the connection alive.
+    ///
+    /// Without traffic, a loopback socket gives no signal that the peer is gone:
+    /// a client killed with `TerminateProcess` on Windows leaves a half-open
+    /// connection that only a write can discover. A periodic ping keeps the
+    /// server's view of `client_count` honest, which is what decides whether the
+    /// server exits.
+    #[serde(rename = "ping")]
+    Ping,
     /// Adjust how log lines are delivered for one tunnel.
     #[serde(rename = "subscribe_logs")]
     SubscribeLogs {
@@ -172,6 +175,13 @@ pub enum ServerMsg {
     /// A protocol-level problem. Usually followed by a disconnect.
     #[serde(rename = "error")]
     Error { code: String, error: WireError },
+    /// Answer to [`ClientMsg::Ping`], and proof the server is still there.
+    #[serde(rename = "pong")]
+    Pong {
+        /// The server's clock when it answered, so a client can show a lag if one
+        /// ever matters.
+        server_now_ms: i64,
+    },
 }
 
 /// A failure a peer can act on: stable ASCII code plus text in both languages.
@@ -234,15 +244,11 @@ mod tests {
             ClientMsg::Hello {
                 proto_version: PROTO_VERSION,
                 config_path: "/tmp/config.toml".into(),
-                host_key_policy: None,
-            },
-            ClientMsg::Hello {
-                proto_version: PROTO_VERSION,
-                config_path: "/tmp/config.toml".into(),
-                host_key_policy: Some("ignore".into()),
+                token: "ab".into(),
             },
             ClientMsg::Bye { last_exit: true },
             ClientMsg::Bye { last_exit: false },
+            ClientMsg::Ping,
             ClientMsg::Command { req_id: 1, expect_rev: Some(42), op: Op::Start { tunnel_id: 7 } },
             // `None` must survive as "field absent", which is how TOML says None.
             ClientMsg::Command { req_id: 2, expect_rev: None, op: Op::StopAll },
@@ -328,9 +334,15 @@ mod tests {
     #[test]
     fn an_unknown_field_is_ignored_so_a_newer_peer_does_not_break_an_older_one() {
         // Forward compatibility: a future server adds a field nobody here knows.
-        let text = "t = \"hello\"\nproto_version = 1\nconfig_path = \"/x\"\nbrand_new_field = 99\n";
+        let text = "t = \"hello\"\nproto_version = 1\nconfig_path = \"/x\"\ntoken = \"t\"\nbrand_new_field = 99\n";
         let msg: ClientMsg = toml::from_str(text).expect("an unknown field must be ignored");
         assert!(matches!(msg, ClientMsg::Hello { .. }));
+    }
+
+    #[test]
+    fn a_pong_carries_the_server_clock() {
+        let msg = ServerMsg::Pong { server_now_ms: 1_700_000_000_123 };
+        assert_eq!(round_trip_server(&msg), msg);
     }
 
     #[test]

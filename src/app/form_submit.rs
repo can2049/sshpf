@@ -279,13 +279,15 @@ impl App {
 
     fn commit_form_create(&mut self, mut cfg: TunnelConfig) {
         cfg.enabled = true;
-        eventlog::tunnel_created(&cfg, "form");
-        // A mirror sends the definition and lets the server allocate the id: it
-        // is the only process that can pick an id no one else is using. Its own
-        // `next_tunnel_id` was computed from a snapshot that may be a frame old.
-        if self.clone_cfg_for_wire(&cfg).is_some() {
+        // A mirror does not own the config file: the server assigns the id and
+        // persists. The local `cfg.tunnels` copy is left alone so the table keeps
+        // matching what the server last sent, until the next snapshot adds the
+        // real row (with the id the server chose).
+        if self.forward(crate::ipc::Op::Create { cfg: Box::new(cfg.clone()) }) {
+            self.close_overlay();
             return;
         }
+        eventlog::tunnel_created(&cfg, "form");
         self.cfg.tunnels.push(cfg.clone());
         // Remember where the row landed *before* pushing, rather than recovering
         // it as `len() - 1` afterwards: the arithmetic is the same today, but it
@@ -299,31 +301,15 @@ impl App {
         self.persist_quietly();
     }
 
-    /// Send a `Create` to the server when this is a mirror; return whether it did.
-    ///
-    /// Written as an explicit helper rather than an inline `if` so both create
-    /// paths (`commit_form_create` and the import/port-batch creators) use the
-    /// exact same wire mapping.
-    fn clone_cfg_for_wire(&mut self, cfg: &TunnelConfig) -> Option<()> {
-        if !self.is_mirror() {
-            return None;
-        }
-        self.send_op(crate::ipc::Op::Create { cfg: Box::new(cfg.clone()) });
-        self.close_overlay();
-        Some(())
-    }
-
     /// Apply the pending edit that the user confirmed.
     pub(crate) fn commit_form_edit(&mut self, eid: TunnelId) {
         let Some(cfg) = self.pending_form.take() else {
             return;
         };
-        // `Update` carries the definition and the id separately, and the server
-        // refuses the pair if they disagree; keeping them equal here is the
-        // client's half of that contract.
-        let mut wire_cfg = cfg.clone();
-        wire_cfg.id = eid;
-        if self.send_op(crate::ipc::Op::Update { tunnel_id: eid, cfg: Box::new(wire_cfg) }) {
+        // The server owns the definition *and* the running session, so an edit is
+        // one command (stop, replace, persist, restart) rather than four local
+        // steps a mirror cannot perform.
+        if self.forward(crate::ipc::Op::Update { tunnel_id: eid, cfg: Box::new(cfg.clone()) }) {
             self.close_overlay();
             return;
         }

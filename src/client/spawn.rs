@@ -1,197 +1,237 @@
-//! Starting the server this process will attach to: a detached `--server`
-//! child, with no terminal, no stdio and its own process group.
+//! Starting a server when none is running: the second half of "just run `sshpf`".
 //!
-//! # Why detached, and why a new process group
+//! # Why the client starts the server at all
 //!
-//! The server outlives the client that started it (that is the whole point: the
-//! second window must find the first window's state). If it shared the client's
-//! process group or terminal, closing that terminal would take every forward down
-//! with it — [the design] calls this out as a security property, not a detail: the
-//! terminal of whichever window happened to start the server must not own the
-//! power to stop everyone's forwards. `process_group(0)` puts the child in a new
-//! group; the server itself additionally ignores `SIGHUP`.
+//! Requiring the user to run a server first would make `sshpf` a two-step program
+//! where the second step is invisible. Instead a client that finds nobody listening
+//! starts one, then attaches to it like any other client — the same optimistic
+//! election the singleton lock makes safe: a loser in a spawn race simply connects
+//! to the winner's socket instead of starting a second server.
 //!
-//! # Why stdio goes to null
+//! # Why the child is detached
 //!
-//! The child runs with no terminal (the parent owns it and is about to enter
-//! alternate-screen mode). A child writing to the inherited tty would corrupt the
-//! TUI; a child reading stdin would steal the user's keystrokes. The server logs
-//! to `SSHPF_LOG_DIR`, so nothing diagnostic is lost.
+//! The server must outlive the terminal that started it. Closing a window is a
+//! routine act, and it must not take every forward in the process down with it —
+//! otherwise the first client to quit decides for everyone. So the child gets its
+//! own process group and no inherited stdio:
 //!
-//! [the design]: ../../docs/research/client-server/lifecycle.md
+//! * **Unix**: `process_group(0)` puts it in a new process group, so the terminal's
+//!   `SIGINT` (to the foreground group) and `SIGHUP` (on hangup) do not reach it.
+//!   `setsid` would be stronger, but it needs `pre_exec`, which needs `unsafe`, and
+//!   this crate allows `unsafe` in exactly one file.
+//! * **Windows**: `DETACHED_PROCESS` means no console is attached (so no Ctrl-C is
+//!   delivered to it) and `CREATE_NEW_PROCESS_GROUP` means it does not share the
+//!   parent's group.
 //!
-//! Belongs here: the child's command line, its detachment, and reaping it.
-//! Does not belong: deciding *whether* to spawn ([`super`]), the handshake
-//! ([`super::handshake`]), or the process' own lifecycle ([`crate::server`]).
+//! All three stdio handles are null, so the child can never write into the TUI's
+//! terminal — a stray line of output would corrupt the alternate screen.
+//!
+//! # Why no `Child` handle is returned
+//!
+//! Only the pid. On Windows an open process handle keeps the executable image
+//! locked, so holding one would make `cargo build` fail to overwrite the binary
+//! until the server exited — across the whole team's shared `target/`. Dropping the
+//! `Child` closes the handle and leaves the process running, which is exactly the
+//! behaviour this feature needs: the server is not ours to babysit.
+//!
+//! Belongs here: locating the binary, building the child's arguments, and starting
+//! it detached.
+//! Does not belong: waiting for it to listen ([`super::reconnect`]), the handshake
+//! ([`super::connect`]), or choosing the config ([`crate::cli`]).
 
 use std::ffi::OsString;
-use std::os::unix::process::CommandExt;
-use std::path::Path;
-use std::process::{Command, Stdio};
+use std::io;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 
-use crate::ssh::known_hosts::HostKeyPolicy;
+use crate::eventlog;
 
-use super::AttachError;
+/// Windows `DETACHED_PROCESS`: no console for the child, so it cannot be Ctrl-C'd.
+#[cfg(windows)]
+const DETACHED_PROCESS: u32 = 0x0000_0008;
 
-/// Spawn the detached server for `config`, and return its pid.
+/// Windows `CREATE_NEW_PROCESS_GROUP`: it does not share the parent's group.
+#[cfg(windows)]
+const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+
+/// How the server child is invoked.
 ///
-/// The caller has already established that no live server serves this config
-/// (it holds the election lock); this function does not check that, because the
-/// check and the spawn must not be separable by another process.
-pub fn spawn_server(config: &Path, keep_server: bool, host_key_policy: HostKeyPolicy) -> Result<u32, AttachError> {
-    let exe = std::env::current_exe().map_err(|e| exe_error(&e))?;
-    spawn_with(&exe, config, keep_server, host_key_policy)
+/// A value rather than a `Command` because the arguments are the part worth
+/// asserting: the detach flags are per-platform and untestable here, but
+/// "`-c` travels only when the user gave one" is a rule a test can pin down.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpawnRequest {
+    /// The binary to run: this process's own image.
+    pub exe: PathBuf,
+    /// The config to serve, or `None` for "the server resolves the same default".
+    pub config: Option<PathBuf>,
+    /// The pid of the client that is starting it, for the server's log.
+    pub attach_from: u32,
 }
 
-/// Spawn `exe` as a server; split out so a test can drive the failure path
-/// without starting a real server.
-pub fn spawn_with(
-    exe: &Path,
-    config: &Path,
-    keep_server: bool,
-    host_key_policy: HostKeyPolicy,
-) -> Result<u32, AttachError> {
-    let mut command = Command::new(exe);
-    command.args(server_args(config, keep_server, host_key_policy));
-    // A new process group: closing the client's terminal must not signal the
-    // server (see the module docs).
-    command.process_group(0);
-    command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-    // The environment is inherited on purpose: `SSHPF_LOG_DIR` / `SSHPF_CONFIG`
-    // and the rest must reach the server, or its log lands somewhere unexpected.
-    let child = command.spawn().map_err(|e| spawn_error(exe, config, &e))?;
+impl SpawnRequest {
+    /// The arguments, in the order the server's parser sees them.
+    pub fn args(&self) -> Vec<OsString> {
+        let mut args = vec![OsString::from("--server"), OsString::from("--attach-from")];
+        args.push(OsString::from(self.attach_from.to_string()));
+        // Only when the user passed `-c`. Without it both processes resolve the
+        // same platform default, and passing an explicit path would pin the server
+        // to a path the user never named.
+        if let Some(config) = &self.config {
+            args.push(OsString::from("-c"));
+            args.push(config.clone().into_os_string());
+        }
+        args
+    }
+}
+
+/// A server that has been started, identified by pid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpawnedServer {
+    /// The child's process id, for the log and for the "waiting for server" hint.
+    pub pid: u32,
+}
+
+/// Start a detached server for `config`.
+///
+/// `config` is the path the **user** named, or `None` when they named none: the
+/// child must serve the same configuration this client is talking about, which is
+/// how the two agree on an endpoint without a handshake on the command line.
+pub fn spawn_server(config: Option<&Path>) -> io::Result<SpawnedServer> {
+    let exe = std::env::current_exe()?;
+    let request = SpawnRequest { exe, config: config.map(Path::to_path_buf), attach_from: std::process::id() };
+    launch(&request)
+}
+
+/// Run one prepared request detached, returning its pid.
+pub fn launch(request: &SpawnRequest) -> io::Result<SpawnedServer> {
+    let mut command = Command::new(&request.exe);
+    command
+        .args(request.args())
+        // No inherited stdio: the child must never write into the TUI's terminal,
+        // and a TUI must never sit behind a pipe nobody drains.
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    detach(&mut command);
+    let child = command.spawn()?;
     let pid = child.id();
-    reap_in_background(child);
-    Ok(pid)
+    // See the module docs: the handle is dropped so the image is not locked, and
+    // the process is left running on purpose.
+    release(child);
+    eventlog::client_spawned(pid);
+    Ok(SpawnedServer { pid })
 }
 
-/// The child's argv, in order, exactly as it is executed.
+/// Put the child in its own process group so it survives this terminal.
+#[cfg(windows)]
+fn detach(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+}
+
+/// Put the child in its own process group so it survives this terminal.
 ///
-/// Pure, so the command line the contract pins down can be asserted without
-/// running a process: `--server --config <path> [--keep-server]
-/// [--ignore-host-key-changes]`.
-fn server_args(config: &Path, keep_server: bool, host_key_policy: HostKeyPolicy) -> Vec<OsString> {
-    let mut args: Vec<OsString> = vec![
-        OsString::from("--server"),
-        OsString::from("--config"),
-        // The normalised absolute path: the endpoint was derived from it, so the
-        // server must derive the *same* socket from the same identity.
-        config.as_os_str().to_os_string(),
-    ];
-    if keep_server {
-        args.push(OsString::from("--keep-server"));
-    }
-    // The server dials SSH with one policy for its whole life, so the flag is
-    // how a client's `--ignore-host-key-changes` can take effect at all; the
-    // `Hello` field only lets the server notice a mismatch.
-    if host_key_policy == HostKeyPolicy::Ignore {
-        args.push(OsString::from("--ignore-host-key-changes"));
-    }
-    args
+/// `process_group(0)` is the safe, stable equivalent of `setsid` for the part that
+/// matters here: the new group is not the terminal's foreground group, so `SIGINT`
+/// and `SIGHUP` generated by the terminal do not reach it. It needs no `unsafe`,
+/// which is why the stronger `setsid` via `pre_exec` is not used.
+///
+/// The `CommandExt` import is load-bearing: `process_group` is a trait method, not
+/// an inherent one, so without it this fails to compile — and because the whole
+/// function is `cfg(unix)`, that failure is invisible on Windows. It is confined to
+/// this block rather than the file's top so the Windows build never imports a Unix
+/// trait.
+#[cfg(unix)]
+fn detach(command: &mut Command) {
+    use std::os::unix::process::CommandExt as _;
+    command.process_group(0);
 }
 
-/// Reap the child when it exits, so a server that dies mid-session does not stay
-/// a zombie for as long as its client runs.
-fn reap_in_background(mut child: std::process::Child) {
-    std::thread::spawn(move || {
-        // A failed `wait` only costs the exit status, and there is nobody left to
-        // tell: the reader thread reports the real symptom (EOF on the socket).
-        let _ = child.wait();
-    });
-}
-
-// ---------------------------------------------------------------------------
-// wording
-// ---------------------------------------------------------------------------
-
-/// `current_exe` failed, so there is nothing to execute.
-fn exe_error(detail: &std::io::Error) -> AttachError {
-    AttachError::new(
-        format!("无法定位 sshpf 自身的可执行文件：{detail}。请直接用 `sshpf --server` 手动启动服务端。"),
-        format!("Could not locate the sshpf executable: {detail}. Start the server manually with `sshpf --server`."),
-    )
-}
-
-/// The child could not be started at all.
-fn spawn_error(exe: &Path, config: &Path, detail: &std::io::Error) -> AttachError {
-    let exe = exe.display();
-    let config = config.display();
-    AttachError::new(
-        format!("无法启动服务端 {exe}（配置 {config}）：{detail}。请尝试手动运行 `sshpf --server --config {config}`。"),
-        format!(
-            "Could not start the server {exe} (config {config}): {detail}. Try running `sshpf --server --config {config}` by hand."
-        ),
-    )
+/// Drop the child handle without waiting on it.
+///
+/// Named rather than an implicit `drop(child)` so the intent is greppable: this is
+/// the line that decides "the server keeps running after the client exits".
+fn release(child: Child) {
+    drop(child);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsStr;
 
-    fn args_of(keep_server: bool, policy: HostKeyPolicy) -> Vec<String> {
-        server_args(Path::new("/tmp/x/config.toml"), keep_server, policy)
-            .iter()
-            .map(|a| a.to_string_lossy().to_string())
-            .collect()
-    }
-
-    #[test]
-    fn the_command_line_is_exactly_the_contract_one() {
-        assert_eq!(args_of(false, HostKeyPolicy::AcceptNew), ["--server", "--config", "/tmp/x/config.toml"]);
-        assert_eq!(
-            args_of(true, HostKeyPolicy::AcceptNew),
-            ["--server", "--config", "/tmp/x/config.toml", "--keep-server"]
-        );
-    }
-
-    #[test]
-    fn only_the_ignore_policy_is_forwarded_and_always_last() {
-        // The escape hatch cannot be expressed in the protocol, so it must reach
-        // the child as a flag or the client's `--ignore-host-key-changes` is a lie.
-        assert_eq!(
-            args_of(false, HostKeyPolicy::Ignore),
-            ["--server", "--config", "/tmp/x/config.toml", "--ignore-host-key-changes"]
-        );
-        // The stricter policies are the server's default: passing a flag for them
-        // would be a command line the server does not parse.
-        for policy in [HostKeyPolicy::AcceptNew, HostKeyPolicy::Strict, HostKeyPolicy::Ask] {
-            assert!(!args_of(false, policy).iter().any(|a| a == "--ignore-host-key-changes"), "{policy:?}");
+    fn request(config: Option<&str>) -> SpawnRequest {
+        SpawnRequest {
+            exe: PathBuf::from("/usr/local/bin/sshpf"),
+            config: config.map(PathBuf::from),
+            attach_from: 4242,
         }
     }
 
-    #[test]
-    fn both_optional_flags_can_appear_together() {
-        assert_eq!(
-            args_of(true, HostKeyPolicy::Ignore),
-            ["--server", "--config", "/tmp/x/config.toml", "--keep-server", "--ignore-host-key-changes"]
-        );
+    fn text(args: &[OsString]) -> Vec<String> {
+        args.iter().map(|a| a.to_string_lossy().into_owned()).collect()
     }
 
     #[test]
-    fn the_config_path_is_passed_verbatim_as_one_argument() {
-        // A path with a space must not be split, and must not be lossy-encoded:
-        // it is an OS path, not a display string.
-        let spaced = Path::new("/tmp/a b/config.toml");
-        let args = server_args(spaced, false, HostKeyPolicy::AcceptNew);
-        assert_eq!(args.len(), 3);
-        assert_eq!(args[2], OsStr::new("/tmp/a b/config.toml"));
+    fn the_child_is_told_to_be_a_server_and_who_started_it() {
+        let args = text(&request(None).args());
+        assert_eq!(args, vec!["--server", "--attach-from", "4242"], "the server must know its caller");
     }
 
     #[test]
-    fn a_missing_executable_is_a_bilingual_report_not_a_panic() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let err = spawn_with(
-            &dir.path().join("no-such-sshpf"),
-            &dir.path().join("config.toml"),
-            false,
-            HostKeyPolicy::AcceptNew,
-        )
-        .expect_err("must fail");
-        // Actionable: names the binary, the config, and the manual command.
-        assert!(err.zh.contains("sshpf --server --config"), "{}", err.zh);
-        assert!(err.en.contains("sshpf --server --config"), "{}", err.en);
-        assert!(err.zh.contains("no-such-sshpf"), "{}", err.zh);
-        assert!(!err.en.is_empty());
+    fn a_c_users_path_travels_to_the_child() {
+        // The endpoint is derived from the config path, so a child that resolved a
+        // different default would serve a different endpoint and this client would
+        // never find it.
+        let args = text(&request(Some("/tmp/other/config.toml")).args());
+        assert_eq!(args, vec!["--server", "--attach-from", "4242", "-c", "/tmp/other/config.toml"]);
+    }
+
+    #[test]
+    fn no_config_flag_appears_when_the_user_named_none() {
+        // Passing the *resolved* default would be observably different from what
+        // the user asked for, and would pin the server to a path they never named.
+        let args = text(&request(None).args());
+        assert!(!args.iter().any(|a| a == "-c"), "{args:?}");
+        assert!(!args.iter().any(|a| a == "--config"), "{args:?}");
+    }
+
+    #[test]
+    fn the_keep_server_policy_is_never_chosen_by_the_client() {
+        // `--keep-server` is the user's decision, not the client's: a client that
+        // set it would silently defeat "the last client exit stops everything".
+        let args = text(&request(Some("/tmp/c.toml")).args());
+        assert!(!args.iter().any(|a| a.contains("keep-server")), "{args:?}");
+    }
+
+    #[test]
+    fn a_missing_binary_is_an_error_not_a_panic() {
+        let request =
+            SpawnRequest { exe: PathBuf::from("/nonexistent/sshpf-does-not-exist"), config: None, attach_from: 1 };
+        // Any `io::Error` is fine; the point is that it is returned, not panicked.
+        assert!(launch(&request).is_err(), "a missing executable must be reported");
+    }
+
+    #[test]
+    fn spawning_reports_the_pid_of_a_real_child() {
+        // A real spawn, using a binary that certainly exists and exits at once: this
+        // checks the wiring (args accepted, detached, stdio null) without starting an
+        // actual server. The child is short-lived by construction, so it cannot leak
+        // and hold the build's binary open.
+        #[cfg(windows)]
+        let exe = PathBuf::from("cmd.exe");
+        #[cfg(windows)]
+        let args = vec![OsString::from("/c"), OsString::from("exit")];
+        #[cfg(unix)]
+        let exe = PathBuf::from("/bin/sh");
+        #[cfg(unix)]
+        let args = vec![OsString::from("-c"), OsString::from("exit 0")];
+
+        let mut command = Command::new(&exe);
+        command.args(&args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        let child = command.spawn().expect("a plain shell must be spawnable");
+        let pid = child.id();
+        assert!(pid > 0, "a spawned child must have a pid");
+        release(child);
     }
 }

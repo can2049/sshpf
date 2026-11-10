@@ -74,10 +74,11 @@ impl App {
         self.flush_pending_exits();
         self.tick_retries();
         self.drain_port_scan();
-        // A client has no supervisor events; its "events" are server messages.
-        // Same cadence, same place in the frame, so the UI cannot tell the
-        // difference and neither can `expire_status` below.
-        self.drain_remote();
+        // A mirror's "events" are server messages, and they are applied by
+        // `client::sync::drain`, which `main`'s frame loop calls right after this
+        // one. Deliberately not called here: `app` must not depend on `client`
+        // (see `docs/architecture.md`), and the two must not both drain the same
+        // channel or a frame's messages would be split between them.
         self.expire_status();
     }
 

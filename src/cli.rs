@@ -37,16 +37,16 @@ sshpf — SSH 端口转发 TUI 管理器 / SSH port-forward manager for the term
                         Use this config file (default ~/.config/sshpf/config.toml)
       --no-restore      启动时不自动恢复上次启用的转发
                         Do not restore the forwards enabled in the last run
+      --server          在前台作为 server 运行（拥有全部转发，不显示界面）
+                        Run as the server in the foreground (owns every forward,
+                        draws nothing). 通常由 client 自动拉起，手动启动仅用于排障。
+                        Normally started by a client; run it by hand to debug.
+      --keep-server     最后一个 client 退出后 server 继续运行
+                        Keep the server up after its last client leaves
       --list-hosts      打印 ~/.ssh/config 中的主机后退出
                         Print the hosts in ~/.ssh/config, then exit
       --check           校验配置文件后退出（不启动 UI）
                         Validate the config file, then exit (no UI)
-      --server          作为后台服务进程运行：持有全部隧道，供多个客户端共享
-                        Run as the background server that owns every tunnel so
-                        several clients can share one state (a client does this
-                        automatically when none is running)
-      --keep-server     最后一个客户端退出后仍保留服务端
-                        Keep the server running after the last client exits
       --ignore-host-key-changes
                         接受已改变的主机密钥（不写入 known_hosts，仅告警）
                         Accept a changed host key (warns; known_hosts is untouched)
@@ -68,6 +68,8 @@ sshpf — SSH 端口转发 TUI 管理器 / SSH port-forward manager for the term
   (start/exit, tunnel up/down/reconnect, failures, panics and fatal signals).
   SSHPF_LOG_DIR=<目录/dir>     改日志目录 / Change the log directory
   SSHPF_LOG_LEVEL=<级别/level> off|error|warn|info|debug（默认/default info）
+  SSHPF_IPC_DIR=<目录/dir>     改 client/server 端点目录（端口/令牌/锁）
+                               Change where the client/server endpoint files live
   超过 2 MiB 自动轮转，保留 3 个归档（sshpf.log.1 … .3）。
   Rotates above 2 MiB, keeping 3 archives (sshpf.log.1 … .3).
 
@@ -136,6 +138,17 @@ SSH 连接参数（ProxyJump/IdentityFile/ssh-agent 等）交给 ~/.ssh/config�
 The config file is TOML with mode 0600. Tunnel definitions are owned by sshpf;
 SSH connection parameters (ProxyJump, IdentityFile, ssh-agent, …) stay in
 ~/.ssh/config, which this tool reads but never rewrites.
+
+多窗口 / Multiple windows:
+  同时打开多个 sshpf 时，只有一个进程真正持有转发（server），其余窗口连上它，
+  所有窗口看到同一份转发列表，任何一处改动都会同步到全部窗口。
+  **最后一个窗口退出时，server 也随之退出，所有转发停止** —— 即使那些转发是
+  别的窗口启动的。想让它常驻请用 --keep-server。
+  When several sshpf windows are open, one process owns the forwards (the server)
+  and the others attach to it: every window shows the same list, and a change in
+  one appears in all. **Closing the last window stops the server and every
+  forward**, including ones another window started. Use --keep-server to keep it
+  running instead.
 ";
 
 /// What the command line asked for.
@@ -149,12 +162,21 @@ pub struct Args {
     pub no_restore: bool,
     pub list_hosts: bool,
     pub check: bool,
-    /// Run as the authoritative server for this config instead of as a client.
-    pub server: bool,
-    /// Keep the server alive after the last client leaves.
-    pub keep_server: bool,
     /// Accept a changed server host key instead of refusing the connection.
     pub ignore_host_key_changes: bool,
+    /// Run as the owning server in the foreground instead of as a client.
+    pub server: bool,
+    /// Keep the server running after its last client leaves.
+    pub keep_server: bool,
+    /// The pid of the client that spawned this server, when one did.
+    ///
+    /// Diagnostic only: it is recorded so a log can answer "which window started
+    /// this server, and when did it go away". It deliberately changes no
+    /// behaviour — the server's lifetime is decided by its client *count*, never by
+    /// whether the process that spawned it is still alive. A server that died with
+    /// its spawner would stop everyone else's forwards when that one terminal
+    /// closed, which is the opposite of the requirement.
+    pub attach_from: Option<u32>,
 }
 
 impl Args {
@@ -205,9 +227,10 @@ where
         no_restore: false,
         list_hosts: false,
         check: false,
+        ignore_host_key_changes: false,
         server: false,
         keep_server: false,
-        ignore_host_key_changes: false,
+        attach_from: None,
     };
     let mut it = args.into_iter();
     while let Some(arg) = it.next() {
@@ -231,15 +254,36 @@ where
             "--no-restore" => parsed.no_restore = true,
             "--list-hosts" => parsed.list_hosts = true,
             "--check" => parsed.check = true,
+            "--ignore-host-key-changes" => parsed.ignore_host_key_changes = true,
             "--server" => parsed.server = true,
             "--keep-server" => parsed.keep_server = true,
-            "--ignore-host-key-changes" => parsed.ignore_host_key_changes = true,
+            "--attach-from" => match it.next() {
+                Some(pid) => parsed.attach_from = Some(parse_pid(&pid)?),
+                None => {
+                    return Err("--attach-from 需要一个进程号 / --attach-from needs a pid argument".to_string());
+                }
+            },
             other => {
                 return Err(format!("未知参数 / Unknown option: {other}\n\n{USAGE}"));
             }
         }
     }
     Ok(Some(parsed))
+}
+
+/// Parse the pid carried by `--attach-from`.
+///
+/// A bad value is a usage error rather than a panic: this argument is produced by
+/// `sshpf` itself, so a malformed one means a version mismatch or a hand-run typo,
+/// and both deserve the usage text.
+fn parse_pid(raw: &std::ffi::OsString) -> Result<u32, String> {
+    match raw.to_string_lossy().trim().parse::<u32>() {
+        Ok(pid) => Ok(pid),
+        Err(_) => Err(format!(
+            "--attach-from 需要一个正整数进程号 / --attach-from needs a positive pid, got {:?}",
+            raw.to_string_lossy()
+        )),
+    }
 }
 
 /// Best-effort stdout write: returns whether it landed, never panics.

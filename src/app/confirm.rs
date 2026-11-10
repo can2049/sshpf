@@ -145,18 +145,21 @@ impl App {
                 )
             }
             ConfirmAction::Quit => {
-                // Counted from the rendered table, not from the supervisor: a
-                // client has no supervisor, and the snapshot's statuses are what
-                // the user is actually looking at.
+                // The count comes from the shared state, not from a local
+                // supervisor: on a client there is no supervisor, and reading one
+                // would quietly report zero (see `docs/research/client-server/
+                // migration.md` §11.1).
                 let running = counts.up + counts.starting + counts.retrying;
+                let last_client = self.client_count <= 1;
                 if running == 0 {
                     help::bi("确认退出 sshpf？", "Quit sshpf?")
-                } else if self.is_last_client() {
-                    // The dangerous asymmetry: closing this window stops forwards
-                    // the user may have started from a window that is already gone.
+                } else if last_client && self.is_mirror() {
+                    // The case the requirement is about: closing this window stops
+                    // forwards that another terminal started, because the server
+                    // goes with its last client.
                     help::bi(
-                        &format!("这是最后一个客户端：退出后所有端口转发都会停止（{running} 条运行中）。确定退出？"),
-                        &format!("Last client: quitting stops every port forward ({running} running). Quit anyway?"),
+                        &format!("这是最后一个客户端：退出后所有 {running} 条端口转发都会停止。确定退出？"),
+                        &format!("Last client: quitting stops all {running} port forwards. Quit anyway?"),
                     )
                 } else {
                     help::bi(
@@ -225,9 +228,15 @@ impl App {
             }
             ConfirmAction::StopAll => self.stop_all(),
             ConfirmAction::Restart(id) => {
-                // One helper for both modes: the authority bounces its own
-                // supervisor, a mirror sends `Restart` and lets the server do it.
-                self.restart_tunnel(id, "manual");
+                // A mirror has no supervisor to bounce: the owner performs the
+                // stop-and-start as one command, so the tunnel is never left
+                // stopped because the second half of the pair was lost.
+                if self.forward(crate::ipc::Op::Restart { tunnel_id: id }) {
+                    return;
+                }
+                self.supervisor.stop(id);
+                self.forget_runtime_state(id);
+                self.start_tunnel(id);
             }
             ConfirmAction::StartAll => self.start_all(),
             ConfirmAction::ApplyEdit(id) => self.commit_form_edit(id),

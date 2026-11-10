@@ -1,244 +1,246 @@
-//! Applying one client command to the authoritative state.
+//! Applying one client command to the owner `App`, with the server's own
+//! validation.
 //!
-//! # Why every command is validated *here*
+//! # A client's command is a request, not an order
 //!
-//! A client's snapshot can be seconds or minutes old — the user may have been
-//! reading a dialog the whole time. If a client's own checks were trusted, an
-//! hour-old view would decide what happens now, and two windows could each be
-//! sure they had permission to overwrite the other. So this file re-runs the same
-//! checks the UI runs (`config::validate_tunnel`, duplicate detection, listen
-//! conflicts, id allocation) against the **current** state, and its verdict is the
-//! only one that counts.
+//! A client's view can be seconds stale — it renders from the last snapshot it
+//! received. Two things therefore never come from the client:
 //!
-//! # Why `expect_rev` is required for some commands and not others
+//! * **the tunnel id of a new tunnel** — the server allocates it, or two clients
+//!   creating at once would pick the same number;
+//! * **whether an action is allowed** — the definition is re-validated, the
+//!   listen port re-checked, and the target id re-looked-up here, against current
+//!   state. A stale `expect_rev` is reported as [`Reply::stale`] rather than
+//!   silently applied over someone else's edit.
 //!
-//! `Delete` and `Update` destroy or replace a specific definition, so they are
-//! "a decision about *that* version" and carry the revision the user was looking
-//! at: a mismatch becomes [`Outcome::Stale`] and the user re-confirms against what
-//! is actually there. `Start`/`Stop` are idempotent *intents* — running them twice
-//! equals running them once — so requiring a revision would make two clients
-//! pressing space at the same time produce a spurious "someone changed this".
+//! The one thing the client does own is its *intent* (start this, delete that),
+//! which is exactly what an [`Op`] is.
 //!
-//! Belongs here: the mapping from [`Op`] to `App` mutations, and the verdict.
-//! Does not belong: sending replies ([`super::session`]), framing (`crate::ipc`),
-//! or the tunnel runtime itself (`crate::app::runtime`).
+//! # Why `StopAll` is allowed from any client
+//!
+//! The requirement says one client may stop everything; that is the point of the
+//! shared view. It is confirmed in the client's UI (`ConfirmAction::StopAll`)
+//! before it is ever sent, and the server applies it as one atomic operation.
+//!
+//! Belongs here: `Op` → `App` calls and the validation in between.
+//! Does not belong: reading or writing frames ([`super::session`]), or building
+//! snapshots ([`super::state`]).
 
 use crate::app::App;
-use crate::ipc::{Op, WireError};
-use crate::model::{FailureKind, StatusMsg, TunnelConfig};
+use crate::eventlog;
+use crate::ipc::{Op, WireError, WirePort};
 
-/// What happened to one command.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Outcome {
-    /// Applied; the state may have changed.
-    Applied,
-    /// The client acted on a revision the server has moved past.
-    Stale,
-    /// Refused, with something to show the user.
-    Refused(WireError),
+/// What happened to one command, in the shape the session replies with.
+pub struct Outcome {
+    /// Whether the command was applied.
+    pub ok: bool,
+    /// Why not, when `ok` is false.
+    pub error: Option<WireError>,
+    /// True when the failure was `expect_rev` being behind, which the client
+    /// renders as "someone else changed this" rather than as an error.
+    pub stale: bool,
+    /// Scan results, for `PortScan`.
+    pub ports: Vec<WirePort>,
 }
 
 impl Outcome {
-    /// Turn the verdict into the `(ok, error)` pair a `Reply` carries.
-    pub fn into_reply(self) -> (bool, Option<WireError>) {
-        match self {
-            Outcome::Applied => (true, None),
-            // `Stale` is answered with its own message; `session` checks for it
-            // before building a `Reply`, so reaching here means "not applied".
-            Outcome::Stale => (false, Some(stale_error())),
-            Outcome::Refused(err) => (false, Some(err)),
+    fn ok() -> Outcome {
+        Outcome { ok: true, error: None, stale: false, ports: Vec::new() }
+    }
+
+    fn failed(code: &str, zh: impl Into<String>, en: impl Into<String>) -> Outcome {
+        Outcome {
+            ok: false,
+            error: Some(WireError { code: code.to_string(), zh: zh.into(), en: en.into() }),
+            stale: false,
+            ports: Vec::new(),
         }
     }
-}
 
-/// A bilingual refusal with a stable ASCII code.
-fn refuse(code: &str, zh: impl Into<String>, en: impl Into<String>) -> Outcome {
-    Outcome::Refused(WireError { code: code.to_string(), zh: zh.into(), en: en.into() })
-}
-
-/// The revision guard shared by `Delete` and `Update`.
-fn check_rev(expect_rev: Option<u64>, current: u64) -> bool {
-    match expect_rev {
-        // Absent means "unconditional"; only the idempotent ops may omit it, and
-        // the two destructive ones are rejected at the call site instead.
-        None => false,
-        Some(seen) => seen == current,
+    /// The reply a stale `expect_rev` produces.
+    fn stale() -> Outcome {
+        Outcome { ok: false, error: None, stale: true, ports: Vec::new() }
     }
 }
 
-/// Apply one command. `current` is the server's revision right now.
-pub fn apply(app: &mut App, op: &Op, expect_rev: Option<u64>, current: u64) -> Outcome {
+/// Apply a command against the shared server state, bumping the revision on
+/// success so every client is sent the result.
+///
+/// This is the function the session calls; [`apply`] is the pure part that takes a
+/// bare `&mut App` and is what the unit tests drive.
+pub fn run(shared: &super::state::Shared, op: &Op, expect_rev: Option<u64>) -> Outcome {
+    let current = shared.revision();
+    // Hold the state lock across the whole command: a reader must never observe a
+    // half-applied command, which would surface as a client seeing an id that does
+    // not exist yet or a definition mid-replacement.
+    let mut state = shared.lock_state();
+    let outcome = apply(&mut state.app, op, expect_rev, current);
+    if outcome.ok {
+        state.revision = state.revision.saturating_add(1);
+    }
+    drop(state);
+    outcome
+}
+
+/// Apply `op`, re-validating everything that came from the client.
+///
+/// `expect_rev` is checked first: a command built on a view the server has already
+/// replaced must not be applied, because the row it names may mean something else
+/// by now.
+pub fn apply(app: &mut App, op: &Op, expect_rev: Option<u64>, current_rev: u64) -> Outcome {
+    if let Some(expected) = expect_rev
+        && expected != current_rev
+    {
+        return Outcome::stale();
+    }
     match op {
-        Op::Start { tunnel_id } => {
-            if !exists(app, *tunnel_id) {
-                return not_found(*tunnel_id);
-            }
-            app.start_tunnel_with(*tunnel_id, "client");
-            Outcome::Applied
-        }
-        Op::Stop { tunnel_id } => {
-            if !exists(app, *tunnel_id) {
-                return not_found(*tunnel_id);
-            }
-            app.stop_tunnel_with(*tunnel_id, "client");
-            Outcome::Applied
-        }
-        Op::Restart { tunnel_id } => {
-            if !exists(app, *tunnel_id) {
-                return not_found(*tunnel_id);
-            }
-            // Restart re-reads the definition from the authoritative table, so a
-            // client that was looking at an older edit cannot resurrect it.
-            app.restart_tunnel(*tunnel_id, "client");
-            Outcome::Applied
-        }
-        Op::Delete { tunnel_id } => {
-            if !exists(app, *tunnel_id) {
-                return not_found(*tunnel_id);
-            }
-            if !check_rev(expect_rev, current) {
-                return Outcome::Stale;
-            }
-            app.delete_tunnel(*tunnel_id);
-            Outcome::Applied
-        }
+        Op::Start { tunnel_id } => start(app, *tunnel_id),
+        Op::Stop { tunnel_id } => stop(app, *tunnel_id),
+        Op::Restart { tunnel_id } => restart(app, *tunnel_id),
+        Op::Delete { tunnel_id } => delete(app, *tunnel_id),
         Op::StartAll => {
             app.start_all();
-            Outcome::Applied
+            Outcome::ok()
         }
         Op::StopAll => {
             app.stop_all();
-            Outcome::Applied
+            Outcome::ok()
         }
         Op::Create { cfg } => create(app, cfg),
-        Op::Update { tunnel_id, cfg } => update(app, *tunnel_id, cfg, expect_rev, current),
-        Op::PortScan { tunnel_id } => {
-            // Accepted, with no rows: the scan is a side query, not a state
-            // change. Reporting `ok` with an empty list tells the client "heard
-            // you, nothing to say yet" rather than leaving its `req_id` pending.
-            if !exists(app, *tunnel_id) {
-                return not_found(*tunnel_id);
-            }
-            Outcome::Applied
-        }
+        Op::Update { tunnel_id, cfg } => update(app, *tunnel_id, cfg),
+        Op::PortScan { tunnel_id } => port_scan(app, *tunnel_id),
     }
 }
 
-/// Whether the id is in the authoritative table.
-fn exists(app: &App, id: u64) -> bool {
-    app.tunnels.iter().any(|t| t.cfg.id == id)
-}
-
-/// The "no such tunnel" refusal, naming the id so the log and the client agree.
-fn not_found(id: u64) -> Outcome {
-    refuse(
-        "not_found",
-        format!("转发 #{id} 已不存在（可能已被其它客户端删除）"),
-        format!("Forward #{id} no longer exists (another client may have deleted it)"),
-    )
-}
-
-/// The `Stale` refusal, used only if a caller builds a `Reply` from it directly.
-fn stale_error() -> WireError {
-    WireError {
-        code: "stale".to_string(),
-        zh: "状态已更新，请确认后重试".to_string(),
-        en: "The state changed; review it and try again".to_string(),
+/// The name of an op for the log, matching the wire token.
+pub fn op_name(op: &Op) -> &'static str {
+    match op {
+        Op::Start { .. } => "start",
+        Op::Stop { .. } => "stop",
+        Op::Restart { .. } => "restart",
+        Op::Delete { .. } => "delete",
+        Op::StartAll => "start_all",
+        Op::StopAll => "stop_all",
+        Op::Create { .. } => "create",
+        Op::Update { .. } => "update",
+        Op::PortScan { .. } => "port_scan",
     }
 }
 
-/// Create a tunnel. The **server** allocates the id, never the client.
-fn create(app: &mut App, cfg: &TunnelConfig) -> Outcome {
-    let Some(id) = app.next_tunnel_id() else {
-        return refuse(
-            "id_exhausted",
-            "无法分配新的转发编号，请清理配置中的 id",
-            "No free forward id is left; clean up the ids in the config",
+fn start(app: &mut App, id: u64) -> Outcome {
+    if app.tunnel(id).is_none() {
+        return not_found("start", id);
+    }
+    app.start_tunnel(id);
+    Outcome::ok()
+}
+
+fn stop(app: &mut App, id: u64) -> Outcome {
+    if app.tunnel(id).is_none() {
+        return not_found("stop", id);
+    }
+    app.stop_tunnel(id);
+    Outcome::ok()
+}
+
+fn restart(app: &mut App, id: u64) -> Outcome {
+    if app.tunnel(id).is_none() {
+        return not_found("restart", id);
+    }
+    // One shot: the owner stops and starts without an intermediate state a client
+    // could observe and act on.
+    app.supervisor_stop(id);
+    app.forget_runtime_state(id);
+    app.start_tunnel(id);
+    Outcome::ok()
+}
+
+fn delete(app: &mut App, id: u64) -> Outcome {
+    if app.tunnel(id).is_none() {
+        return not_found("delete", id);
+    }
+    app.delete_tunnel(id);
+    Outcome::ok()
+}
+
+/// Create a tunnel the client described.
+///
+/// The id is **always** assigned here: `cfg.id` is discarded, because two clients
+/// creating at the same moment would otherwise both claim the same number.
+fn create(app: &mut App, cfg: &crate::model::TunnelConfig) -> Outcome {
+    if let Err(e) = crate::config::validate_tunnel(cfg) {
+        return rejected("create", "invalid_config", &e.to_string());
+    }
+    let Some(id) = app.next_free_id() else {
+        return Outcome::failed(
+            "id_space_exhausted",
+            "转发 ID 已用尽，无法新建。",
+            "The tunnel id space is exhausted; nothing can be created.",
         );
     };
     let mut next = cfg.clone();
     next.id = id;
-    if let Err(e) = crate::config::validate_tunnel(&next) {
-        return refuse("invalid_config", format!("配置无效: {e}"), format!("Invalid definition: {e}"));
-    }
     if let Some(existing) = app.duplicate_of(&next) {
-        return refuse(
+        eventlog::action_duplicate_skipped("client", &next.name, &existing);
+        return Outcome::failed(
             "duplicate",
-            format!("已存在相同的转发「{existing}」"),
-            format!("The same forward already exists as \"{existing}\""),
+            format!("已存在含义相同的转发「{existing}」。"),
+            format!("A forward with the same meaning already exists: \"{existing}\"."),
         );
     }
-    if let Some(conflict) = app.listen_conflict_name(&next) {
-        return refuse(
+    if let Some(conflict) = app.listen_conflict_for(&next) {
+        return Outcome::failed(
             "listen_conflict",
-            format!("监听地址与「{conflict}」冲突"),
-            format!("The listen endpoint collides with \"{conflict}\""),
+            format!("监听地址与「{conflict}」冲突。"),
+            format!("The listen endpoint collides with \"{conflict}\"."),
         );
     }
-    // Names are unique per table; a second "web" from another client becomes
-    // "web-2" rather than being refused, which is what the form does locally.
-    next.name = app.cfg.unique_name(&next.name, None);
-    next.enabled = true;
-    if let Err(e) = app.adopt_created(next.clone()) {
-        return refuse("save_failed", format!("保存配置失败: {e}"), format!("Cannot save the config: {e}"));
-    }
-    app.set_status(StatusMsg::info(crate::help::bi(
-        &format!("已创建「{}」", next.name),
-        &format!("Created \"{}\"", next.name),
-    )));
-    Outcome::Applied
+    app.add_tunnel(next);
+    Outcome::ok()
 }
 
-/// Replace an existing definition, then rebuild its connection.
-fn update(app: &mut App, id: u64, cfg: &TunnelConfig, expect_rev: Option<u64>, current: u64) -> Outcome {
-    if !exists(app, id) {
-        return not_found(id);
-    }
-    if !check_rev(expect_rev, current) {
-        return Outcome::Stale;
-    }
-    // The pair must agree: otherwise one update could rewrite a *different*
-    // tunnel than the one the user confirmed.
-    if cfg.id != id {
-        return refuse(
-            "id_mismatch",
-            format!("更新目标不一致（消息 id={}，配置 id={}）", id, cfg.id),
-            format!("The update names two different forwards (message id={id}, definition id={})", cfg.id),
-        );
+/// Replace an existing definition.
+fn update(app: &mut App, id: u64, cfg: &crate::model::TunnelConfig) -> Outcome {
+    if app.tunnel(id).is_none() {
+        return not_found("update", id);
     }
     if let Err(e) = crate::config::validate_tunnel(cfg) {
-        return refuse("invalid_config", format!("配置无效: {e}"), format!("Invalid definition: {e}"));
+        return rejected("update", "invalid_config", &e.to_string());
     }
-    // A duplicate is fine when it is the same id (editing a tunnel into itself).
-    if let Some(existing) = app.duplicate_of(cfg)
-        && existing != cfg.name
-    {
-        return refuse(
-            "duplicate",
-            format!("已存在相同的转发「{existing}」"),
-            format!("The same forward already exists as \"{existing}\""),
-        );
-    }
-    if let Some(conflict) = app.listen_conflict_name(cfg) {
-        return refuse(
-            "listen_conflict",
-            format!("监听地址与「{conflict}」冲突"),
-            format!("The listen endpoint collides with \"{conflict}\""),
-        );
-    }
-    if let Err(e) = app.adopt_updated(id, cfg.clone()) {
-        return refuse("save_failed", format!("保存配置失败: {e}"), format!("Cannot save the config: {e}"));
-    }
-    Outcome::Applied
+    let mut next = cfg.clone();
+    next.id = id;
+    app.replace_tunnel(next);
+    Outcome::ok()
 }
 
-/// The failure kind a refusal in `stage` maps to, for the client's status line.
+/// Start a peer port scan for one tunnel.
 ///
-/// Kept next to the refusals so the mapping cannot drift from the wording.
-pub fn refusal_kind(code: &str) -> FailureKind {
-    match code {
-        "invalid_config" => FailureKind::Unknown,
-        "listen_conflict" => FailureKind::PortInUse,
-        _ => FailureKind::Unknown,
+/// The scan runs on the server because it needs a live SSH session, which only the
+/// owner has. Not implemented in this change: the scan needs a form to install its
+/// result into, and a headless server has none. It is refused explicitly rather
+/// than silently doing nothing, so a client can explain itself.
+fn port_scan(app: &mut App, id: u64) -> Outcome {
+    match app.tunnel(id) {
+        None => not_found("port_scan", id),
+        Some(_) => Outcome::failed(
+            "unsupported",
+            "server 模式下暂不支持扫描对端端口，请在单进程模式下使用。",
+            "Scanning the peer's ports is not available in server mode yet; use the \
+             single-process mode for it.",
+        ),
     }
+}
+
+fn not_found(op: &str, id: u64) -> Outcome {
+    eventlog::server_command_rejected(op, "not_found", &format!("tunnel {id}"));
+    Outcome::failed(
+        "not_found",
+        format!("转发 {id} 已不存在（可能已被其他客户端删除）。"),
+        format!("Tunnel {id} no longer exists (another client may have deleted it)."),
+    )
+}
+
+fn rejected(op: &str, code: &str, detail: &str) -> Outcome {
+    eventlog::server_command_rejected(op, code, detail);
+    Outcome::failed(code, format!("操作被拒绝：{detail}"), format!("The action was refused: {detail}"))
 }

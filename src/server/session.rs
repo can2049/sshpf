@@ -1,260 +1,332 @@
-//! Where a listening socket becomes a client: accept, handshake, and the two
-//! threads that carry frames in each direction.
+//! One client's session: handshake, the read loop, and the reply path.
 //!
-//! # The shape, and why it is three pieces
+//! # Why this thread exists
 //!
-//! ```text
-//! accept ─► handshake (on the server loop's own thread, bounded by a timeout)
-//!            │
-//!            ├─► reader thread: frames ──► mpsc ──► server main loop
-//!            └─► writer thread: mpsc ──► frames
-//! ```
+//! Accepting a connection and *serving* it are different latencies: a client may
+//! sit idle for hours, so its reads must never block the accept loop; and a command
+//! needs an answer, so its writes must never block on the state lock. One thread
+//! per client (reader + writer on the same socket) is the simplest shape that
+//! satisfies both, and ten clients is the documented ceiling.
 //!
-//! The handshake stays synchronous with the accept loop on purpose: it is bounded
-//! (a read timeout plus a version check), and doing it inline means a half-open
-//! connection that never says `Hello` cannot be counted as a client or leak two
-//! threads. `client_count` is what decides whether the server may shut down, so
-//! counting must happen only after a connection has identified itself.
+//! # The handshake is a gate, not a formality
 //!
-//! # Why the welcome frame is not sent here
+//! The first frame must be a [`ClientMsg::Hello`] carrying the config path and the
+//! token. Only after both check out does the client receive
+//! [`ServerMsg::Welcome`], and only then is it registered for broadcasts and
+//! **counted**. Anything else — a wrong token, a wrong version, a different config,
+//! or no `Hello` within [`ipc::HANDSHAKE_TIMEOUT`] — is refused with a frame that
+//! says what to do, and the socket is closed. Counting only on welcome is what
+//! keeps a half-open connection from pinning the server open forever.
 //!
-//! [`ServerMsg::Welcome`] carries a snapshot, and a snapshot carries the
-//! `revision` and `client_count`. Neither is known until the main loop has added
-//! this session to the count — so the handshake returns an empty queue and the
-//! loop pushes `Welcome` as the first frame of the broadcast. That keeps one
-//! place (`broadcast`) responsible for every frame a client receives.
-//!
-//! # Why each session gets a bounded send queue
-//!
-//! The broadcast loop must never block on one client's socket: a window that
-//! stopped reading (suspended laptop, wedged terminal) would otherwise freeze
-//! every other client's view. The writer thread pulls from a small
-//! [`mpsc::SyncSender`], so "this client cannot keep up" surfaces at the *enqueue*
-//! (`try_send` → `Full`) instead of inside a `write` that has nowhere to put the
-//! bytes. A full queue is the signal to drop that session, which is honest: the
-//! alternative is buffering without limit.
-//!
-//! Belongs here: accept + handshake, session identity, and the reader/writer
-//! threads for one connection.
-//! Does not belong: deciding what a command means ([`super::commands`]), what to
-//! broadcast ([`super::broadcast`]), or when to shut down ([`super::lifecycle`]).
+//! Belongs here: one connection's life.
+//! Does not belong: counting clients ([`super::state`]), fan-out
+//! ([`super::broadcast`]), or what a command does ([`super::commands`]).
 
-use std::io::Write;
-use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
-use std::thread::JoinHandle;
+use std::io::{BufWriter, Write};
+use std::net::{SocketAddr, TcpStream};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use crate::app::App;
-use crate::ipc::{self, ClientMsg, ProtocolError, ServerMsg, check_config, check_version};
+use crate::eventlog;
+use crate::ipc::{self, ClientMsg, ServerMsg, WireError};
 
-/// How long a connecting peer has to send its `Hello`.
-const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
+use super::framing::{FrameReader, Incoming};
+use super::state::Shared;
 
-/// How many snapshot frames may queue for one client before it is dropped.
+/// How long the loop waits for one frame before re-checking its own flags.
 ///
-/// Two is enough for "one being written, one superseding it": snapshots are full
-/// replacements, so a third means the client is not reading at all.
-pub const SNAPSHOT_QUEUE: usize = 2;
+/// Short enough that a shutdown or a lagging client is noticed promptly, long
+/// enough that an idle client costs almost nothing.
+const READ_POLL: Duration = Duration::from_millis(200);
 
-/// One event the server main loop must react to.
-#[derive(Debug)]
-pub enum SessionEvent {
-    /// A peer completed the handshake and became a client.
-    Opened { id: u64 },
-    /// One command from a client.
-    Command { id: u64, req_id: u64, expect_rev: Option<u64>, op: crate::ipc::Op },
-    /// The client said goodbye (`via_bye: true`) or its socket ended (`false`).
-    Closed { id: u64, via_bye: bool },
-}
-
-/// The server's handle on one connected client.
-pub struct Session {
-    /// Session identity, unique within the process.
-    pub id: u64,
-    /// Snapshot frames to this client; `None` once it can no longer be served.
-    outbox: Option<SyncSender<ServerMsg>>,
-    /// Set when this client said goodbye, so the shutdown trigger can tell a
-    /// deliberate exit from a crash (they get different grace windows).
-    pub said_bye: bool,
-    /// The writer thread, joined on removal so the socket is really closed.
-    writer: Option<JoinHandle<()>>,
-}
-
-impl Session {
-    /// A session whose queue the caller owns, for exercising the fan-out rules
-    /// without a socket.
-    #[cfg(test)]
-    pub fn with_queue(id: u64, outbox: SyncSender<ServerMsg>) -> Session {
-        Session { id, outbox: Some(outbox), said_bye: false, writer: None }
-    }
-
-    /// Try to queue one message without ever blocking the broadcaster.
-    ///
-    /// Returns `false` when the queue is full or the writer is gone: either way
-    /// this client can no longer be kept up to date, and the caller drops it.
-    pub fn try_send(&mut self, msg: ServerMsg) -> bool {
-        let Some(outbox) = self.outbox.as_ref() else {
-            return false;
-        };
-        match outbox.try_send(msg) {
-            Ok(()) => true,
-            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
-                self.outbox = None;
-                false
-            }
-        }
-    }
-
-    /// Close the queue and wait for the writer, so the peer sees a clean EOF.
-    pub fn shut(&mut self) {
-        self.outbox = None;
-        if let Some(handle) = self.writer.take() {
-            // Best effort: the writer observes the closed channel and returns.
-            let _ = handle.join();
-        }
-    }
-}
-
-/// Accept every pending connection, handshaking each one.
+/// Spawn the session thread for one accepted connection.
 ///
-/// Non-blocking: the server main loop polls this once per tick, so accepting
-/// needs no thread of its own. Newly opened sessions are appended to `sessions`
-/// and reported on `events` as [`SessionEvent::Opened`], in that order, so the
-/// loop can send each one its own `Welcome` against the final count.
-pub fn accept_pending(
-    listener: &UnixListener,
-    app: &App,
-    next_id: &AtomicU64,
-    events: &std::sync::mpsc::Sender<SessionEvent>,
-    sessions: &mut Vec<Session>,
-) {
-    loop {
-        let Ok((stream, _addr)) = listener.accept() else {
-            // `WouldBlock` is the normal "nothing pending" answer for a
-            // non-blocking listener; a real error will simply be retried on the
-            // next tick, and the loop must not stall the UI either way.
-            return;
-        };
-        let id = next_id.fetch_add(1, Ordering::Relaxed);
-        if let Some(session) = handshake(stream, id, app, events) {
-            sessions.push(session);
-        }
+/// A thread that cannot be created is reported and the connection dropped: the
+/// client retries, and the alternative (accepting without ever serving) looks
+/// exactly like a hang.
+pub fn spawn(stream: TcpStream, peer: SocketAddr, shared: Shared) {
+    let spawned = std::thread::Builder::new()
+        .name(format!("sshpf-session-{}", peer.port()))
+        .spawn(move || serve(stream, peer, shared));
+    if let Err(e) = spawned {
+        crate::logging::error("server.session_thread_failed", &[("msg", &e.to_string())]);
     }
 }
 
-/// Complete the handshake and start the two threads, or reject the peer.
-///
-/// A rejected peer is not a server failure: it is an old client, a different
-/// config, or a random process poking the socket. It is told why — when the
-/// protocol still allows a frame — and dropped.
-fn handshake(
-    mut stream: UnixStream,
-    id: u64,
-    app: &App,
-    events: &std::sync::mpsc::Sender<SessionEvent>,
-) -> Option<Session> {
-    // The accepted socket inherits the listener's blocking mode on Linux, so set
-    // the handshake bound explicitly rather than assuming.
-    stream.set_read_timeout(Some(HELLO_TIMEOUT)).ok()?;
-    let (proto_version, config_path) = match ipc::read_client_msg(&mut stream) {
-        // A first frame that is not `Hello` cannot be answered meaningfully: the
-        // peer is not speaking this handshake.
-        Ok(Some(ClientMsg::Hello { proto_version, config_path, .. })) => (proto_version, config_path),
-        Ok(_) => return None,
-        Err(_) => return None,
+/// The whole life of one connection.
+fn serve(stream: TcpStream, peer: SocketAddr, shared: Shared) {
+    if let Err(e) = negotiate_timeouts(&stream) {
+        eventlog::server_connection_refused(&format!("{peer}: {e}"));
+        return;
+    }
+    let Ok(read_half) = stream.try_clone() else {
+        eventlog::server_connection_refused(&format!("{peer}: cannot clone the socket"));
+        return;
     };
-    if let Err(e) = check_version(proto_version).and_then(|()| check_config(&served_config(app), &config_path)) {
-        let _ = reject(&mut stream, &e);
+    let mut reader = std::io::BufReader::new(read_half);
+    let mut writer = BufWriter::new(stream);
+
+    let Some(session) = handshake(&mut reader, &mut writer, peer, &shared) else {
+        return;
+    };
+    run_session(reader, &mut writer, session, shared, peer);
+}
+
+/// What a successful handshake produced.
+struct Session {
+    /// The registry id, used for removal when this session ends.
+    id: u64,
+    /// Encoded frames waiting to be written; bounded by the broadcaster.
+    rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    /// Set by the broadcaster when this client fell too far behind.
+    lagging: Arc<AtomicBool>,
+}
+
+/// Validate the opening `Hello`, returning the served config path on success.
+///
+/// Every rejection writes a frame that tells the client what to do and is recorded
+/// once, so the caller only has to stop.
+fn admit(
+    reader: &mut std::io::BufReader<TcpStream>,
+    writer: &mut BufWriter<TcpStream>,
+    peer: SocketAddr,
+    shared: &Shared,
+) -> Option<String> {
+    let msg = match ipc::read_client_msg(reader) {
+        Ok(Some(msg)) => msg,
+        Ok(None) => {
+            eventlog::server_connection_refused(&format!("{peer}: closed before Hello"));
+            return None;
+        }
+        Err(e) => {
+            refuse(writer, "bad_frame", &e.to_string());
+            eventlog::server_connection_refused(&format!("{peer}: {e}"));
+            return None;
+        }
+    };
+    let ClientMsg::Hello { proto_version, config_path, token } = msg else {
+        refuse(writer, "expected_hello", "the first frame must be a hello");
+        eventlog::server_connection_refused(&format!("{peer}: the first frame was not a hello"));
+        return None;
+    };
+    if let Err(e) = ipc::check_version(proto_version) {
+        refuse(writer, e.code, &e.error.en);
+        eventlog::server_connection_refused(&format!("{peer}: {}", e.code));
         return None;
     }
-    // From here the peer is a client. Clear the handshake bound so the reader can
-    // block normally on the next frame.
-    stream.set_read_timeout(None).ok()?;
-    let session = start_threads(stream, id, events)?;
-    // Only now is it a client: the count drives the shutdown decision, so a
-    // half-open connection that never said `Hello` must not appear in it.
-    let _ = events.send(SessionEvent::Opened { id });
-    Some(session)
+    let served = shared.config_display();
+    if let Err(e) = ipc::check_config(&served, &config_path) {
+        refuse(writer, e.code, &e.error.en);
+        eventlog::server_connection_refused(&format!("{peer}: {}", e.code));
+        return None;
+    }
+    if let Err(e) = ipc::check_token(&shared.token(), &token) {
+        refuse(writer, e.code, &e.error.en);
+        eventlog::server_connection_refused(&format!("{peer}: {}", e.code));
+        return None;
+    }
+    Some(served)
 }
 
-/// Epoch milliseconds for a snapshot's `server_now_ms`.
-///
-/// `model::now_unix()` counts **seconds**; the wire wants milliseconds, and a
-/// client derives every age from a difference against this one value, so the
-/// multiplication has to happen exactly once, here.
-pub fn now_ms() -> i64 {
-    crate::model::now_unix().saturating_mul(1000)
+/// Read the `Hello`, validate it, and send the `Welcome`.
+fn handshake(
+    reader: &mut std::io::BufReader<TcpStream>,
+    writer: &mut BufWriter<TcpStream>,
+    peer: SocketAddr,
+    shared: &Shared,
+) -> Option<Session> {
+    // Everything that can refuse the client — a malformed frame, a wrong version, a
+    // different config, a wrong token — is one gate, so the welcome path below has
+    // no refusals left in it.
+    let served = admit(reader, writer, peer, shared)?;
+
+    // Counting happens here, after the token check, and never before: a connection
+    // refused for a bad secret must not have incremented `client_count`, or anyone
+    // who can reach the port could keep the server alive by probing it.
+    if !shared.admit_client(&peer) {
+        refuse(writer, "server_full", "the server is at its client limit or shutting down");
+        eventlog::server_connection_refused(&format!("{peer}: refused (full or stopping)"));
+        return None;
+    }
+
+    let (tx, rx) = std::sync::mpsc::sync_channel(super::broadcast::CLIENT_QUEUE);
+    let lagging = Arc::new(AtomicBool::new(false));
+    let id = super::broadcast::register(tx, lagging.clone());
+    let welcome = ServerMsg::Welcome {
+        proto_version: ipc::PROTO_VERSION,
+        config_path: served,
+        server_pid: std::process::id(),
+        snapshot: shared.snapshot(),
+    };
+    if let Err(e) = ipc::write_message(writer, &welcome) {
+        // Vanished between connecting and being welcomed: give the slot back, or the
+        // count would stay inflated and the server would never exit.
+        super::broadcast::unregister(id);
+        shared.release_client("welcome_failed");
+        eventlog::server_connection_refused(&format!("{peer}: {e}"));
+        return None;
+    }
+    Some(Session { id, rx, lagging })
 }
 
-/// The config path this server serves, in the same lexical form a client sends.
-///
-/// Both sides derive it from `ipc::endpoint_for(config)`, which normalises
-/// lexically, so the strings compare equal without a `canonicalize` that would
-/// fail before the config file exists.
-pub fn served_config(app: &App) -> String {
-    ipc::endpoint_for(&app.paths.config).config_path.display().to_string()
-}
-
-/// Send a refusal frame, best effort.
-fn reject(stream: &mut UnixStream, err: &ProtocolError) -> std::io::Result<()> {
-    let msg = ServerMsg::Error { code: err.code.to_string(), error: err.error.clone() };
-    ipc::write_message(stream, &msg).and_then(|()| stream.flush())
-}
-
-/// Spawn the reader and writer threads for one accepted client.
-fn start_threads(stream: UnixStream, id: u64, events: &std::sync::mpsc::Sender<SessionEvent>) -> Option<Session> {
-    let read_half = stream.try_clone().ok()?;
-    let (outbox, out_rx) = sync_channel::<ServerMsg>(SNAPSHOT_QUEUE);
-    spawn_reader(read_half, id, events.clone())?;
-    let writer = std::thread::Builder::new()
-        .name(format!("sshpf-srv-tx{id}"))
-        .spawn(move || writer_loop(stream, out_rx))
-        .ok()?;
-    Some(Session { id, outbox: Some(outbox), said_bye: false, writer: Some(writer) })
-}
-
-/// Read frames from one client until it goes away.
-fn spawn_reader(mut stream: UnixStream, id: u64, events: std::sync::mpsc::Sender<SessionEvent>) -> Option<()> {
-    std::thread::Builder::new()
-        .name(format!("sshpf-srv-rx{id}"))
-        .spawn(move || {
-            loop {
-                match ipc::read_client_msg(&mut stream) {
-                    Ok(Some(ClientMsg::Command { req_id, expect_rev, op })) => {
-                        if events.send(SessionEvent::Command { id, req_id, expect_rev, op }).is_err() {
-                            return;
-                        }
-                    }
-                    Ok(Some(ClientMsg::Bye { .. })) => {
-                        let _ = events.send(SessionEvent::Closed { id, via_bye: true });
-                        return;
-                    }
-                    // A repeated `Hello` or a log subscription is accepted and
-                    // ignored: every snapshot already carries the log tail the
-                    // client renders, and the handshake is over.
-                    Ok(Some(_)) => {}
-                    Ok(None) => break,
-                    Err(_) => break,
+/// Serve a welcomed client until it leaves.
+fn run_session(
+    reader: std::io::BufReader<TcpStream>,
+    writer: &mut BufWriter<TcpStream>,
+    session: Session,
+    shared: Shared,
+    peer: SocketAddr,
+) {
+    let mut reader = FrameReader::new(reader);
+    let mut last_exit = false;
+    let mut reason = "eof";
+    loop {
+        if shared.is_stopping() {
+            reason = "shutdown";
+            break;
+        }
+        match reader.read_incoming() {
+            Incoming::Msg(msg) => match handle_msg(writer, msg, &shared) {
+                Flow::Continue => {}
+                Flow::Bye(exits) => {
+                    last_exit = exits;
+                    acknowledge_bye(writer, &shared);
+                    break;
                 }
+                Flow::Dead(why) => {
+                    reason = why;
+                    break;
+                }
+            },
+            Incoming::Closed => {
+                reason = "eof";
+                break;
             }
-            // EOF or a broken frame: the client vanished without a `Bye` (crash,
-            // `SIGKILL`, closed terminal). The count must still drop, or the
-            // server would never be allowed to exit.
-            let _ = events.send(SessionEvent::Closed { id, via_bye: false });
-        })
-        .ok()
-        .map(|_| ())
+            // Nothing complete this poll: not an event, so the loop continues to
+            // the lagging check and the outbound queue below.
+            Incoming::Timeout => {}
+            Incoming::Failed(e) => {
+                // This session was already welcomed, so a broken frame or a reset
+                // socket is not a *refusal* — that wording belongs to the handshake
+                // gate. On Windows a killed window arrives here as
+                // `WSAECONNRESET`, which is exactly the "the window died" fact
+                // whoever reads the log is looking for.
+                eventlog::server_session_ended(&format!("{peer}: {e}"));
+                reason = "read_failed";
+                break;
+            }
+        }
+        if session.lagging.load(Ordering::Relaxed) {
+            reason = "lagging";
+            break;
+        }
+        drain_queue(writer, &session);
+    }
+    super::broadcast::unregister(session.id);
+    // Flush first: the last client leaving should still receive the reply that
+    // acknowledges its own `Bye`, and the count must not drop before that frame is
+    // on the wire.
+    drain_queue(writer, &session);
+    let remaining = shared.release_client(reason);
+    super::lifecycle::on_client_left(&shared, remaining, last_exit);
 }
 
-/// Drain the queue into the socket; stop when the queue closes or a write fails.
-fn writer_loop(mut stream: UnixStream, out_rx: Receiver<ServerMsg>) {
-    while let Ok(msg) = out_rx.recv() {
-        if ipc::write_message(&mut stream, &msg).and_then(|()| stream.flush()).is_err() {
+/// Answer a `Bye` so the client learns how many clients remain.
+///
+/// Best effort: a client that already closed its socket is not an error, and the
+/// count it would have been told is only advisory anyway (the server recounted).
+fn acknowledge_bye(writer: &mut BufWriter<TcpStream>, shared: &Shared) {
+    let reply = ServerMsg::Reply {
+        req_id: 0,
+        ok: true,
+        rev: shared.revision(),
+        error: None,
+        remaining: Some(shared.client_count()),
+        ports: Vec::new(),
+    };
+    let _ = write_message(writer, &reply);
+}
+
+/// What handling one message means for the loop.
+enum Flow {
+    Continue,
+    /// The client said goodbye; carries its `last_exit` proposal.
+    Bye(bool),
+    /// The connection is unusable.
+    Dead(&'static str),
+}
+
+/// Apply one client message.
+fn handle_msg(writer: &mut BufWriter<TcpStream>, msg: ClientMsg, shared: &Shared) -> Flow {
+    match msg {
+        ClientMsg::Command { req_id, expect_rev, op } => {
+            let outcome = super::commands::run(shared, &op, expect_rev);
+            let reply = ServerMsg::Reply {
+                req_id,
+                ok: outcome.ok,
+                rev: shared.revision(),
+                error: outcome.error,
+                remaining: Some(shared.client_count()),
+                ports: outcome.ports,
+            };
+            if write_message(writer, &reply) { Flow::Continue } else { Flow::Dead("write_failed") }
+        }
+        ClientMsg::Bye { last_exit } => {
+            eventlog::client_bye(last_exit, Some(shared.client_count()));
+            Flow::Bye(last_exit)
+        }
+        ClientMsg::Ping => {
+            let pong = ServerMsg::Pong { server_now_ms: super::state::now_ms() };
+            if write_message(writer, &pong) { Flow::Continue } else { Flow::Dead("write_failed") }
+        }
+        // A second `Hello` on an established session is protocol misuse, not a
+        // reason to drop a working client. Log subscriptions are not implemented
+        // yet; ignoring them keeps an older client working.
+        ClientMsg::Hello { .. } | ClientMsg::SubscribeLogs { .. } => Flow::Continue,
+    }
+}
+
+/// Write one message, reporting whether it landed.
+fn write_message(writer: &mut BufWriter<TcpStream>, msg: &ServerMsg) -> bool {
+    ipc::write_message(writer, msg).is_ok()
+}
+
+/// Write every frame the broadcaster queued for this client.
+///
+/// The queue holds complete, already-framed bytes (see [`super::broadcast`]), so
+/// this writes them verbatim: no re-encoding and, crucially, no re-adding of a
+/// length prefix.
+fn drain_queue(writer: &mut BufWriter<TcpStream>, session: &Session) {
+    while let Ok(frame) = session.rx.try_recv() {
+        if writer.write_all(&frame).is_err() {
             return;
         }
+        let _ = writer.flush();
     }
-    // Shutting the write half is what tells the peer the session ended.
-    let _ = stream.shutdown(std::net::Shutdown::Write);
+}
+
+/// Write a protocol-level refusal, best effort.
+fn refuse(writer: &mut BufWriter<TcpStream>, code: &str, detail: &str) {
+    let msg = ServerMsg::Error {
+        code: code.to_string(),
+        error: WireError {
+            code: code.to_string(), zh: format!("服务端拒绝连接：{detail}"), en: detail.to_string()
+        },
+    };
+    let _ = ipc::write_message(writer, &msg);
+}
+
+/// Give the socket timeouts so the loop can poll its own flags between frames.
+///
+/// A read timeout is what makes the session observable: the loop can then check
+/// whether the server is shutting down or the client fell behind, instead of
+/// blocking forever on a client that will never speak again. The write timeout
+/// bounds a wedged client so one unresponsive peer cannot hold a session thread.
+fn negotiate_timeouts(stream: &TcpStream) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(READ_POLL))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    // Small frames, latency matters: a client's reply should not wait for Nagle.
+    let _ = stream.set_nodelay(true);
+    Ok(())
 }
