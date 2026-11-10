@@ -6,7 +6,7 @@
 
 > 历史施工图（2026-11）。**行数与文件名多为当时的估算**，实际实现已与之分化（例如现在叫
 > `src/client/`、`src/server/`，传输层是回环 TCP）。本文保留的价值：分阶段纪律、不变量清单、
-> 以及 §11 的验收条款。当前状态见 [../../client-server.md](../../client-server.md)。
+> 以及 §11 的验收条款。当前状态：该方案已回退，见 [../../architecture.md](../../architecture.md#进程模型--process-model)。
 
 ## 0. 不变量
 

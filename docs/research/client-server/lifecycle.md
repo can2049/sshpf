@@ -1,7 +1,7 @@
 # 生命周期与单例选举 / Process lifecycle & singleton election（调研稿）
 
 > **这份文档回答**：client 与 server 怎么起、怎么保证全局只有一个 server、最后一个 client 退出时发生什么、宽限窗口为什么分两种、信号怎么处理、崩溃后怎么办。
-> **不负责**：协议消息字段（见 [protocol.md](protocol.md)）、代码怎么改（见 [migration.md](migration.md)）、当前行为（见 [../../client-server.md](../../client-server.md)）。
+> **不负责**：协议消息字段（见 [protocol.md](protocol.md)）、代码怎么改（见 [migration.md](migration.md)）、当前行为（该方案已回退，见 [../../architecture.md](../../architecture.md#进程模型--process-model)）。
 > **相关代码路径**：`src/server/election.rs`、`src/server/start.rs`、`src/server/session.rs`、`src/client/connect.rs`、`src/sys/signals.rs`。
 
 > 历史设计稿（2026-11），写于实现之前。**判断已落地**；细节以 `src/server/`、`src/client/` 为准。

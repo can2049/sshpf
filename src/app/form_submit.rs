@@ -279,14 +279,6 @@ impl App {
 
     fn commit_form_create(&mut self, mut cfg: TunnelConfig) {
         cfg.enabled = true;
-        // A mirror does not own the config file: the server assigns the id and
-        // persists. The local `cfg.tunnels` copy is left alone so the table keeps
-        // matching what the server last sent, until the next snapshot adds the
-        // real row (with the id the server chose).
-        if self.forward(crate::ipc::Op::Create { cfg: Box::new(cfg.clone()) }) {
-            self.close_overlay();
-            return;
-        }
         eventlog::tunnel_created(&cfg, "form");
         self.cfg.tunnels.push(cfg.clone());
         // Remember where the row landed *before* pushing, rather than recovering
@@ -306,13 +298,6 @@ impl App {
         let Some(cfg) = self.pending_form.take() else {
             return;
         };
-        // The server owns the definition *and* the running session, so an edit is
-        // one command (stop, replace, persist, restart) rather than four local
-        // steps a mirror cannot perform.
-        if self.forward(crate::ipc::Op::Update { tunnel_id: eid, cfg: Box::new(cfg.clone()) }) {
-            self.close_overlay();
-            return;
-        }
         if let Some(slot) = self.cfg.find_mut(eid) {
             let keep_enabled = slot.enabled;
             let mut next = cfg.clone();

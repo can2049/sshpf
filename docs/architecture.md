@@ -33,8 +33,6 @@
 | `ssh` | `model`、`text`、`logging`、`eventlog`、`sys` | `app`、`ui`、`keys`、`tunnel` |
 | 叶子层 | 彼此之间尽量少，且只向下 | 任何上层 |
 
-**`ipc` / `server` / `client` 的位置**：`ipc` 被 `server` 与 `client` **双向**依赖，所以只能依赖叶子层，绝不许 `use crate::app/ui/keys/tunnel/cli`——否则会形成环。`server` 与 `client` 都依赖 `ipc`，且都**不**依赖对方的内部实现。传输层是**回环 TCP**，不是 Unix 域套接字（`std` 在 Windows 上没有 UDS API），因此只有一套发现协议和一套失败模式。取舍与安全边界见 [client-server.md](client-server.md)。
-
 **这次重构修掉的三个违规**（保留作判例，避免回潮）：
 
 | 违规 | 修法 |
@@ -45,13 +43,24 @@
 
 ## 进程模型 / Process model
 
-| 进程 | 谁起的 | 拥有隧道？ | 写 `config.toml`？ | 跑在哪 |
-|---|---|---|---|---|
-| `server`（每份配置唯一） | 首个 client 自动拉起，或 `--server` | **是** | **是**（唯一写者） | 两平台 |
-| `client`（任意多个） | 用户运行 `sshpf` | 否，镜像快照 | 否（权威在 server） | 两平台 |
-| 单进程（无 server） | `--check` / `--list-hosts` | 只读 | 否 | 两平台 |
+**单进程：一个 `sshpf` 进程拥有全部隧道，不做进程间协调。** 没有后台服务进程，也没有视图
+进程——你启动的那个交互进程就是唯一持有转发、唯一写 `config.toml` 的进程。
 
-`client` 与 `server` 之间**状态同步只有一条路**：全量 `Snapshot` + 单调 `revision`；**用户意图只有一条路**：`Command` + `Reply`，且 server 一律重新校验。`App` 两边同一份类型，`mirror: Option<Mirror>` 为 `Some` 时即为镜像（`src/app/mirror.rs`）。细节见 [client-server.md](client-server.md)。
+| 模式 | 谁启动 | 拥有隧道？ | 写 `config.toml`？ | 跑在哪 |
+|---|---|---|---|---|
+| 交互 TUI（默认） | 用户运行 `sshpf` | **是** | **是**（唯一写者） | 两平台 |
+| `--check` / `--list-hosts` | 同一命令加参数 | 否（只读） | 否 | 两平台 |
+
+由此得到两条语义，别按旧模型理解：
+
+- **退出即全停**：进程退出时由它自己停掉全部隧道（`app.shutdown` → `tunnel.stop` / `tunnel.exit`），
+  不存在"最后一个窗口退出才关服"这回事。
+- **`--no-restore` 只影响本进程**：它表示"本进程启动时不自动恢复 enabled 的转发"，没有
+  "传给谁"的问题。
+
+同一份 `config.toml` 被两个进程同时打开时，两边各自持有自己的隧道并各自写盘——监听端口会撞车，
+后写者覆盖前写者。这不是支持的多窗口共享，而是**两份独立状态**；要做到界面里只有一份真相，就只开
+一个进程。
 
 ## 模块地图 / Module map
 
@@ -60,13 +69,12 @@
 | 目录 | 一句话 |
 |---|---|
 | `src/main.rs`、`src/cli.rs`、`src/lib.rs` | 事件循环 + 信号、参数解析 + `USAGE` 双语文本、`pub mod` 声明 |
-| `src/app/` | 状态机：持有隧道、消费事件、确认闸、表单、多选、镜像半边 |
+| `src/app/` | 状态机：持有隧道、消费事件、确认闸、表单、多选 |
 | `src/keys/` | 按键分发，一个上下文一个 handler 文件 |
 | `src/ui/` | 纯渲染（ratatui），每帧重建命中图 |
 | `src/tunnel.rs` | 隧道监督：一线程一 `current_thread` runtime |
 | `src/config.rs` | TOML 持久化（原子写；Unix `0600`，Windows 靠 ACL） |
 | `src/ssh/` | `~/.ssh/config`、known_hosts、SOCKS5、端口探测、russh 客户端 |
-| `src/ipc/`、`src/server/`、`src/client/` | client-server 协议的唯一定义处、权威进程、视图进程 |
 | `src/model/` | 纯数据：隧道、导入表、状态、表单、失败分类 |
 | `src/text.rs` | 唯一的字符串层：宽度/截断/双语/折行/glob |
 | `src/logging/` | 落盘日志 + 崩溃捕获（**唯一允许 `unsafe`**） |

@@ -2,12 +2,12 @@
 
 > **这份文档回答**：每个 `event=` 值是什么级别、带哪些字段、什么含义、什么时候该看它。这是日志的**唯一事件清单**。
 > **不负责**：日志格式/轮转/排查配方（见 [../logging.md](../logging.md)）、崩溃机制（见 [../security.md](../security.md)）。
-> **相关代码路径**：`src/eventlog/`（`event=` 值的唯一真相：`process.rs` / `server.rs` / `tunnel.rs` / `ssh.rs` / `user.rs`）、`src/logging/`（含 `crash.*`）。
+> **相关代码路径**：`src/eventlog/`（`event=` 值的唯一真相：`process.rs` / `tunnel.rs` / `ssh.rs` / `user.rs`）、`src/logging/`（含 `crash.*`）。
 
 ## 约定 / Conventions
 
 - `event=` 是**稳定 ASCII 契约**：函数名、字符串、级别、字段名与顺序逐字不变。改它们等于改日志契约。
-- 事件家（family）= 源码里的文件：`app.*`/`config.*`/`state.*`/`log.*`/`cli.*` → `process.rs`；`server.*`/`client.*` → `server.rs`；`tunnel.*`/`forward.*`/`socks5.*` → `tunnel.rs`；`sshconfig.*`/`knownhosts.*` → `ssh.rs`；`action.*`/`import.*`/`portscan.*`/`ui.*`/`form.*` → `user.rs`；`crash.*` → `logging/`。
+- 事件家（family）= 源码里的文件：`app.*`/`config.*`/`state.*`/`log.*`/`cli.*` → `process.rs`；`tunnel.*`/`forward.*`/`socks5.*` → `tunnel.rs`；`sshconfig.*`/`knownhosts.*` → `ssh.rs`；`action.*`/`import.*`/`portscan.*`/`ui.*`/`form.*` → `user.rs`；`crash.*` → `logging/`。
 - **隧道身份字段**：所有隧道级记录的前 6 个字段固定是 `tunnel` `name` `forward` `listen` `target` `host`，所以 `grep 'tunnel=3 '` 就是一条隧道的完整时间线。下方"隧道字段"= 这 6 个字段，不再逐行重复列出。
 
 ## 进程与配置 / Process & config
@@ -40,32 +40,6 @@
 | `cli.bad_args` | ERROR | `msg` | 参数错误，进程以退出码 2 退出 |
 | `cli.stdout_failed` | WARN | `mode` | 非 TUI 模式 stdout 写失败（管道关闭、磁盘满）；**退出码仍是该模式的真实结果**，这条只是说明输出没送达 |
 
-## client-server 运行时 / client-server runtime
-
-> 两个进程替代了一个，所以「为什么和我想的不一样」多了一个候选答案：*是哪个进程、它们见上面了吗*。这一组事件就是为了只靠日志能回答这个问题。运行模型见 [../client-server.md](../client-server.md)。
-
-| `event=` | 级别 | 字段 | 含义 |
-|---|---|---|---|
-| `server.start` | INFO | `pid` `config` `socket` `keep_server` | 服务端拿到选举锁并在监听 |
-| `server.stopped` | INFO | `socket` | 主循环已退出并清理完毕 |
-| `server.election_lost` | DEBUG | `lock` | 另一进程已在服务这份配置：**正常选举结果**，本进程退出码 3 |
-| `server.stale_socket_removed` | INFO | `socket` | 认出并清掉 `SIGKILL` 残留的 socket（抢到锁之后才做） |
-| `server.client_connected` | INFO | `count` | 某 client 完成握手；`count` 含它 |
-| `server.client_disconnected` | INFO | `count` `reason` | 某 client 离开；`reason=bye`（主动告别）/`eof`（崩溃、`kill -9`、终端被杀） |
-| `server.client_dropped` | WARN | `session` `reason` | 某 client 收帧队列满（读不动），断开它以免拖住其他人；`reason=queue_full` |
-| `server.grace_started` | INFO | `grace_ms` `trigger` | 计数归零，开始宽限倒计时；`trigger=last_exit`(500ms)/`eof`(5000ms) |
-| `server.grace_cancelled` | INFO | `count` | 宽限期内新 client 连入，关服取消 |
-| `server.shutdown_begin` | INFO | `count` `active` `trigger` | 开始关服，`active` 是即将停掉的隧道数 |
-| `server.lock_failed` / `server.lock_open_failed` | ERROR | `msg` | 选举锁的 `flock` / `open` 真出错（不是「被别人持有」，那是 DEBUG 的 `server.election_lost`） |
-| `server.bind_failed` | ERROR | `msg` | 拿不到锁却仍无法 bind：socket 目录不可写、路径被占等 |
-| `server.socket_chmod_failed` | WARN | `msg` | socket 建成后没能收紧到 `0600`：同组用户可能连上它 |
-| `server.socket_unlink_failed` | WARN | `msg` | 关服时 socket 没删掉，下次启动会走残留恢复 |
-| `server.signal_unavailable` | WARN | `signal` | 服务端某个退出信号注册失败 |
-| `client.attached` | INFO | `server_pid` `config` | 本进程连上了服务端（而不是自己拥有隧道） |
-| `client.attach` | INFO | `config` | 本进程进入 client 模式 |
-| `client.server_spawned` | INFO | `server_pid` | 本进程拉起了它随后连上的服务端 |
-| `client.disconnected` | WARN | `reason` | 与服务端的连接断了：界面不再更新，必须让用户知道 |
-| `client.attach_failed` | ERROR | `msg` | 连不上也拉不起服务端：**不静默降级成单进程**，以非 0 退出 |
 
 ## SSH 配置与主机密钥 / SSH config & host keys
 

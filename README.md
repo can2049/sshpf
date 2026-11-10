@@ -99,11 +99,13 @@ sshpf --ignore-host-key-changes   # 接受已改变的主机密钥（全局降�
 
 **远端端口可直接选**：把光标放在 `远端端口` 上按 `p`，sshpf 会通过**隧道同一条 SSH 路径**去问对端正在监听哪些端口（有 `ss` 用 `ss -ltnH`，否则 `netstat -ltn`，都没有会明确告诉你）。`enter` 填入单条；或 `space` 勾选多条（`a` 全选 / `U` 清空 / `I` 反选，`r` 重扫）后 `ctrl+s`，**每个勾选端口一条 `-L` 转发**。勾选默认**全空**——发现一个服务不等于要转发它。`-R` 的列表是**只读**的（那些端口已被占用，选一个必然撞车）。
 
-### 多个窗口共享同一份状态 / Several windows, one state
+### 一个进程拥有全部转发 / One process owns every forward
 
-**一份配置只有一个后台服务进程**（`sshpf --server`，由第一个窗口自动拉起），所有窗口都是它的客户端：开第二个窗口**不会再报「端口已被占用」**，而是显示同一份状态；任何窗口的操作都会广播给所有窗口；标题栏显示 `客户端 2/client 2`。**关掉最后一个窗口 = 停掉所有转发**，所以只有它会在退出前提示。想让它常驻用 `--keep-server`。
+**你启动的那个进程就是唯一持有转发、唯一写 `config.toml` 的进程。** 没有后台服务进程，也没有视图进程；标题栏固定显示 `单进程/owner`。
 
-**Linux 与 Windows 走同一套代码路径**：传输层是回环 TCP（不是 Unix 域套接字，`std` 在 Windows 上没有 UDS API），端点目录在 Linux 是 `$XDG_RUNTIME_DIR/sshpf`、在 Windows 是 `%TEMP%\sshpf-ipc`（`dirs::runtime_dir()` 在 Windows 恒为 `None`，落到 per-user temp）。完整模型见 [docs/client-server.md](docs/client-server.md)。
+因此同一份配置**不要同时开两个 sshpf**：两个进程各自持有自己的隧道并各自写盘，监听端口会撞车，后写者覆盖前写者。要并行跑两套互不干扰的转发，用 `-c` 指向两份不同的配置文件。
+
+**Linux 与 Windows 走同一套代码路径**：纯 Rust（`russh`），没有 `ssh` 子进程，两平台的差异只有文件权限的落地方式（Unix `0600`/`0700`，Windows 靠 profile 继承的 ACL）。
 
 ### 从 `~/.ssh/config` 导入转发 / Import
 
@@ -180,7 +182,6 @@ note = ""
 |---|---|
 | `SSHPF_CONFIG` | 配置文件路径（`state.toml` 与它同目录） |
 | `SSHPF_LOG_DIR` / `SSHPF_LOG_LEVEL` | 日志目录 / `off\|error\|warn\|info\|debug`（默认 `info`；`off` 仍写崩溃记录） |
-| `SSHPF_IPC_DIR` | client-server 的端点目录（端口/令牌/锁；默认 Linux `$XDG_RUNTIME_DIR/sshpf`、Windows `%TEMP%\sshpf-ipc`）；测试用它隔离 |
 | `SSHPF_SSH_CONFIG` / `SSHPF_KNOWN_HOSTS` | 只解析这个 ssh config / 使用这个 known_hosts 文件 |
 | `NO_COLOR` | 关闭全部颜色（状态仍由符号和文字表达） |
 
@@ -197,7 +198,7 @@ tail -f ~/.local/state/sshpf/logs/sshpf.log   # 实时看结构化日志（Windo
 | 主机密钥校验失败 | 见下方[「ssh 能连但 sshpf 报 host key verification failed」](#ssh-能连但-sshpf-报-host-key-verification-failed) |
 | 认证失败 | 先手动 `ssh <主机>` 确认能免密登录，或 `ssh-add` 加载密钥 |
 | 端口被占用 | 详情页会显示占用进程的 `pid/进程名`。**如果占用者是 `sshpf` 自己**，说明有旧版本的单进程实例还在跑：退出它即可 |
-| 第二个窗口连不上 / 状态不一致 | 看 `client.attach_failed`、`server.election_lost`、`client.disconnected`；`SSHPF_IPC_DIR` 不同会让两个窗口连到不同的服务进程 |
+| 两个窗口内容不一致 | 已经不存在共享状态：每个进程各自拥有自己的转发。用 `-c` 指到不同配置来跑互相独立的两套 |
 | 某条一直 `◌ 重试` | `grep 'event=tunnel.retry_scheduled'` 看排了几次，`tunnel.retry_abandoned` 表示已放弃 |
 | 显示 `● 已连通` 但端口不通 / 休眠唤醒后不工作 | SSH 半开连接：`grep 'event=tunnel.health_failed'` 看 `cause`（`ping_timeout`/`ping_error`/`session_closed`），确认探活没被 `health_check_secs=0` 关掉；探活成功不写日志，所以**没有这条事件不等于探活没跑** |
 | 界面某块不见了 | `grep 'event=ui.render_degraded'` |
@@ -257,8 +258,8 @@ cargo fmt --check
 
 ## 已知限制（v1）
 
-- **端口占用反查进程**仅 Linux 可用（依赖 `/proc`）；其它平台上该列只是空着，不影响转发本身。**多窗口共享状态**两平台都支持（回环 TCP + 令牌）。
-- 一份配置一个服务进程；用 `-c` 指向不同配置文件就是互相独立的两套状态（socket 路径由配置路径派生）。
+- **端口占用反查进程**仅 Linux 可用（依赖 `/proc`）；其它平台上该列只是空着，不影响转发本身。
+- **同一份配置不支持多开**：一个进程拥有全部转发。用 `-c` 指向不同配置文件就是互相独立的两套状态。
 - 只支持公钥 / ssh-agent 认证，TUI 内不接管密码输入；不统计流量（需按 channel 累计字节，留待后续）。
 - 同一主机多条转发各自建连，未做连接复用；隧道既是 tokio task，杀进程即关闭 socket，不需要孤儿回收。
 - **导入**只读 `LocalForward` / `RemoteForward` / `DynamicForward`；`Match` 块里的转发一律不导入；Unix socket 形式与 `-R` 无目标只列出不可导入；去重按**字面** key 不走地址归一化；`Include` 有总文件数预算。完整清单见 [docs/import.md](docs/import.md#已知边界--known-limits)。

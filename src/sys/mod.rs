@@ -16,8 +16,6 @@
 //! Tunnels are now tokio tasks rather than processes, so that whole layer is
 //! gone — see `docs/research/pure-rust-ssh-plan.md` §4.
 
-pub mod signals;
-
 #[cfg(unix)]
 mod unix;
 #[cfg(unix)]

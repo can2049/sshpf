@@ -23,12 +23,6 @@ impl App {
     // -- persistence -------------------------------------------------------
 
     pub fn persist(&mut self) -> Result<(), String> {
-        // Only the owner writes files. A mirror's `cfg` is a copy of what the
-        // server last sent, so writing it back would race the server's own write
-        // and could resurrect a tunnel the server just deleted.
-        if self.is_mirror() {
-            return Ok(());
-        }
         for view in &self.tunnels {
             if let Some(slot) = self.cfg.find_mut(view.cfg.id) {
                 slot.enabled = view.cfg.enabled;
@@ -51,11 +45,6 @@ impl App {
     }
 
     pub fn save_state(&self) {
-        // Same reason as `persist`: `state.toml` describes what *this* process
-        // ran. A mirror ran nothing, and its table is a copy of the server's.
-        if self.is_mirror() {
-            return;
-        }
         let mut st = config::StateFile { last_run: now_unix(), ..Default::default() };
         for view in &self.tunnels {
             st.last_state.insert(view.cfg.id.to_string(), view.status.key().to_string());

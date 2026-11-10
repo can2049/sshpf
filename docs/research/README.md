@@ -9,8 +9,13 @@
 **这里全部是历史调研笔记，不是当前事实来源。**
 
 它们在两个转折点上写成：① v1 选型（用系统 `ssh` 子进程）；② v2 纯 Rust 化（`russh`）与
-client-server 改造。结论已经落实进代码，本目录只保留**为什么当时那样判断**、**测量数字**与
-**库缺陷的复现证据**。
+client-server 改造。本目录只保留**为什么当时那样判断**、**测量数字**与**库缺陷的复现证据**。
+
+> ⚠️ **client-server 那部分已回退**（v0.9，见 [CHANGELOG](../../CHANGELOG.md)）。当时的方案是
+> 一个后台 server 进程拥有全部隧道、多个 client 窗口共享状态；现在已完全删除，回归**单进程**：
+> 你启动的那个进程拥有全部转发。因此 `client-server.md` 与 `client-server/` 下的三篇**只作历史
+> 记录**，其中描述的选举、令牌、快照、宽限窗口在当前代码里都不存在，原先那篇描述当前行为的
+> 运行模型文档也已随之删除。现行进程模型见 [../architecture.md](../architecture.md#进程模型--process-model)。
 
 | 现在要知道什么 | 去哪 |
 |---|---|
@@ -39,7 +44,8 @@ client-server 改造。结论已经落实进代码，本目录只保留**为什�
 
 - 查当前键位、配置字段、日志事件 → [../keymap.md](../keymap.md)、[../logging/events.md](../logging/events.md)。
 - 查当前 `~/.ssh/config` 解析行为 → [../import.md](../import.md) 与 `src/ssh/`。
-- 查 client-server 当前行为 → [../client-server.md](../client-server.md)（**那篇是当前事实来源**）。
+- 查 multi-process / client-server 当前行为 —— **不存在**：该方案已回退，现行是单进程，见
+  [../architecture.md](../architecture.md#进程模型--process-model)。
 - 引用其中的版本号、行数、依赖版本、下载量 —— 全部可能已过期。
 
 ## 目录
@@ -66,8 +72,6 @@ client-server 改造。结论已经落实进代码，本目录只保留**为什�
 | `pure-rust-ssh-spike.md` §8 | `src/ssh/known_hosts.rs` | known_hosts 四处误判 |
 | `pure-rust-ssh-config.md` | `src/ssh/config.rs` | `ssh2-config` 选型与 `Match` 缺陷 |
 | `pure-rust-ssh-plan.md` §4 | `src/sys/mod.rs` | 目标架构（进程组/Job Object 为何消失） |
-| `client-server/protocol.md` §8.2 | `src/ipc/mod.rs` | 协议兼容变更规则 |
-| `client-server/migration.md` §11.1 | `src/app/confirm.rs` | 退出计数必须来自快照而非本地 supervisor |
 | `tech-options.md` §3.3 | `src/app.rs` | 单线程 UI 轮询 + mpsc 事件模型 |
 | `prior-art.md` §7 | `src/ui.rs` | 主屏布局与状态符号 |
 

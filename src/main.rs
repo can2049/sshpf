@@ -6,7 +6,7 @@
 //! # The map
 //!
 //! ```text
-//! main()        logging → args (src/cli.rs) → paths → one of the three modes
+//! main()        logging → args (src/cli.rs) → paths → one of the two modes
 //! run_tui()     signals → terminal → App → event_loop → shutdown → restore
 //! event_loop()  drain events, draw one frame, read one key — repeat until quit
 //! ```
@@ -84,14 +84,6 @@ fn main() -> ExitCode {
         return cli::check_config(&paths);
     }
 
-    // `--server` is a headless mode: it owns every forward and draws nothing, so it
-    // must not take the terminal. It is normally started by a client, and running it
-    // by hand is for debugging (its log file is the thing to read).
-    if args.server {
-        eventlog::cli_mode("server");
-        return run_server(paths, &args);
-    }
-
     match run_tui(paths, &args, started) {
         Ok(code) => code,
         Err(e) => {
@@ -102,15 +94,6 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
-}
-
-/// Run in `--server` mode.
-///
-/// All the work — election, the signal bridge, the outcome-to-exit-code mapping —
-/// lives in [`sshpf::server::start`], because `main` owns dispatch and nothing
-/// else. Keeping the rules there is what lets this file stay a routing table.
-fn run_server(paths: Paths, args: &cli::Args) -> ExitCode {
-    sshpf::server::start(paths, args)
 }
 
 /// Register the quit signals without any `unsafe` code.
@@ -190,14 +173,6 @@ fn prepare_app(app: &mut App, no_restore: bool) {
     // explanation reads as data loss, so it is said out loud — after `load_hosts`
     // so `--no-restore`'s own notice does not overwrite it.
     announce_folded(app);
-    // Only the **owner** restores tunnels. In client-server mode the server does
-    // it once, on its own start-up: a client restoring as well would race the
-    // server's restore, and the visible result is every tunnel bouncing
-    // ("connected, dropped, reconnected") the moment a second window opens.
-    // `--no-restore` is therefore a server-side flag once a server is in play.
-    if app.is_mirror() {
-        return;
-    }
     if no_restore {
         logging::info("app.restore_skipped", &[("reason", &"no-restore")]);
         app.set_status(StatusMsg::info("已跳过自动恢复（--no-restore）"));
@@ -258,50 +233,21 @@ fn run_tui(paths: Paths, args: &cli::Args, started: Instant) -> std::io::Result<
     let received = Arc::new(AtomicUsize::new(0));
     install_signal_flags(&quit, &received);
 
-    // Attach to the server *before* taking the terminal: a failure here must be a
-    // readable sentence on a normal screen, not a flash of raw mode followed by an
-    // error printed over a corrupted one.
-    let Some(session) = attach_or_report(&paths, args)? else {
-        return Ok(ExitCode::FAILURE);
-    };
-
     let mut terminal = take_terminal()?;
     // From here on the crash handler must release the alternate screen before the
     // message lands in the user's shell.
     logging::set_tui_active(true);
 
     warn_if_config_exposed(&paths);
-    let mut app = build_mirror_app(paths, args, &session);
+    let mut app = build_app(paths, args);
     let mouse = enable_mouse();
-    let result = event_loop(&mut terminal, &mut app, &quit, Some(&session));
+    let result = event_loop(&mut terminal, &mut app, &quit);
 
     let signal = received.load(Ordering::Relaxed);
     if signal != 0 {
         logging::info("app.signal", &[("signal", &sys::signal_name(signal as i32))]);
     }
-    let code = shut_down(&mut app, mouse, started, result);
-    // Say goodbye last, and only after the tunnels' fate is no longer this
-    // process's business: `last_exit` is a *proposal* the server recounts, so it
-    // must reflect the count this client actually saw.
-    let last_exit = app.client_count <= 1;
-    session.close(last_exit);
-    Ok(code)
-}
-
-/// Attach to the server, reporting a failure on the plain terminal.
-///
-/// `Ok(None)` means the attach failed and the reason has already been shown: the
-/// caller exits with failure rather than starting a UI that has no server behind
-/// it.
-fn attach_or_report(paths: &Paths, args: &cli::Args) -> std::io::Result<Option<sshpf::client::Session>> {
-    match sshpf::client::run(&paths.config, args.config.is_some(), args.no_restore) {
-        Ok(session) => Ok(Some(session)),
-        Err(e) => {
-            logging::error("client.attach_failed", &[("msg", &e.message())]);
-            let _ = writeln!(std::io::stderr(), "{}", e.message());
-            Ok(None)
-        }
-    }
+    Ok(shut_down(&mut app, mouse, started, result))
 }
 
 /// Record a config file that is readable by anyone but its owner.
@@ -316,13 +262,12 @@ fn warn_if_config_exposed(paths: &Paths) {
     eventlog::config_perms_tightened(&config::display_path(&paths.config), ok);
 }
 
-/// Build the `App` this process renders: a mirror backed by `session`.
+/// Build the `App` this process renders.
 ///
-/// The outbox is what makes every mutating method forward a command instead of
-/// acting, because the tunnels belong to the server.
-fn build_mirror_app(paths: Paths, args: &cli::Args, session: &sshpf::client::Session) -> App {
+/// This process owns every tunnel, so there is nothing to attach and nothing to
+/// wait for: the `App` it returns is authoritative from the first frame.
+fn build_app(paths: Paths, args: &cli::Args) -> App {
     let mut app = App::with_host_key_policy(paths, args.host_key_policy());
-    app.attach_mirror(sshpf::app::Mirror::new(session.outbox()));
     prepare_app(&mut app, args.no_restore);
     app
 }
@@ -341,21 +286,10 @@ fn enable_mouse() -> bool {
     mouse
 }
 
-fn event_loop(
-    terminal: &mut DefaultTerminal,
-    app: &mut App,
-    quit: &Arc<AtomicBool>,
-    session: Option<&sshpf::client::Session>,
-) -> std::io::Result<()> {
+fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, quit: &Arc<AtomicBool>) -> std::io::Result<()> {
     while !quit.load(Ordering::Relaxed) {
         let frame_started = Instant::now();
         app.drain_events();
-        // Apply whatever the server sent since the last frame. This is the client's
-        // equivalent of `drain_events`: the same place in the loop, the same 200 ms
-        // cadence, so the table is never more than one frame stale.
-        if let Some(session) = session {
-            sshpf::client::sync::drain(app, session.inbox());
-        }
         terminal.draw(|frame| ui::draw(frame, app))?;
         // A frame that overruns the tick is the first symptom of a wedged UI
         // (a blocking call sneaking into the event pump). Logging it turns "the
