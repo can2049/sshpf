@@ -4,9 +4,9 @@
 [![Crates.io](https://img.shields.io/crates/v/sshpf.svg)](https://crates.io/crates/sshpf)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-SSH 端口转发管理器，命令行 TUI 表格界面。Linux 与 Windows 均支持。在不离开终端的情况下查看、新增、启停、删除端口转发，每条转发实时显示状态与失败原因；配置持久化，重启后自动恢复上次启用的条目。
+SSH 端口转发管理器，命令行 TUI 表格界面，Linux 与 Windows 均支持。在不离开终端的情况下查看、新增、启停、删除端口转发，每条转发实时显示状态与失败原因；配置持久化，重启后自动恢复上次启用的条目。
 
-> 本文是**用户视角**：是什么 / 装 / 用 / 风险 / 配置 / 排查。内部结构、设计理由、给 AI agent 的导航在 **[docs/index.md](docs/index.md)**。
+> 本文是**用户视角**：装 / 用 / 风险 / 配置 / 排查。内部结构、设计理由、给 AI agent 的导航在 **[docs/index.md](docs/index.md)**。
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
@@ -35,24 +35,9 @@ SSH 端口转发管理器，命令行 TUI 表格界面。Linux 与 Windows 均�
 │  · socks        D 127.0.0.1:1080    (SOCKS5)          dev-box        ◐ 连接中    —              │
 ├──────────────────────────────────────────────────────────────────────────────────────────────────┤
 │ 已选 2 条  ·  s 启用  ·  x 停用  ·  R 重启  ·  D 删除  ·  a 全选  ·  v/esc 退出                    │
-│ j/k ↑↓ 移动  space 勾选  J/K 扩选  g/G 首尾                                                       │
-│ a 全选  s/x/R/D 批量操作  esc 退出  ? 帮助                                                        │
+│ j/k ↑↓ 移动  space 勾选  J/K 扩选  g/G 首尾  a 全选  s/x/R/D 批量操作  esc 退出  ? 帮助           │
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
-
-## 是什么 / What it is
-
-| 能力 | 说明 |
-|---|---|
-| 三种转发 | `-L` 本地、`-R` 远端、`-D` 动态（内置 SOCKS5 服务端） |
-| 主机来源 | `~/.ssh/config`（`Include`、`Host` 通配、`!` 否定、`Host *` 继承、`ProxyJump`） |
-| 转发定义 | 由 sshpf 自己管理，**从不写** `~/.ssh/config` |
-| 状态可见 | 每条转发实时显示状态符号 + 失败原因短句，详情页有完整日志 |
-| 自动重连 | 网络类失败指数退避（2s→…→30s），配置类失败直接停下并说明原因 |
-| 定时连通性检测 | 每 30s 主动探活，休眠/断网后半开连接被发现并自动重连 |
-| 导入 | 主机在 `~/.ssh/config` 里声明的转发可直接导入，默认全勾 |
-| 风险控制 | 破坏性/有副作用的操作一律先弹确认框 |
-| 双语 | 界面文案、帮助浮层、`--help` 全部中英并列 |
 
 ## 安装 / Install
 
@@ -90,7 +75,7 @@ sshpf --ignore-host-key-changes   # 接受已改变的主机密钥（全局降�
 
 ### 键位 / Keys
 
-界面里**任何时刻**按 `?` 都能看到当前上下文的按键说明，中英双语，且与文档一致。**完整键位参考（按 15 个上下文分表，含鼠标与状态图例）见 [docs/keymap.md](docs/keymap.md)。**
+界面里**任何时刻**按 `?` 都能看到当前上下文的按键说明，中英双语，且与文档一致。**完整键位参考（15 个上下文，含鼠标与状态图例）见 [docs/keymap.md](docs/keymap.md)。** 常见几个：
 
 | 键 | 作用 |
 |---|---|
@@ -104,48 +89,27 @@ sshpf --ignore-host-key-changes   # 接受已改变的主机密钥（全局降�
 | `?` | 打开 / 关闭帮助 |
 | `q` / `ctrl+c` | 退出（有运行中转发时确认；`ctrl+c` 等同 `q`） |
 
-`?` 打开的帮助是**分区**的：主界面、多选、表单（导航/编辑）、主机下拉、对端端口、导入面板、导入列筛选、确认框、详情、过滤、帮助自身、鼠标、状态图例、安全与诊断。其中内容不是手写散文，而是 `src/help.rs` 里的数据，与页脚提示同源，所以"页脚说的"和"`?` 说的"不可能矛盾。
+`?` 的帮助是**分区**的，内容不是手写散文而是 `src/help.rs` 里的数据，与页脚提示同源，所以"页脚说的"和"`?` 说的"不可能矛盾。
 
 ### 新增转发 / Create a tunnel
 
 表单采用**两阶段编辑**，避免方向键误改内容：**导航态**（默认）方向键只移动高亮；按 `enter` 进入**编辑态**才接收输入；`ctrl+s` 随时保存。字段顺序**远端在前、本地在后**：`SSH 主机 → 名称 → 类型 → 远端地址 → 远端端口 → 本地地址 → 本地端口 → 自动重连`。
 
-**本地端口自动推荐**（始终可编辑覆盖）：
+**本地端口自动推荐**（始终可编辑覆盖）：远端端口空闲且 ≥1024 → 同值；<1024 → `+2200` 的惯用别名（`22 → 2222`），因为绑定低位端口需要 root；被系统或其它条目占用（含**未运行**的）→ 向上顺延；你手改过 → 不再自动覆盖。
 
-| 场景 | 推荐 |
-|---|---|
-| 远端端口空闲且 ≥1024 | 同值（`8080 → 8080`） |
-| 远端端口 <1024 | `+2200` 的惯用别名（`22 → 2222`），因为绑定低位端口需要 root |
-| 端口被系统占用，或被其它条目占用（含**未运行**的） | 向上顺延 |
-| 你手改过本地端口 | 不再自动覆盖 |
-
-#### 远端端口直接选 / Pick the peer's port
-
-把光标放在 `远端端口` 上按 `p`，sshpf 会通过**隧道同一条 SSH 路径**去问对端正在监听哪些端口：有 `ss` 就用 `ss -ltnH`，没有就用 `netstat -ltn`，都没有会明确告诉你（而不是显示成"没有监听"）；`~/.ssh/config` 里已为该主机声明过的端口**不重复列出**（面板写明隐藏了几个）；命令是写死的固定文本，**不插入**任何用户输入。
-
-| 想要 | 怎么做 |
-|---|---|
-| 建一条 | 光标移到该端口，`enter` 填入字段（本地端口随之重新推荐），列表收起 |
-| 一次建多条 | `space` 勾选（`a` 全选 / `U` 清空 / `I` 反选），`r` 可重扫，然后 `ctrl+s`，**每个勾选端口一条 `-L` 转发** |
-| 不想用了 | `esc`（或 `i`）收起列表 |
-
-勾选默认**全空**：发现一个服务不等于要转发它。`-R` 的列表是**只读**的——那里列出的是服务端**已被占用**的端口，选一个必然撞车，所以只作参考（显示 `[–]`）。扫描在后台线程跑；换主机或重扫时旧结果会被丢弃。
+**远端端口可直接选**：把光标放在 `远端端口` 上按 `p`，sshpf 会通过**隧道同一条 SSH 路径**去问对端正在监听哪些端口（有 `ss` 用 `ss -ltnH`，否则 `netstat -ltn`，都没有会明确告诉你）。`enter` 填入单条；或 `space` 勾选多条（`a` 全选 / `U` 清空 / `I` 反选，`r` 重扫）后 `ctrl+s`，**每个勾选端口一条 `-L` 转发**。勾选默认**全空**——发现一个服务不等于要转发它。`-R` 的列表是**只读**的（那些端口已被占用，选一个必然撞车）。
 
 ### 多个窗口共享同一份状态 / Several windows, one state
 
-在 Linux 上，**一份配置只有一个后台服务进程**（`sshpf --server`，由第一个窗口自动拉起），所有 `sshpf` 窗口都是它的客户端：开第二个窗口**不会再报「端口已被占用」**，而是连上已有服务进程显示同一份状态；任何窗口的操作都会广播给所有窗口；标题栏显示 `客户端 2/client 2`。
-
-**关掉最后一个窗口 = 停掉所有转发**，所以只有它会在退出前提示「这是最后一个客户端」。想让它常驻用 `--keep-server`。`--check` / `--list-hosts` 不连服务进程（打印后退出，不该有副作用）。Windows 暂无 socket 传输，仍是每进程独立的旧行为。完整模型见 [docs/client-server.md](docs/client-server.md)。
+在 Linux 上，**一份配置只有一个后台服务进程**（`sshpf --server`，由第一个窗口自动拉起），所有窗口都是它的客户端：开第二个窗口**不会再报「端口已被占用」**，而是显示同一份状态；任何窗口的操作都会广播给所有窗口；标题栏显示 `客户端 2/client 2`。**关掉最后一个窗口 = 停掉所有转发**，所以只有它会在退出前提示。想让它常驻用 `--keep-server`。Windows 暂无 socket 传输，仍是每进程独立。完整模型见 [docs/client-server.md](docs/client-server.md)。
 
 ### 从 `~/.ssh/config` 导入转发 / Import
 
-在 `SSH 主机` 字段上按 `space` 或 `i` 展开该主机已声明的 `LocalForward` / `RemoteForward` / `DynamicForward`。**默认全部勾选**，取消不要的再 `ctrl+s`；一条勾选行创建一条隧道。勾选只是**意图**：不写盘、不 bind、不建线程，隧道在保存之后才创建。**编辑已有条目时没有这个面板**。
+在 `SSH 主机` 字段上按 `space` 或 `i` 展开该主机已声明的 `LocalForward` / `RemoteForward` / `DynamicForward`。**默认全部勾选**，取消不要的再 `ctrl+s`；一条勾选行创建一条隧道。勾选只是**意图**：不写盘、不 bind、不建线程。**编辑已有条目时没有这个面板。**
 
 面板自动展开说的是"不用按任何键就有默认"，**不是**"它总能盖过你手填的东西"：面板没被动过且手填字段完整时，`ctrl+s` **只建手填那一条**（状态栏说明面板的 N 条未创建）；手填不完整、或动过面板（勾选/筛选/手动展开），走面板的勾选行；面板已收起，走手填那一条。
 
-规则速记：`Host` 块**全部累积**（不是命中第一个就停）、`!prod-db` 否定整块排除、`Match` 块里的转发行**不导入也不列出**、注释行不列出、跨块重复的转发去重成一行、`-R` 的两端**对调**（指令监听端→远端，目标端→本地）、Unix socket 形式与无目标的 `-R` 列出但不可勾。
-
-完整规则（作用域累积、`Include` 预算、行去重、筛选与全选、批量校验顺序、端口顺延）见 [docs/import.md](docs/import.md)。
+规则速记：`Host` 块**全部累积**（不是命中第一个就停）、`!prod-db` 否定整块排除、`Match` 块里的转发行**不导入也不列出**、注释行不列出、跨块重复的转发去重成一行、`-R` 的两端**对调**（指令监听端→远端，目标端→本地）、Unix socket 形式与无目标的 `-R` 列出但不可勾。完整规则见 [docs/import.md](docs/import.md)。
 
 ### 不会重复创建 / No duplicate forwards
 
@@ -157,16 +121,16 @@ sshpf --ignore-host-key-changes   # 接受已改变的主机密钥（全局降�
 
 ### 鼠标与确认 / Mouse & confirmation
 
-终端支持鼠标时（捕获是 best-effort，失败也不影响键盘）：点行移动光标、多选模式下同时切换标记、`shift` 点击扩选、点导入表复选框勾选、点列头开始筛选该列、点筛选 chip 的 `×` 删除、点动作条按钮执行批量操作（**仍走确认闸**）、滚轮滚动。点击落空**什么都不做**，不"透传"给下面的控件；弹窗**吞掉**点击。
+终端支持鼠标时（捕获是 best-effort，失败也不影响键盘）：点行移动光标、多选模式下同时切换标记、`shift` 点击扩选、点导入表复选框勾选、点列头筛选该列、点 chip 的 `×` 删除筛选、点动作条按钮执行批量操作（**仍走确认闸**）、滚轮滚动。点击落空**什么都不做**，不"透传"；弹窗**吞掉**点击。
 
-所有破坏性或有副作用的操作先弹确认框，`y`/`enter` 执行，`n`/`esc` 取消：删除、停用、重启、批量启停/重启/删除、保存编辑、放弃编辑、退出（含 `ctrl+c`）。**刻意不弹确认**（可逆、无副作用）：移动光标、过滤、打开帮助、查看详情、**启动**某条未启用的转发、**新建**转发。给高频操作加确认会让用户习惯无脑按 `y`，真正的危险确认就失效了。
+所有破坏性或有副作用的操作先弹确认框（`y`/`enter` 执行，`n`/`esc` 取消）：删除、停用、重启、批量启停/重启/删除、保存编辑、放弃编辑、退出（含 `ctrl+c`）。**刻意不弹**（可逆、无副作用）：移动光标、过滤、帮助、详情、**启动**某条未启用的转发、**新建**转发。给高频操作加确认会让用户习惯无脑按 `y`，真正的危险确认就失效了。
 
 ## 风险 / Risks
 
 | 风险 | 说明与对策 |
 |---|---|
 | 密码/2FA 登录不支持 | 只走 `IdentityFile` 或 ssh-agent；需要密码的主机会立刻失败并显示「认证失败」，**不会**卡在密码提示上 |
-| 主机密钥变更 | 默认策略 `accept-new`：首次连接自动记录，**密钥变更则拒绝**（并指出 `known_hosts` 行号）；`@revoked` 吊销的密钥同样拒绝。确需接受时用 `--ignore-host-key-changes` 或 `~/.ssh/config` 的 `StrictHostKeyChecking no`，两者都留 WARN 且不改写 `known_hosts`，见[排障](#ssh-能连但-sshpf-报-host-key-verification-failed) |
+| 主机密钥变更 | 默认 `accept-new`：首次连接自动记录，**密钥变更则拒绝**（并指出 `known_hosts` 行号）；`@revoked` 同样拒绝。确需接受时用 `--ignore-host-key-changes` 或 `~/.ssh/config` 的 `StrictHostKeyChecking no`，两者都留 WARN 且不改写 `known_hosts`，见[排障](#ssh-能连但-sshpf-报-host-key-verification-failed) |
 | 未做连接复用 | 同一主机多条转发各自建连（`ControlMaster -O forward` 绑定失败仍返回 exit 0，无法可靠判定成败，故不采用） |
 | 端口占用反查进程 | 仅 Linux（依赖 `/proc`），其它平台该项为空，不影响转发本身 |
 | 把错误搞静默 | 反过来的风险由设计规避：所有降级都有一条可 grep 的日志记录，见 [安全](docs/security.md) |
@@ -203,8 +167,6 @@ note = ""
 
 **不存任何密码或密钥口令。** `retry_initial_secs` / `retry_max_secs` 越界会被钳制到 `[1s, 24h]` 并记 `config.defaults_clamped`（`0` 会变成每帧重连，所以不能照做）。`health_check_secs` 同样记 `config.defaults_clamped`：`0` 保持不变（**0 = 关闭探活**），`1..=4` 抬到 `5`，超过 24h 压到 24h。
 
-## 环境变量 / Environment
-
 | 变量 | 作用 |
 |---|---|
 | `SSHPF_CONFIG` | 配置文件路径（`state.toml` 与它同目录） |
@@ -228,7 +190,7 @@ tail -f ~/.local/state/sshpf/logs/sshpf.log   # 实时看结构化日志
 | 端口被占用 | 详情页会显示占用进程的 `pid/进程名`。**如果占用者是 `sshpf` 自己**，说明有旧版本的单进程实例还在跑：退出它即可 |
 | 第二个窗口连不上 / 状态不一致 | 看 `client.attach_failed`、`server.election_lost`、`client.disconnected`；`SSHPF_IPC_DIR` 不同会让两个窗口连到不同的服务进程 |
 | 某条一直 `◌ 重试` | `grep 'event=tunnel.retry_scheduled'` 看排了几次，`tunnel.retry_abandoned` 表示已放弃 |
-| 显示 `● 已连通` 但端口不通 / 休眠唤醒后不工作 | SSH 半开连接：`grep 'event=tunnel.health_failed'` 看 `cause`（`ping_timeout`/`ping_error`/`session_closed`），确认探活是否开着（`health_check_secs=0` 即人为关闭）；探活成功不写日志，所以**没有这条事件不等于探活没跑** |
+| 显示 `● 已连通` 但端口不通 / 休眠唤醒后不工作 | SSH 半开连接：`grep 'event=tunnel.health_failed'` 看 `cause`（`ping_timeout`/`ping_error`/`session_closed`），确认探活没被 `health_check_secs=0` 关掉；探活成功不写日志，所以**没有这条事件不等于探活没跑** |
 | 界面某块不见了 | `grep 'event=ui.render_degraded'` |
 | 进程崩了 / 卡死 | `grep -E 'event=crash\.|tunnel.thread_panic'`，判据见下 |
 
@@ -279,28 +241,20 @@ cargo fmt --check
 | 我想… | 读 |
 |---|---|
 | 找任何东西 | **[docs/index.md](docs/index.md)**——按「我想…」查表 |
-| 了解分层与目录职责 | [docs/architecture.md](docs/architecture.md) |
 | 改按键 / 界面 / 日志 / 隧道 / 导入 | [docs/keymap.md](docs/keymap.md)、[docs/tui.md](docs/tui.md)、[docs/logging.md](docs/logging.md)、[docs/runtime.md](docs/runtime.md)、[docs/import.md](docs/import.md) |
-| 了解安全政策与测试 | [docs/security.md](docs/security.md)、[docs/testing.md](docs/testing.md) |
-| 改码约定（给 AI agent） | [docs/agents.md](docs/agents.md) |
+| 了解分层、安全政策、测试、改码约定 | [docs/architecture.md](docs/architecture.md)、[docs/security.md](docs/security.md)、[docs/testing.md](docs/testing.md)、[docs/agents.md](docs/agents.md) |
 
 调研依据（**历史调研，非当前事实来源**，见 [docs/research/README.md](docs/research/README.md)）：[pure-rust-ssh-plan.md](docs/research/pure-rust-ssh-plan.md)、[pure-rust-ssh-spike.md](docs/research/pure-rust-ssh-spike.md)、[tech-options.md](docs/research/tech-options.md)、[prior-art.md](docs/research/prior-art.md)。
 
 ## 已知限制（v1）
 
-- **端口占用反查进程**仅 Linux 可用（依赖 `/proc`）。
-- **多窗口共享状态仅在 Linux/macOS（Unix socket）**：Windows 没有等价传输，仍是每进程独立的单进程模式。
+- **端口占用反查进程**仅 Linux 可用（依赖 `/proc`）；**多窗口共享状态**仅在 Linux/macOS，Windows 仍是每进程独立的单进程模式。
 - 一份配置一个服务进程；用 `-c` 指向不同配置文件就是互相独立的两套状态（socket 路径由配置路径派生）。
-- 隧道既是 tokio task，杀进程即关闭 socket，会话随之结束——不需要孤儿回收；macOS 走 Unix 分支。
-- 只支持公钥 / ssh-agent 认证，TUI 内不接管密码输入。
-- 不统计流量（需按 channel 累计字节，留待后续）。
-- 同一主机多条转发各自建连，未做连接复用。
-- **导入只读** `LocalForward` / `RemoteForward` / `DynamicForward`；`Match` 块里的转发一律不导入；Unix socket 形式与 `-R` 无目标只列出不可导入。
-- `Include` 有**总文件数**预算（含主文件共 9 个）；`Include` 写在 `Host` 块内部时，被包含文件里的裸指令会被当成全局指令。
-- 导入去重按**字面** key，不做地址归一化（`8090` 与 `127.0.0.1:8090` 是两行）；端口冲突在创建时兜底。
+- 只支持公钥 / ssh-agent 认证，TUI 内不接管密码输入；不统计流量（需按 channel 累计字节，留待后续）。
+- 同一主机多条转发各自建连，未做连接复用；隧道既是 tokio task，杀进程即关闭 socket，不需要孤儿回收。
+- **导入**只读 `LocalForward` / `RemoteForward` / `DynamicForward`；`Match` 块里的转发一律不导入；Unix socket 形式与 `-R` 无目标只列出不可导入；去重按**字面** key 不走地址归一化；`Include` 有总文件数预算。完整清单见 [docs/import.md](docs/import.md#已知边界--known-limits)。
 - 鼠标是 best-effort；字面字符 `f` 无法输入到导入表筛选里（`f` 优先用于切换筛选列）。
-- **崩溃日志在 Windows 上只覆盖 panic**：没有 `sigaction`/Unix 信号语义，SEH 层（访问违例）不在此列。
-- 崩溃记录里的致命信号行用 epoch 秒（`ts=…`）而非格式化时间戳（信号处理器只能用 async-signal-safe 调用）。
+- **崩溃日志在 Windows 上只覆盖 panic**（没有 `sigaction`/Unix 信号语义，SEH 层不在此列）；致命信号行用 epoch 秒（`ts=…`）而非格式化时间戳。见 [docs/security.md](docs/security.md#崩溃捕获--crash-capture)。
 
 ## 许可证
 

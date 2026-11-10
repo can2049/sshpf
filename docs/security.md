@@ -62,13 +62,13 @@
 
 ### panic
 
-`set_panic_hook` 链式调用上一个 hook（所以 `ratatui` 恢复终端的逻辑照常生效），写 `crash.panic` + `crash.panic.trace` 两条记录。`thread` 字段是关键：每条隧道跑在自己的线程上（`sshpf-tunnel-<id>`），线程名能区分"UI 挂了"和"某条隧道挂了"。栈只保留前 25 帧：debug 构建的栈顶 30 帧几乎全是 `std::panicking` 的管道代码。
+`set_panic_hook` 链式调用上一个 hook（所以 `ratatui` 恢复终端照常生效），写 `crash.panic` + `crash.panic.trace`。`thread` 字段区分"UI 挂了"与"某条隧道挂了"；栈只保留前 25 帧（debug 栈顶几乎全是 `std::panicking` 的管道代码）。
 
 ### 致命信号（`SIGSEGV` / `SIGBUS` / `SIGABRT` / `SIGILL` / `SIGFPE`）
 
-`src/logging/crash.rs` 用 `sigaction` 装 handler，只做四件事：① 若 TUI 持有终端，先写转义序列退出备用屏（否则用户卡在残留画面里）；② `write(2)` 一条**手工拼好**的记录到预先 `dup` 出来的 fd（整数逐位自己转十进制）；③ 往 stderr 写一行**启动时就拼好**的提示；④ 恢复默认处理器 → **解除内核对该信号的屏蔽** → `raise`。
+`src/logging/crash.rs` 用 `sigaction` 装 handler，只做四件事：① TUI 持有终端时先写转义序列退出备用屏；② `write(2)` 一条**手工拼好**的记录到预先 `dup` 出的 fd；③ 往 stderr 写一行**启动时就拼好**的提示；④ 恢复默认处理器 → **解除内核对该信号的屏蔽** → `raise`。
 
-第 4 步的解除屏蔽容易漏：内核在 handler 执行期间屏蔽该信号，不解除的话 `raise` 只是排队，随后 `_exit(139)` 抢先执行，进程就从"被 SIGSEGV 杀死"变成"以 139 退出"，**core dump 也不会产生**。测试 `a_fatal_signal_keeps_the_signal_exit_status` 钉住它。代价：这一条记录**没有格式化时间戳**，只有 `ts=<epoch 秒>`。递归崩溃由 `SA_RESETHAND` 兜住（第二次触发走默认动作，不会死循环）。
+第 ④ 步最容易漏：内核在 handler 执行期间屏蔽该信号，不解除则 `raise` 只排队，`_exit(139)` 抢先执行，进程从"被 SIGSEGV 杀死"变成"以 139 退出"，**core dump 也不产生**（`a_fatal_signal_keeps_the_signal_exit_status` 钉住它）。代价：这条记录**没有格式化时间戳**，只有 `ts=<epoch 秒>`；递归崩溃由 `SA_RESETHAND` 兜住。
 
 ### 重入：`crash.log_reentrant`
 
