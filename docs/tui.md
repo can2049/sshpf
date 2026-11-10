@@ -12,9 +12,7 @@
 
 ## 主界面布局 / Frame layout
 
-`draw()`（`src/ui.rs`）的顺序：夹紧滚动 → 清空命中图 → 画静态区 → 画浮层 → 写回命中图。
-
-静态区自上而下 `Layout::vertical`：
+`draw()`（`src/ui.rs`）的顺序：夹紧滚动 → 清空命中图 → 画静态区 → 画浮层 → 写回命中图。静态区自上而下 `Layout::vertical`：
 
 | 行 | 高度 | 内容 | 渲染器 |
 |---|---|---|---|
@@ -25,15 +23,13 @@
 | 4 | `select_mode` | 多选动作条（仅多选模式） | `ui::selection::draw_selection_bar` |
 | 5 | 3 | 键提示 3 行（每条都双语） | `ui::hints::draw_keys` |
 
-浮层按 `App.overlay` 画在最上层：`Help` / `Form` / `Confirm` / `Detail` / `Filter`。
-浮层用 `centered_pct`（帮助 78×84%、详情 88×86%）或 `centered`（表单固定 110 列宽、确认框按文案宽度），
-`clear_and_block` 先 `Clear` 再画边框——否则下面的表格会透出来。
+浮层按 `App.overlay` 画在最上层：`Help` / `Form` / `Confirm` / `Detail` / `Filter`。浮层用 `centered_pct`（帮助 78×84%、详情 88×86%）或 `centered`（表单固定 110 列宽、确认框按文案宽度），`clear_and_block` 先 `Clear` 再画边框——否则下面的表格会透出来。
 
 **分区块取不到时**：`band(rows, i, "what")` 用 `rows.get(i)`，`None` 就记 `ui.render_degraded reason=layout_band_missing` 并返回零矩形（这一块这一帧不画），**不 panic**。
 
 ## 列宽与降级 / Columns
 
-`src/ui/layout.rs` 定列、宽度预算与收缩顺序。列：
+`src/ui/layout.rs` 定列、宽度预算与收缩顺序。
 
 | 列 | 典型宽 | 内容 |
 |---|---|---|
@@ -60,11 +56,7 @@
 
 ## 颜色 / Palette
 
-`src/ui/palette.rs`：`palette()` 读 `NO_COLOR`（设了就用无色档），`palette_with()` 供测试注入。
-
-- 状态色只强化符号，不替代符号：`●` 绿 / `◐` 黄 / `◌` 黄 / `✗` 红 / `○` 灰。
-- 表格行有三档视觉：**编辑态实心选中条 > 仅高亮加粗强调色 > 普通**。光标只在编辑态出现。
-- 变暗（dimmed）用于不可用控件的**视觉**表达，同时该控件**不记 hit**（否则点击"看起来没反应"）。
+`src/ui/palette.rs`：`palette()` 读 `NO_COLOR`（设了就用无色档），`palette_with()` 供测试注入。状态色只强化符号，不替代符号：`●` 绿 / `◐` 黄 / `◌` 黄 / `✗` 红 / `○` 灰。表格行有三档视觉：**编辑态实心选中条 > 仅高亮加粗强调色 > 普通**，光标只在编辑态出现。变暗（dimmed）用于不可用控件的**视觉**表达，同时该控件**不记 hit**（否则点击"看起来没反应"）。
 
 ## 文本与折行 / Text
 
@@ -87,8 +79,6 @@
 ImportColumnHeader(ImportColumn)   // ← 而不是 x = 23
 TunnelRow(TunnelId)                // ← 而不是行号
 ```
-
-三条规则：
 
 | 规则 | 为什么 |
 |---|---|
@@ -150,8 +140,7 @@ TunnelRow(TunnelId)                // ← 而不是行号
 1. `src/ui/hit.rs`：加 `HitTarget` 变体（带**语义**载荷，不是坐标）。
 2. `src/ui/<panel>.rs`：画完后 `hits.push(rect, HitTarget::… )`；不能点时**不要** push。
 3. `src/app/mouse.rs`：在 dispatch 里接住它，调与键盘相同的方法（不要新写业务逻辑）。
-4. `src/help.rs` 的 `SectionId::Mouse`：加一行说明——否则 `tests/help_coverage.rs` 的
-   `every_hit_target_is_described_in_the_mouse_section` 会红。
+4. `src/help.rs` 的 `SectionId::Mouse`：加一行说明——否则 `tests/help_coverage.rs` 的 `every_hit_target_is_described_in_the_mouse_section` 会红。
 5. `docs/keymap.md` 的鼠标表加一行。
 
 回归测试先例：`keys::tests::a_modal_swallows_clicks_instead_of_passing_them_to_the_table`——在弹窗背后放一个表格行，断言点击被消费、光标不动、也没有行被标记。

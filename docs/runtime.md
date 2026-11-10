@@ -18,8 +18,7 @@ main 线程（同步）                        每条隧道一个后台线程
 
 | 事实 | 值 / 位置 |
 |---|---|
-| 每帧最多消费事件数 | `MAX_EVENTS_PER_FRAME = 4096`（`src/app.rs`） |
-| 每帧最多事件是有界的原因 | 一帧处理上万条会把 UI 卡死；超出留到下一帧 |
+| 每帧最多消费事件数 | `MAX_EVENTS_PER_FRAME = 4096`（`src/app.rs`）；一帧处理上万条会把 UI 卡死，超出留到下一帧 |
 | 一条隧道一线程一 runtime 的理由 | 隔离性好（一条 panic 不传染），几条到几十条规模够用；10 条并发建连实测 80 ms |
 | `russh::client::Handle` 跨 task 共享 | 必须 `Arc<Handle>`（它不是 `Clone`） |
 | 隧道线程名 | `sshpf-tunnel-<id>`（panic 记录靠它区分是谁挂了） |
@@ -33,9 +32,7 @@ main 线程（同步）                        每条隧道一个后台线程
 | `preflight()` | 校验配置 → 端口占用预检 → 解析 `ssh_host` endpoint | 返回失败结论 → `tunnel.rejected`（`stage=validate`/`preflight_bind`/`resolve_endpoint`） |
 | `launch()` | `Supervisor::spawn` → 起线程 → 状态置 `Starting` | `tunnel.spawn_failed` |
 
-`trigger` 字段是稳定 ASCII 值，告诉读者**这次启动是谁发起的**：`manual` / `restore` / `retry` / `batch` / `created` / `edited`。
-
-预检在**建连之前**做，因为这两类错误可以立刻确定、不值得等一次 SSH 握手：端口被占、主机解析不出来。
+`trigger` 字段是稳定 ASCII 值，告诉读者**这次启动是谁发起的**：`manual` / `restore` / `retry` / `batch` / `created` / `edited`。预检在**建连之前**做，因为这两类错误可以立刻确定、不值得等一次 SSH 握手：端口被占、主机解析不出来。
 
 ## 就绪判定 / Readiness
 
@@ -45,23 +42,16 @@ main 线程（同步）                        每条隧道一个后台线程
 
 | 类型 | 就绪 = |
 |---|---|
-| `-L` | `TcpListener::bind` 返回 `Ok` |
-| `-D` | 同上（SOCKS5 监听器 bind 成功） |
+| `-L` / `-D` | `TcpListener::bind` 返回 `Ok`（`-D` 是 SOCKS5 监听器 bind 成功） |
 | `-R` | `tcpip_forward()` await 到服务端对 `GLOBAL_REQUEST` 的回复 |
 
 旧实现解析 `ssh -v` 的 `Entering interactive session.`，有三个实测过的假信号（双栈半失败、ProxyJump 子进程混入、`-R` 顺序倒置）——改为真实结果后这类 bug 结构上不可能再发生。
 
 ## 停止 / Stop
 
-1. 置停止标志；
-2. driver 的 `select!` 立刻返回 → runtime 丢弃 → socket 关闭 → 会话结束；
-3. `Supervisor::poll` 等线程退出，有宽限期；超时记 `tunnel.stop_timeout`（UI 已判停止，但端口可能还被占着）。
-
-端口释放实测 **172 µs**。`SIGKILL` 掉 sshpf 也不会留孤儿：没有子进程，socket 由内核关闭。30 次启停循环无 fd 泄漏。
+置停止标志 → driver 的 `select!` 立刻返回 → runtime 丢弃 → socket 关闭 → 会话结束 → `Supervisor::poll` 等线程退出（有宽限期，超时记 `tunnel.stop_timeout`：UI 已判停止，但端口可能还被占着）。端口释放实测 **172 µs**；`SIGKILL` 掉 sshpf 也不会留孤儿（没有子进程，socket 由内核关闭）；30 次启停循环无 fd 泄漏。
 
 ## 失败分类与重试 / Classification & retry
-
-失败分两类，决定"要不要等"：
 
 | 类 | 包含 | 结果 |
 |---|---|---|
@@ -89,9 +79,7 @@ main 线程（同步）                        每条隧道一个后台线程
 | 失效后 | 线程以 `StaleConnection` 结束 → 既有 `Exited` → `was_up=true` → 退避重连（受 `auto_restart`） |
 | 日志 | 失效记 `tunnel.health_failed`（WARN，带 `cause`/`detail`/`interval_ms`）；**成功不记 INFO** |
 
-**判据必须留在隧道线程里**：探活的结论是一条"本次运行结束"的错误，`select!` 里哪个分支先返回，driver 就返回哪个——这才是既有 `Exited` 路径。另起一个 task 会让 serve 循环继续活着陪伴一个死会话，正是要修的 bug；而放在 UI 线程就把网络等待带进了 `poll(200ms)` 的同步循环。
-
-→ [design.md](design.md) D36 · `src/ssh/client/health.rs`、`src/ssh/client/driver.rs`
+**判据必须留在隧道线程里**：探活的结论是一条"本次运行结束"的错误，`select!` 里哪个分支先返回，driver 就返回哪个——这才是既有 `Exited` 路径。另起一个 task 会让 serve 循环继续活着陪伴一个死会话，正是要修的 bug；而放在 UI 线程就把网络等待带进了 `poll(200ms)` 的同步循环。见 [design.md](design.md) D36。
 
 ## 事件泵 / Event pump
 
@@ -107,12 +95,7 @@ main 线程（同步）                        每条隧道一个后台线程
 | `StderrClosed { id }` | 该次运行的行已全部送达 | 允许用完整日志做分类 |
 | `SpawnFailed { id, error }` | 线程都起不来 | 直接失败态 |
 
-两条必须守住的时序规则：
-
-1. **失败原因随 `Exited` 一起传**，不靠"读最后几行日志"——退出事件与最后几行日志可能乱序。
-2. **`was_up=true` 的掉线是 WARN，从未连上的失败是 ERROR。** 前者网络抖一下，系统会自愈；后者要用户动手。
-
-`app.orphan_event`（`DEBUG`）表示收到了一条已删除隧道的事件——不是 bug，是删除与线程退出之间的正常竞态。
+两条必须守住的时序规则：① **失败原因随 `Exited` 一起传**，不靠"读最后几行日志"——退出事件与最后几行日志可能乱序；② **`was_up=true` 的掉线是 WARN，从未连上的失败是 ERROR。** `app.orphan_event`（`DEBUG`）表示收到了一条已删除隧道的事件——不是 bug，是删除与线程退出之间的正常竞态。
 
 ## 退出 / Shutdown
 
@@ -145,7 +128,7 @@ Stopped ──start──▶ Starting ──Ready──▶ Up ──Exited(was_u
 |---|---|
 | 启动 | `tunnel.start`、`tunnel.rejected`、`tunnel.spawn`、`tunnel.spawn_failed` |
 | 就绪 | `tunnel.ready`（含 `elapsed_ms`） |
-| 运行 | `tunnel.line`（DEBUG）、`tunnel.state`（DEBUG）、`forward.target_failed`、`socks5.rejected` |
+| 运行 | `tunnel.line`（DEBUG）、`forward.target_failed`、`socks5.rejected` |
 | 探活 | `tunnel.health_failed`（WARN，失败的探活才记） |
 | 结束 | `tunnel.exit`、`tunnel.failed`、`tunnel.retry_scheduled`、`tunnel.retry`、`tunnel.retry_abandoned` |
 | 停止 | `tunnel.stop`、`tunnel.stop_timeout` |

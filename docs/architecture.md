@@ -1,7 +1,7 @@
 # 架构 / Architecture
 
-> **这份文档回答**：本项目分几层、每层的模块叫什么名字、依赖方向是什么、新代码该放哪个文件。
-> **不负责**：具体业务流程（见 [runtime.md](runtime.md)、[tui.md](tui.md)）、设计历史（见 [design.md](design.md)）。
+> **这份文档回答**：分几层、依赖方向是什么、进程模型是什么、**哪个目录负责什么**（粗粒度）、新代码该放哪。
+> **不负责**：逐文件说明——那个权威在**每个文件自己的 `//!` 头注释**里；具体业务流程见 [runtime.md](runtime.md)、[tui.md](tui.md)、[import.md](import.md)。
 > **相关代码路径**：`src/lib.rs`（模块声明）、`src/*/mod.rs`（各层地图）。
 
 ## 分层 / Layers
@@ -18,7 +18,7 @@
    tunnel    config       tunnel=线程/runtime 监督   config=TOML 持久化
                │
                ▼
-        ssh               russh 客户端 / known_hosts / SOCKS5 / forwards
+         ssh               russh 客户端 / known_hosts / SOCKS5 / forwards
                │
                ▼
    model   text   logging   sys   eventlog
@@ -33,15 +33,17 @@
 | `ssh` | `model`、`text`、`logging`、`eventlog`、`sys` | `app`、`ui`、`keys`、`tunnel` |
 | 叶子层 | 彼此之间尽量少，且只向下 | 任何上层 |
 
-**`ipc` / `server` / `client` 的位置**：`ipc` 被 `server` 与 `client` **双向**依赖，
-所以只能依赖叶子层，绝不许 `use crate::app/ui/keys/tunnel/cli`——否则会形成环。
-`server` 与 `client` 都依赖 `ipc`，且都**不**依赖对方的内部实现。
+**`ipc` / `server` / `client` 的位置**：`ipc` 被 `server` 与 `client` **双向**依赖，所以只能依赖叶子层，绝不许 `use crate::app/ui/keys/tunnel/cli`——否则会形成环。`server` 与 `client` 都依赖 `ipc`，且都**不**依赖对方的内部实现。传输层是**回环 TCP**，不是 Unix 域套接字（`std` 在 Windows 上没有 UDS API），因此只有一套发现协议和一套失败模式。取舍与安全边界见 [client-server.md](client-server.md)。
 
-**三者都是跨平台的**（Windows 与 Linux 同一套代码路径）。传输层是**回环 TCP**，
-不是 Unix 域套接字：`std` 在 Windows 上没有 UDS API，而回环 TCP 两端通用，因此只有
-一套发现协议和一套失败模式。取舍与安全边界见 [client-server.md](client-server.md)。
+**这次重构修掉的三个违规**（保留作判例，避免回潮）：
 
-进程模型：
+| 违规 | 修法 |
+|---|---|
+| `ssh/client.rs` → `crate::app::log`（底层调上层） | 事件词汇搬到顶层 `src/eventlog.rs`，`app::log` 不再存在 |
+| `model.rs` → `crate::help::bi`（数据层调文案层） | `bi` 移到 `src/text.rs`，`help::bi` 变成 re-export（唯一保留的例外，新代码用 `text::bi`） |
+| `ui/import.rs`、`ui/layout.rs` → `help::` 的渲染无关内容 | 改用 `crate::text::` |
+
+## 进程模型 / Process model
 
 | 进程 | 谁起的 | 拥有隧道？ | 写 `config.toml`？ | 跑在哪 |
 |---|---|---|---|---|
@@ -49,56 +51,32 @@
 | `client`（任意多个） | 用户运行 `sshpf` | 否，镜像快照 | 否（权威在 server） | 两平台 |
 | 单进程（无 server） | `--check` / `--list-hosts` | 只读 | 否 | 两平台 |
 
-`client` 与 `server` 之间的**状态同步只有一条路**：全量 `Snapshot` + 单调 `revision`；
-**用户意图只有一条路**：`Command` + `Reply`，且 server 一律重新校验。`App` 两边同一份类型，
-`mirror: Option<Mirror>` 为 `Some` 时即为镜像——见 `src/app/mirror.rs`。
-
-**本次重构修掉的三个违规**（保留作判例）：
-
-| 违规 | 修法 |
-|---|---|
-| `ssh/client.rs` → `crate::app::log`（底层调上层） | 事件词汇搬到顶层 `src/eventlog.rs`，`app::log` 不再存在 |
-| `model.rs` → `crate::help::bi`（数据层调文案层） | `bi` 移到 `src/text.rs`，`help::bi` 变成 re-export |
-| `ui/import.rs`、`ui/layout.rs` → `help::` 的渲染无关内容 | 改用 `crate::text::` |
-
-**唯一例外**：`help::bi` 仍存在（`pub use crate::text::bi;`），供尚未迁移的调用点使用。新代码用 `text::bi`。
+`client` 与 `server` 之间**状态同步只有一条路**：全量 `Snapshot` + 单调 `revision`；**用户意图只有一条路**：`Command` + `Reply`，且 server 一律重新校验。`App` 两边同一份类型，`mirror: Option<Mirror>` 为 `Some` 时即为镜像（`src/app/mirror.rs`）。细节见 [client-server.md](client-server.md)。
 
 ## 模块地图 / Module map
 
-表列：**文件 → 放什么 → 谁在用 → 加新东西放哪**。这是给 agent 的定位表，读代码前先读它。
+**这张表只到目录一级。** 想知道某个文件放什么、边界在哪，读该文件顶部的 `//!`——那是唯一权威（`tests/safety_guards.rs` 强制每个源文件都有）。
 
-### 入口 / Entry
+| 目录 | 一句话 |
+|---|---|
+| `src/main.rs`、`src/cli.rs`、`src/lib.rs` | 事件循环 + 信号、参数解析 + `USAGE` 双语文本、`pub mod` 声明 |
+| `src/app/` | 状态机：持有隧道、消费事件、确认闸、表单、多选、镜像半边 |
+| `src/keys/` | 按键分发，一个上下文一个 handler 文件 |
+| `src/ui/` | 纯渲染（ratatui），每帧重建命中图 |
+| `src/tunnel.rs` | 隧道监督：一线程一 `current_thread` runtime |
+| `src/config.rs` | TOML 持久化（原子写、`0600`） |
+| `src/ssh/` | `~/.ssh/config`、known_hosts、SOCKS5、端口探测、russh 客户端 |
+| `src/ipc/`、`src/server/`、`src/client/` | client-server 协议的唯一定义处、权威进程、视图进程 |
+| `src/model/` | 纯数据：隧道、导入表、状态、表单、失败分类 |
+| `src/text.rs` | 唯一的字符串层：宽度/截断/双语/折行/glob |
+| `src/logging/` | 落盘日志 + 崩溃捕获（**唯一允许 `unsafe`**） |
+| `src/eventlog/` | `event=` 词汇表（唯一真相） |
+| `src/help/` | 双语帮助目录（数据，不是散文） |
+| `src/sys/` | 平台差异：文件权限、退出信号 |
 
-| 文件 | 放什么 | 谁在用 | 加新东西放哪 |
-|---|---|---|---|
-| `src/main.rs` | `main()` 调度 + 事件循环 + 信号注册（311 行） | 二进制 | 只加"进程级"编排 |
-| `src/cli.rs` | 参数解析、`USAGE` 双语文本、`--check`/`--list-hosts`（367 行） | `main` | 新 flag → 这里，并同步 `USAGE` |
-| `src/lib.rs` | `pub mod` 声明 + 顶层 `pub use` | 二进制与集成测试 | 新模块 → 这里登记 |
+`src/*.rs` 与 `src/*/mod.rs` 是**模块根**：只做地图 + re-export + 入口函数，不堆实现。
 
-### app 状态机 / `src/app/`
-
-| 文件 | 放什么 | 谁在用 | 加新东西放哪 |
-|---|---|---|---|
-| `src/app.rs` | `App` 结构、`Overlay`、`ConfirmAction`、常量（`MAX_EVENTS_PER_FRAME`、`HOST_DROPDOWN_ROWS`、重试边界） | `main`、`keys`、`ui` | 新的 App 级状态字段 |
-| `src/app/query.rs` | 只读查询：选中、过滤后可见行、计数器 | `app`、`ui` | 新的纯读取访问器 |
-| `src/app/overlay.rs` | `open_*` / `close_overlay`（浮层唯一开关） | `keys`、`app` | 新的浮层打开/关闭 |
-| `src/app/helpers.rs` | 无 `App` 依赖的纯函数：视图构造、config repair、`backoff` | `app`、`main` | 纯计算 |
-| `src/app/import_pane.rs` | 导入面板的**交互**半边：展开/收起、列筛选、光标、勾选、「已存在」标记的来源 | `keys::import`、`ui::import` | 面板交互规则 |
-| `src/app/runtime.rs` | 启停/重启、`start_tunnel_with`（`preflight()` + `launch()`） | `app` | 隧道"启动/停止"这一侧 |
-| `src/app/events.rs` | 事件泵的**读**侧：`drain_events`、`on_ready`/`on_line`/`on_exit`、`flush_pending_exits`、`tick_retries`/`arm_retry` | `app` | 事件 → 状态转移、退避规则 |
-| `src/app/persist.rs` | `persist`（config.toml）、`save_state`（state.toml）、`persist_quietly` | `app` | 落盘策略 |
-| `src/app/form.rs` | 表单**状态** + 校验（纯状态机，不 spawn、不落盘） | `app`、`keys::form` | 表单字段与校验规则 |
-| `src/app/form_submit.rs` | 表单**提交**：校验 → 持久化 → supervisor（create 直接保存，edit 确认后重建），以及「手填 vs 导入面板谁赢 `ctrl+s`」的路由 | `keys`、`app` | 提交顺序与副作用、提交归属 |
-| `src/app/duplicate.rs` | 转发**身份去重**：`duplicate_of` / `duplicate_in_batch`（只比 `forward_identity`，不做 I/O） | `form_submit`、`import`、`port_batch` | 新的重复判定入口；身份定义在 `model::tunnel` |
-| `src/app/import.rs` | 导入的**提交**半边：发现主机转发、批量校验、`config_from_forward`、建隧道 | `app` | 导入语义与校验 |
-| `src/app/port_scan.rs` | 对端端口扫描的**交互**半边：`p` 打开、扫描线程/代次、光标与勾选 | `keys::ports`、`app` | 扫描状态与面板交互 |
-| `src/app/port_batch.rs` | 对端端口批量的**提交**半边：勾选端口 → 每条一条 `-L` 隧道（全有或全无） | `app::form_submit` | 批量提交语义与命名 |
-| `src/app/confirm.rs` | 确认闸：`ask_confirm`、文案、`apply` | `app`、`keys::misc` | 新受保护操作 → `ConfirmAction` 一个变体 |
-| `src/app/select.rs` | 多选模式：标记集合、批量派发 | `app`、`keys::select` | 新批量动作 → `BatchAction` |
-| `src/app/mouse.rs` | 鼠标：查 `HitMap` → 调与键盘同一批 `App` 方法 | `main` | 新的可点语义 |
-| `src/app/picker.rs` | 主机下拉：过滤、移动、接受 | `app`、`keys::dropdown` | 下拉行为 |
-
-### keys 键分发 / `src/keys/`
+### keys 键分发 / `src/keys`
 
 | 文件 | handler | 上下文 / help section |
 |---|---|---|
@@ -107,131 +85,12 @@
 | `src/keys/select.rs` | `handle_select_key` | 多选模式 |
 | `src/keys/form.rs` | `handle_form_key`、`handle_field_navigating/editing`、`activate_field`、`adjust_field`、`move_field`、`edit_field` | 表单（导航 / 编辑） |
 | `src/keys/import.rs` | `handle_import_key`、`handle_import_filter_key`、`active_filter_column` | 导入面板 / 导入列筛选 |
+| `src/keys/ports.rs` | `handle_port_key` + 移动/行两个 helper | 对端端口列表 |
 | `src/keys/dropdown.rs` | `handle_dropdown_key` | 主机下拉 |
-| `src/keys/misc.rs` | `handle_help_key`、`handle_detail_key`、`handle_confirm_key`、`handle_filter_key`、`status_level_name`、`confirm_is_delete` | 帮助 / 详情 / 确认 / 过滤 |
-| `src/keys/testkit.rs` | `#[cfg(test)]` 共享夹具（`app_with`、key 构造器、场景构造器），**无生产代码** | 测试夹具 |
+| `src/keys/misc.rs` | `handle_help_key`、`handle_detail_key`、`handle_confirm_key`、`handle_filter_key` | 帮助 / 详情 / 确认 / 过滤 |
+| `src/keys/testkit.rs` | `#[cfg(test)]` 共享夹具，**无生产代码** | 测试夹具 |
 
 **加键 = 改两个文件**：handler 里加 dispatch，`src/help.rs` 对应 section 加一行。漏一个 `tests/help_coverage.rs` 会红。见 [agents.md](agents.md#加按键--add-a-key)。
-
-### ui 渲染 / `src/ui/`
-
-| 文件 | 放什么 |
-|---|---|
-| `src/ui.rs` | 模块地图 + `draw()` 入口（81 行，只做编排） |
-| `src/ui/frame.rs` | `draw()` 主流程、`clamp_scrolls`、`band()`、`centered()`、`popup_block()` |
-| `src/ui/palette.rs` | `Palette`、颜色、`fmt_uptime` / `fmt_unix` / `cell()` |
-| `src/ui/text.rs` | 本层包装（`pair`/`fit_pair`/`fit_pair_spaced` → `crate::text`）+ `warn_once` |
-| `src/ui/layout.rs` | 列定义 `Col`、`column_layout()`、宽度预算 |
-| `src/ui/hit.rs` | `HitTarget` + `HitMap`（每帧重建的语义命中图） |
-| `src/ui/header.rs` | 标题、计数器、消息条 |
-| `src/ui/hints.rs` | 底部提示行（3 行）、`flow_hints` |
-| `src/ui/table.rs` | 转发表格、状态短句 |
-| `src/ui/selection.rs` | 多选动作条 |
-| `src/ui/help.rs` | 帮助浮层（`help_lines` 与滚动上限共用） |
-| `src/ui/form.rs` | 新建/编辑表单 |
-| `src/ui/dropdown.rs` | 主机下拉 |
-| `src/ui/confirm.rs` | 确认框 |
-| `src/ui/detail.rs` | 详情 + 完整日志 |
-| `src/ui/filter.rs` | 过滤输入行 |
-| `src/ui/import.rs` | 导入面板根 + `draw_pane` + `draw_empty` |
-| `src/ui/ports.rs` | 对端监听端口面板（扫描中/失败/空/行列表 + 页脚键位） |
-| `src/ui/import/body.rs` | 行渲染、滚动窗口 |
-| `src/ui/import/header.rs` | 列头、chips、按钮 |
-| `src/ui/import/footer.rs` | 页脚：勾选统计、hint 打包折行 |
-| `src/ui/import/row.rs` | `ColSpec`、列宽计算、`row_line`、`cell_span` |
-| `src/ui/import/cursor.rs` | `LineCursor` |
-| `src/ui/test_support.rs` | `#[cfg(test)]` 渲染测试夹具（`TestBackend` 包装） |
-
-渲染规则（不改状态、`NO_COLOR`、CJK 宽度、命中图纪律）见 [tui.md](tui.md)。
-
-### 其余层 / The rest
-
-| 文件 | 放什么 |
-|---|---|
-| `src/ipc/mod.rs` | 模块地图 + re-export（client-server 协议的唯一定义处） |
-| `src/ipc/frame.rs` | `u32` 大端长度前缀、`MAX_FRAME`（256 KiB）、读写一帧 |
-| `src/ipc/msg.rs` | `ClientMsg`/`ServerMsg`、`Op` 命令枚举、`WireError`、`PROTO_VERSION` |
-| `src/ipc/snapshot.rs` | `Snapshot`/`WireTunnel`/`WireStatus`；`Instant` ⇄ 毫秒时间戳（`from_views`/`to_views`） |
-| `src/ipc/codec.rs` | 编解码、版本/配置/**令牌**校验、双语可操作错误 |
-| `src/ipc/endpoint.rs` | `config_path` → `port`/`token`/`lock` 三个文件（FNV-1a）、词法规范化、`$SSHPF_IPC_DIR` |
-| `src/ipc/transport.rs` | 回环 TCP 绑定/连接、端口与令牌文件（原子写）、单例锁、令牌生成 |
-| `src/server.rs` | server 主循环（非阻塞 accept）+ `ServerArgs`/`ShutdownTrigger` |
-| `src/server/start.rs` | `--server` 启动：选举、信号桥、退出码映射 |
-| `src/server/election.rs` | 抢锁、清残留端点、绑定并发布、`Role::{Server,Client}` |
-| `src/server/state.rs` | `Shared`：`Arc<Mutex<ServerState>>` + 原子 `client_count`/`revision` |
-| `src/server/session.rs` | 单 client：握手闸、读循环、定向回复、有界队列写出 |
-| `src/server/framing.rs` | `FrameReader`：**可续读**的帧解码（读超时不能丢半帧） |
-| `src/server/broadcast.rs` | 会话注册表、`revision` 广播、慢消费者标记 |
-| `src/server/commands.rs` | `Op` → `App` 变更，**server 侧重新校验**、`expect_rev` 判定 |
-| `src/server/lifecycle.rs` | `client_count`、宽限窗口（确认 500ms / 崩溃 5s）、关服顺序 |
-| `src/client.rs` | `run()`：连不上则选举/拉起，之后只重连；`Session` |
-| `src/client/connect.rs` | 读令牌/端口、拨号、`Hello`/`Welcome` 握手 |
-| `src/client/link.rs` | 连接的读线程、写循环、2s 心跳 |
-| `src/client/sync.rs` | `ServerMsg` → `App`（`apply` / 每帧 `drain`） |
-| `src/client/spawn.rs` | 分离式拉起 `--server`（Windows `DETACHED_PROCESS` / Unix `process_group(0)`） |
-| `src/client/reconnect.rs` | spawn 等待预算与退避 |
-| `src/app/mirror.rs` | 镜像半边：`Mirror`、`App::forward`、`App::apply_snapshot` |
-| `src/app/server_api.rs` | server 专用 `App` 入口：`add_tunnel`/`replace_tunnel`/`next_free_id` |
-| `src/sys/signals.rs` | `QuitFlags`：退出信号 → 原子（TUI 与 server 共用） |
-| `src/tunnel.rs` | `Supervisor`、`TunnelEvent`、一线程一 `current_thread` runtime、`catch_unwind` |
-| `src/config.rs` | `ConfigFile`、`Defaults`、`Paths`、原子写、`0600`/`0700` |
-| `src/ssh.rs` | `ssh` 层地图 |
-| `src/ssh/config.rs` | `~/.ssh/config` → 主机与有效连接参数（`ssh2-config`），`strip_match_blocks` |
-| `src/ssh/forwards.rs` | `LocalForward`/`RemoteForward`/`DynamicForward` 行扫描、作用域、去重 |
-| `src/ssh/known_hosts.rs` | 主机密钥校验（自写）、`HostKeyPolicy`、`@revoked` |
-| `src/ssh/socks5.rs` | `-D` 的 SOCKS5 服务端（仅 `CONNECT` + `NOAUTH`） |
-| `src/ssh/client.rs` | 模块地图 + `run()` + `pub use Options/classify` |
-| `src/ssh/client/classify.rs` | `russh::Error` → `FailureKind`、`classify_text`、`short_reason` |
-| `src/ssh/client/handler.rs` | `SharedVerdict`、`Handler`（`check_server_key`、`forwarded-tcpip`） |
-| `src/ssh/client/auth.rs` | `Auth`、`load_auth`、`connect_agent`、`expand_path`、`authenticate` |
-| `src/ssh/client/connect.rs` | `timeout_connect`、`session()`、`connect()`（含 `ProxyJump` 链） |
-| `src/ssh/client/driver.rs` | `serve_local` / `serve_remote` / `serve_dynamic`；三个循环各自 race 探活 |
-| `src/ssh/client/health.rs` | 定时探活：`PING_TIMEOUT`（5s）、`StaleCause`（失效判据）、`watch`、失效 → `StaleConnection` |
-| `src/ssh/probe.rs` | 对端端口探测：`list_command`、`interpret`、`scan_listen_ports`、`ScanOutcome` |
-| `src/ssh/client/probe.rs` | 走隧道同一条 SSH 路径执行命令并取回 stdout |
-
-### 叶子层 / Leaves
-
-| 文件 | 放什么 | 加东西放哪 |
-|---|---|---|
-| `src/model.rs` | 模块地图 + `mod`/`pub use`（63 行，只做导航） | 新类型 → 下表对应文件 |
-| `src/model/tunnel.rs` | `ForwardKind`、`TunnelConfig`（含 `forward_identity`）、`identity_of`（唯一身份算法，`SshForward` 也用它） | 隧道定义字段、身份规则 |
-| `src/model/dedup.rs` | `fold_duplicates`、`Folded`：载入时把「同一个转发」的多条已保存条目折成一条 | 折叠规则（哪条留下、怎么报告） |
-| `src/model/import.rs` | `SshForward`（含 `ends` / `forward_identity`：未规划端口的转发身份）、`ForwardEnds`、`LocalPortReason`、`PORT_SCAN_LIMIT`、`plan_local_port`、`col_match` | 导入的发现规则、方向映射与端口规则 |
-| `src/model/import/row.rs` | `ImportColumn`、`ImportRow`（一行怎么显示、怎么勾，含 `existing` / `creatable`：已保存的转发列出但不可创建） | 可筛选列 / 每行标志 |
-| `src/model/import/table.rs` | `ImportTable`：候选行、光标、滚动、选中、`touched`、`with_existing` | 行与选中状态 |
-| `src/model/import/filter.rs` | `ImportTable` 的逐列筛选 + 撤销栈 | 筛选/撤销行为 |
-| `src/model/portscan.rs` | `RemotePort`、`PortRow`、`PortPick`、`PortScanState` | 对端端口与选择器状态 |
-| `src/model/portscan/parse.rs` | `ss` / `netstat` 文本 → `RemotePort`（不可信输入） | 端口解析规则 |
-| `src/model/portscan/declared.rs` | `declared_ports` / `filter_declared`：排除 ssh config 已列出的端口 | 端口去重规则 |
-| `src/model/fixtures.rs` | `#[cfg(test)]` 专用共享夹具（不进 release） | 测试夹具 |
-| `src/model/batch.rs` | `MultiSelect`、`BatchAction` | 批量动作 |
-| `src/model/failure.rs` | `FailureKind`、`FailureInfo` | 新失败分类（同步 `kind()`/`short()`/`displays`） |
-| `src/model/status.rs` | `TunnelStatus`、`LogLevel`、`LogLine`、`LogRing`、`TunnelView` | 状态与内存日志 |
-| `src/model/form.rs` | `FormField`、`FormMode`、`InputBuf` | 表单字段 |
-| `src/model/picker.rs` | `HostPicker` | 下拉状态 |
-| `src/model/msg.rs` | `StatusMsg`、`now_hms`、`now_unix` | 状态栏消息 |
-| `src/model/match.rs` | `fuzzy_match` | 模糊匹配 |
-| `src/text.rs` | `display_width`、`char_width`、`truncate_to_width`、`pad_to_width`、`bi`、`fit`、`wrap`、`glob_match` | **任何**字符串操作 |
-| `src/help.rs` | 模块地图 + `SECTIONS` 组装、`bi`/`fit` re-export、`SectionId` | 帮助目录的入口 |
-| `src/help/main.rs` | 主界面、多选模式两节 | 这两个上下文的文案 |
-| `src/help/form.rs` | 表单导航 / 编辑、主机下拉三节 | 表单相关文案 |
-| `src/help/import.rs` | 导入面板、导入列筛选两节 | 导入相关文案 |
-| `src/help/dialogs.rs` | 确认框、详情、过滤、帮助浮层四节 | 弹层文案 |
-| `src/help/notes.rs` | 鼠标、状态图例、安全规则三节 | 跨上下文 prose（note 行） |
-| `src/logging.rs` | 模块地图 + 公共 API（`Level`/`Config`/`logger`/`init`/`info`/`warn`…）+ 全局状态 | 见 `logging/*` |
-| `src/logging/level.rs` | `Level`、`Config`、`default_dir`、`level_from_env` | 级别与配置 |
-| `src/logging/sink.rs` | `Sink`、`Logger`、`CriticalSection`、`record`、`rotate`、`open_append`、`rewire_crash_fd` | 写入与轮转 |
-| `src/logging/format.rs` | `now_timestamp`、`token`、`push_value`（字段转义） | 格式 |
-| `src/logging/panic.rs` | `install_panic_hook`、`log_panic`、`payload_text`、`write_panic_record`、`backtrace` | panic 通路 |
-| `src/logging/crash.rs` | **唯一 `unsafe` 文件**：signal handler + `set_tui_active` | 见文件头 SAFETY CONTRACT |
-| `src/eventlog.rs` | `event=` 值的唯一真相 + `pub use` | 新事件 → 下表对应族 |
-| `src/eventlog/process.rs` | 进程/配置类：`app_start`、`app_exit`、`config_loaded`… | 进程与配置事件 |
-| `src/eventlog/tunnel.rs` | 隧道生命周期：`tunnel_start_requested`、`tunnel_ready`、`tunnel_retry_abandoned`… | 隧道事件 |
-| `src/eventlog/ssh.rs` | SSH 配置与主机密钥类 | SSH 事件 |
-| `src/eventlog/user.rs` | 用户动作、界面降级：`render_degraded`、`slow_frame`、`mouse_capture_failed`… | 用户动作与降级 |
-| `src/sys/mod.rs` | `signal_name` 平台函数 + 转发到 `unix`/`windows` | 新平台差异 |
-| `src/sys/unix.rs` / `src/sys/windows.rs` | `quit_signals`、`create_private_file`、`open_private_append`、`restrict_file`、`restrict_dir`、`perms_too_open`（Windows 侧为空实现/`Ctrl-C` 子集） | — |
 
 ## 依赖规则 / Dependency rules
 
@@ -247,14 +106,14 @@
 | 需求 | 放哪 | 还要动 |
 |---|---|---|
 | 新的隧道字段 | `src/model/tunnel.rs` + `src/config.rs`（serde 默认值） | `src/ui/import/row.rs` 若影响展示；`--check` 校验 |
-| 新的失败分类 | `src/model/failure.rs`（`kind()`/`short()`/`displays()` 三处） | `docs/logging/events.md` 的 `kind` 稳定值列表 |
-| 新的确认闸动作 | `src/app/confirm.rs` 的 `ConfirmAction` + 文案 | `src/keys/` 触发点；帮助 Safety section |
-| 新的批量动作 | `src/model/batch.rs` 的 `BatchAction` | `src/app/select.rs`、`src/ui/selection.rs`、keymap |
-| 新的界面面板（浮层） | `src/app.rs` 的 `Overlay` 变体 + `src/ui/<name>.rs` + `src/keys/<name>.rs` | `HitTarget` 变体 + help section + keymap |
-| 新的导入列 | `src/model/import/row.rs` 的 `ImportColumn` | `src/ui/import/row.rs`、`src/keys/import.rs`、`src/model/import/filter.rs` |
-| 新的日志事件 | `src/eventlog/<族>.rs` 一个函数 | `docs/logging/events.md` 一行 |
-| 新的连通性判定 / 探活 | `src/ssh/client/health.rs`（判据与 `PING_TIMEOUT`） | `src/ssh/client/driver.rs` 的循环 race、`docs/runtime.md` |
-| 新的配置项 | `src/config.rs` `Defaults` | README 配置段、`config.defaults_clamped` 若需钳制 |
+| 新的失败分类 | `src/model/failure.rs`（`kind()`/`short()`/`displays()` 三处） | [logging/events.md](logging/events.md) 的 `kind` 稳定值列表 |
+| 新的确认闸动作 | `src/app/confirm.rs` 的 `ConfirmAction` + 文案 | `src/keys/` 触发点；`help` 的 Safety section |
+| 新的批量动作 | `src/model/batch.rs` 的 `BatchAction` | `src/app/select.rs`、`src/ui/selection.rs`、[keymap.md](keymap.md#多选模式--selection-mode) |
+| 新的界面面板（浮层） | `src/app.rs` 的 `Overlay` 变体 + `src/ui/<name>.rs` + `src/keys/<name>.rs` | `HitTarget` 变体 + help section + keymap（清单见 [tui.md](tui.md#加一个可点控件--add-a-clickable-control)） |
+| 新的导入列 | `src/model/import/row.rs` 的 `ImportColumn` | `src/ui/import/row.rs`、`src/keys/import.rs`、`src/model/import/filter.rs`、[import.md](import.md) |
+| 新的日志事件 | `src/eventlog/<族>.rs` 一个函数 | [logging/events.md](logging/events.md) 一行 |
+| 新的连通性判定 / 探活 | `src/ssh/client/health.rs`（判据与 `PING_TIMEOUT`） | `src/ssh/client/driver.rs` 的循环 race、[runtime.md](runtime.md#健康检查--health-checks) |
+| 新的配置项 | `src/config.rs` `Defaults` | [../README.md](../README.md#配置--configuration)、`config.defaults_clamped` 若需钳制 |
 | 新的字符串工具 | `src/text.rs`（唯一实现） | 单测放同文件尾部 |
 | 新的平台差异 | `src/sys/mod.rs` + `unix.rs`/`windows.rs` | Windows CI 必须仍能编译 |
 
@@ -266,6 +125,6 @@
 |---|---|---|
 | 单文件生产行数 | ≤ 400 | `tests/safety_guards.rs` 断言（`MAX_PROD_LINES`） |
 | 单函数行数 | ≤ 60 | `tests/safety_guards.rs` 断言（`MAX_FN_LINES`，测试函数豁免） |
-| 模块根（`src/ui.rs` 等） | 只做地图 + `draw()` 之类入口 | 评审；它是 agent 的路标，不要堆实现 |
+| 模块根（`src/ui.rs` 等） | 只做地图 + 入口 | 评审；它是 agent 的路标，不要堆实现 |
 
 豁免要写进 `tests/safety_guards.rs` 的 `SIZE_EXEMPT` 并注明理由——**不是** `#[allow]`。

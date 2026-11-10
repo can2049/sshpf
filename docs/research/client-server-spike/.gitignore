@@ -1,9 +1,0 @@
-# Build output of this throwaway probe crate.
-#
-# The root .gitignore only covers `/target` (the workspace root), so a nested
-# crate like this one needs its own rule — otherwise `git add` would sweep in
-# hundreds of compiler artifacts.
-/target/
-# Same convention as docs/research/spike/: a throwaway crate does not commit a
-# lockfile (there is no reproducibility contract with a disposable probe).
-Cargo.lock
