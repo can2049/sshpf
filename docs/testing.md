@@ -13,6 +13,7 @@
 | **加固**（真二进制） | `tests/logging.rs`、`tests/panic_hardening.rs` | 21 + 13 | 真进程，必须 `--test-threads=1` | 日志全链路、崩溃、恶意输入不 panic |
 | **端到端** | `tests/e2e.rs` | 19 | 真 `sshd`，默认 `#[ignore]` | 三种转发真的通、主机密钥真的拒/真的可忽略、端口真的释放、探活真的发现失效会话 |
 | **策略矩阵** | `tests/host_key_policy.rs` | 10 | 无（真实 `known_hosts` / `~/.ssh/config` 夹具） | 主机密钥判定完整矩阵：默认拒变更、`ignore` 接受但**不写盘**、`@revoked` 四策略恒拒；逐跳策略、全局开关优先 |
+| **跨进程** | `tests/client_server.rs` | 11 | 真二进制作 `--server` + 裸 `TcpStream` 客户端，需 loopback | 发现与握手、令牌是权限边界、窗口收敛到一个 revision、**泵自己改的状态也会广播**、最后一个窗口退出才关服、宽限期、单例选举 |
 
 单元测试**跟着被拆模块走**：`src/model/import/table.rs` 的测试就放该文件末尾，不放回 `src/model.rs`。跨模块共用的夹具放 `#[cfg(test)]` 的夹具文件（如 `src/model/fixtures.rs`、`src/ui/test_support.rs`）——不要把一个夹具复制三份。
 
@@ -41,6 +42,7 @@ cargo test --lib model::                       # 只跑某个模块
 cargo test --test help_coverage                # 帮助覆盖（秒级）
 cargo test --test safety_guards                # 安全/体积政策扫描
 cargo test --test host_key_policy              # 主机密钥策略矩阵（进程内，秒级）
+cargo test --test client_server -- --test-threads=1  # 跨进程：真 service 进程 + 裸 socket 客户端
 cargo test --test logging -- --test-threads=1  # 崩溃与日志（会 fork 自杀子进程）
 cargo test --test panic_hardening -- --test-threads=1
 cargo test --test e2e -- --ignored --test-threads=1   # 真 sshd 端到端
@@ -53,7 +55,7 @@ cargo test --test e2e -- --ignored --test-threads=1   # 真 sshd 端到端
 | Job | 平台 | 跑什么 |
 |---|---|---|
 | `lint` | ubuntu | `cargo fmt --all --check` + `cargo clippy --all-targets -- -D warnings` |
-| `test` | ubuntu + windows | `cargo test --lib` + `cargo test --test help_coverage` + `cargo test --test host_key_policy` |
+| `test` | ubuntu + windows | `cargo test --lib` + `--test help_coverage` + `--test host_key_policy` + `--test safety_guards` + `--test client_server`（`--test-threads=1`） |
 | `hardening` | ubuntu | `--test logging` 与 `--test panic_hardening`，均 `--test-threads=1` |
 | `e2e` | ubuntu | `cargo test --test e2e -- --ignored --test-threads=1` |
 

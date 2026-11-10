@@ -101,6 +101,23 @@ jobs:
       - name: Host-key policy
         run: cargo test --test host_key_policy
 
+      # The client-server suite drives the real binary as a `--server` and speaks
+      # the wire protocol to it from raw `TcpStream` clients, so it needs neither
+      # sshd nor a network — only the ability to spawn a process and bind loopback,
+      # which both matrix entries have.
+      #
+      # It runs here for the same reason as the three steps above: `cargo test
+      # --lib` does not execute `tests/*.rs` targets. It went unlisted when the
+      # client-server runtime landed, and the consequence was a broadcast bug that
+      # left every window showing "connecting" for a forward that was already
+      # listening — no job in this file could have caught it.
+      #
+      # `--test-threads=1`: the tests are wall-clock based (grace windows, pump
+      # ticks) and each kills its own server child, so overlapping them makes the
+      # timings contend.
+      - name: Client-server (real processes)
+        run: cargo test --test client_server -- --test-threads=1
+
       - name: Build (release)
         run: cargo build --release
 
