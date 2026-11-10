@@ -36,33 +36,45 @@ fn config_takes_the_next_argument_verbatim() {
     assert_eq!(args.config.as_deref(), Some(std::ffi::OsStr::new("rel/config.toml")));
 }
 
-/// The old hand-written loop simply set the bool again, so a repeated flag was
-/// legal. clap rejects a second occurrence by default; `overrides_with` on every
-/// flag is what keeps this from becoming a usage error. Pinned because it is the
-/// kind of difference that only shows up in a shell script nobody re-ran.
+/// **Deliberate behaviour change** (was: accepted): a repeated flag is now a
+/// usage error.
+///
+/// The old hand-written loop just set the bool a second time, so `--check --check`
+/// silently worked. clap rejects the second occurrence, and that is the rule we
+/// keep: a flag given twice is a mistake worth reporting, not something to absorb.
+/// The message is bilingual like the other usage errors, so it does not leak
+/// clap's English `error:`/`Usage:` block into a program that speaks Chinese
+/// first.
 #[test]
-fn a_repeated_flag_is_accepted_not_a_usage_error() {
+fn a_repeated_flag_is_a_usage_error() {
     for flag in ["--check", "--list-hosts", "--no-restore", "--ignore-host-key-changes"] {
-        let args = parse(&[flag, flag]).unwrap().unwrap();
-        assert!(
-            args.check || args.list_hosts || args.no_restore || args.ignore_host_key_changes,
-            "{flag} did not stick"
-        );
+        let err = parse_err(&[flag, flag]);
+        assert!(err.contains("参数不能重复"), "{flag}: {err}");
+        assert!(err.contains(flag.trim_start_matches('-')), "the message must name the flag: {err}");
     }
-    // Two `-c` are legal too; the last one wins (same as the old loop reading them in order).
-    let args = parse(&["-c", "/tmp/a.toml", "-c", "/tmp/b.toml"]).unwrap().unwrap();
-    assert_eq!(args.config.as_deref(), Some(std::ffi::OsStr::new("/tmp/b.toml")));
+    // The flag with a value repeats the same way.
+    let err = parse_err(&["-c", "/tmp/a.toml", "-c", "/tmp/b.toml"]);
+    assert!(err.contains("参数不能重复"), "{err}");
 }
 
-/// `--config` takes the next argument **verbatim**, even when it looks like a
-/// flag. `sshpf -c --help` naming a file called `--help` is odd but legal, and it
-/// is what the old parser did (`it.next()` with no inspection). clap would
-/// otherwise treat `--help` as the help flag, so `allow_hyphen_values` pins it.
+/// **Deliberate behaviour change** (was: stored as the path): a flag-shaped value
+/// for `--config` is now a usage error.
+///
+/// The old parser took whatever came next (`it.next()` with no inspection), so
+/// `sshpf -c --help` tried to open a config file literally named `--help`. clap
+/// refuses to treat a `--…` token as a value, which is the safer reading: a typo
+/// like `-c --check` now says so instead of failing later with a confusing
+/// "failed to read --check".
+///
+/// A path that really does start with `--` still works — write it attached.
 #[test]
-fn config_takes_a_flag_shaped_argument_as_its_value() {
-    let args = parse(&["--config", "--help"]).unwrap().unwrap();
+fn a_flag_shaped_config_value_is_a_usage_error() {
+    let err = parse_err(&["--config", "--help"]);
+    assert!(err.contains("--config"), "{err}");
+    assert!(err.contains("需要一个路径参数"), "the message must say a path is missing: {err}");
+    // The escape hatch for a genuinely dash-leading path.
+    let args = parse(&["--config=--help"]).unwrap().unwrap();
     assert_eq!(args.config.as_deref(), Some(std::ffi::OsStr::new("--help")));
-    assert!(!args.check, "the value must not also be interpreted as a flag");
 }
 
 /// **Deliberate behaviour change**: `--config=PATH` and `-cPATH` are now accepted.
