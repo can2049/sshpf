@@ -360,6 +360,3 @@ mod imp {
 // it. Gate the whole module rather than sprinkling `#[cfg(unix)]` on each test.
 #[cfg(all(test, unix))]
 mod tests;
-
-#[cfg(all(test, unix))]
-mod tests;
