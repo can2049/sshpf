@@ -72,25 +72,7 @@
 
 ## 代码目录速查 / Repository at a glance
 
-| 路径 | 一句话 |
-|---|---|
-| `src/main.rs` | 进程入口 + 事件循环 |
-| `src/cli.rs` | 参数解析 + `USAGE` 双语文本 |
-| `src/app/` | 状态机：持有隧道、消费事件、确认闸、表单、多选、鼠标 |
-| `src/keys/` | 按键分发（每个上下文一个 handler 文件） |
-| `src/ui/` | 纯渲染（ratatui），每帧重建命中图 |
-| `src/tunnel.rs` | 隧道监督：一线程一 runtime |
-| `src/ssh/` | `~/.ssh/config`、known_hosts、SOCKS5、russh 客户端 |
-| `src/ipc/`、`src/server/`、`src/client/` | client-server 协议定义、权威进程、视图进程 |
-| `src/model/` | 纯数据：隧道、导入表、状态、表单、失败分类 |
-| `src/config.rs` | TOML 持久化（原子写、`0600`） |
-| `src/logging/` | 落盘日志 + 崩溃捕获（唯一允许 `unsafe`） |
-| `src/eventlog/` | `event=` 词汇表（唯一真相） |
-| `src/help/` | 双语帮助目录（数据，不是散文；按上下文分文件） |
-| `src/text.rs` | 唯一的字符串层：宽度/截断/双语/折行/glob |
-| `src/sys/` | 平台差异：文件权限、退出信号 |
-
-逐文件「放什么 / 边界在哪」不用查文档：读那个文件自己的 `//!` 头注释（`tests/safety_guards.rs` 强制每个源文件都有）。
+**逐目录职责见 [architecture.md](architecture.md#模块地图--module-map)。逐文件「放什么 / 边界在哪」不用查文档：读那个文件自己的 `//!` 头注释**（`tests/safety_guards.rs` 强制每个源文件都有）。
 
 ## 维护本页 / Keeping this index honest
 

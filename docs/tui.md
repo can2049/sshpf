@@ -125,15 +125,7 @@ TunnelRow(TunnelId)                // ← 而不是行号
 
 ## 降级 / Degradation
 
-渲染层每帧都可能触发边界条件，所以**限流**：`ui.render_degraded` 每进程每处只记一次（`ui::text::warn_once` + 各自的 `static SEEN`）。否则一次 resize 就能把 2 MiB 日志刷满，把真正有意思的历史挤掉。
-
-| `reason` | 触发 | 后果 |
-|---|---|---|
-| `layout_band_missing` | `Layout::split` 少给了分区 | 该块这一帧不画 |
-| `width_overflow` | 文本显示宽度超 `u16` | 截断渲染 |
-| `row_overflow` | 行号 + 表头顶出 `u16` | 视为屏幕外，不进命中图 |
-
-**降级不是静默的**：每一处都有一条可 grep 的记录。排查见 [logging.md](logging.md#排查配方--recipes)。
+渲染层每帧都可能触发边界条件，所以**限流**：`ui.render_degraded` 每进程每处只记一次（`ui::text::warn_once` + 各自的 `static SEEN`）。否则一次 resize 就能把 2 MiB 日志刷满，把真正有意思的历史挤掉。三种 `reason`（`layout_band_missing` 该块不画 / `width_overflow` 截断渲染 / `row_overflow` 视为屏幕外不进命中图）的含义与排查见 [logging.md](logging.md#排查配方--recipes)。**降级不是静默的**：每一处都有一条可 grep 的记录。
 
 ## 加一个可点控件 / Add a clickable control
 

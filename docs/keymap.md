@@ -41,14 +41,12 @@
 
 | 按键 / Key | 中文 | English |
 |---|---|---|
-| `j` / `↓` | 向下移动光标 | Move the cursor down |
-| `k` / `↑` | 向上移动光标 | Move the cursor up |
-| `g` / `home` | 跳到首行 | Jump to the first row |
-| `G` / `end` | 跳到末行 | Jump to the last row |
+| `j` / `↓` / `k` / `↑` | 上下移动光标 | Move the cursor up / down |
+| `g` / `home` / `G` / `end` | 跳到首行 / 末行 | Jump to the first / last row |
 | `space` | 启用 / 停用当前行；运行中会先确认 | Enable / disable the row; asks first if it is running |
 | `r` | 重启当前行；运行中先确认，未运行直接启动 | Restart the row; asks if running, starts it if not |
 | `n` | 新建转发 | Create a tunnel |
-| `e` / `E` | 编辑当前行（两个键同效） | Edit the selected row (`e` and `E` are aliases) |
+| `e` / `E` | 编辑当前行（两个键同效） | Edit the selected row |
 | `d` | 删除当前行（先确认） | Delete the selected row (asks first) |
 | `enter` / `l` | 打开详情 / 完整日志 | Open the detail / full-log overlay |
 | `/` | 按名称或 SSH 主机过滤 | Filter by name or SSH host |
@@ -74,8 +72,7 @@
 | `v` / `V` / `esc` | 退出多选模式（标记清空） | Leave selection mode (marks are cleared) |
 | `j` / `↓` / `k` / `↑` | 移动光标，已勾选的标记保持不变 | Move the cursor; existing marks stay |
 | `g` / `G` / `home` / `end` | 跳到首行 / 末行 | Jump to the first / last row |
-| `J` / `shift+↓` | 从锚点向下扩选到光标 | Extend the marks down from the anchor |
-| `K` / `shift+↑` | 从锚点向上扩选到光标 | Extend the marks up from the anchor |
+| `J` / `shift+↓` / `K` / `shift+↑` | 从锚点向下 / 向上扩选到光标 | Extend the marks down / up from the anchor |
 | `space` | 勾选 / 取消当前行（**不是**启停） | Mark / unmark this row (it does **not** start or stop it) |
 | `a` | 全选切换，只作用于筛选后可见行 | Toggle select-all, visible rows only |
 | `s` | 批量启用（先确认） | Batch start (asks first) |
@@ -129,8 +126,8 @@
 
 说明 / Notes:
 
-- `ctrl+s` / `f10` 在**两个阶段都能保存**：编辑态会先结束当前字段的编辑再提交，所以**不会**把字母 `s` 打进字段。此前编辑态的 `ctrl+s` 会把 `s` 插进正在编辑的内容（静默的数据损坏），`f10` 则完全无反应——而提示行一直写着「`ctrl+s` 保存」。Both stages save: the editing stage ends the field edit first, so the letter `s` is never typed into the field.
-- **`ctrl+s` / `f10` 在任何子焦点下都能保存**：主机下拉开着、导入列筛选正在输入、或对端端口列表开着时，保存键都属于表单。这里曾经有个静默缺陷：`ctrl+s` 是 `Char('s')`，字符本身不是控制字符，于是下拉框与列筛选末尾的 `Char(c) if !c.is_control()` 兜底分支把它当普通输入吃掉——查询框里多出 `s`、保存没有发生、**也没有任何日志**（详见 [design.md](design.md) D35）。
+- `ctrl+s` / `f10` 在**两个阶段都能保存**：编辑态会先结束当前字段的编辑再提交，所以**不会**把字母 `s` 打进字段。此前编辑态的 `ctrl+s` 会把 `s` 插进正在编辑的内容（静默的数据损坏），`f10` 则完全无反应——而提示行一直写着「`ctrl+s` 保存」。
+- **`ctrl+s` / `f10` 在任何子焦点下都能保存**：主机下拉开着、导入列筛选正在输入、或对端端口列表开着时，保存键都属于表单。这里曾有个静默缺陷：`ctrl+s` 是 `Char('s')`，字符本身不是控制字符，于是下拉框与列筛选末尾的 `Char(c) if !c.is_control()` 兜底分支把它当普通输入吃掉——保存没有发生、**也没有任何日志**（详见 [design.md](design.md) D35）。
 - 在 `远端端口` 输入会联动推荐本地端口；手改过 `本地端口` 后不再被推荐覆盖。
 - 两段式 `esc`：第一次退出编辑，第二次才是"放弃并关闭表单"（有未保存内容会确认）。
 
@@ -140,8 +137,7 @@
 
 | 按键 / Key | 中文 | English |
 |---|---|---|
-| `↓` / `j` | 下一台主机 | Next host |
-| `↑` / `k` | 上一台主机 | Previous host |
+| `↓` / `j` / `↑` / `k` | 上下移动主机 | Move the host highlight |
 | `pgdn` / `pgup` | 向下 / 向上翻一页 | Page down / up |
 | `home` / `end` | 第一台 / 最后一台主机 | First / last host |
 | 任意字符 | 过滤主机（别名 / 地址 / 用户名） | Filter hosts by alias, address or user |
@@ -228,9 +224,7 @@
 
 | 按键 / Key | 中文 | English |
 |---|---|---|
-| `j` / `↓` | 向下滚动 | Scroll down |
-| `k` / `↑` | 向上滚动 | Scroll up |
-| `pgdn` / `pgup` | 向下 / 向上翻页 | Page down / up |
+| `j` / `↓` / `k` / `↑` / `pgdn` / `pgup` | 滚动 / 翻页 | Scroll / page |
 | `q` / `esc` / `enter` / `l` | 关闭，回到主界面 | Close and go back |
 
 失败原因与原始 ssh stderr 在这里完整保留；表格的「最后错误」列只放归类短句。
@@ -252,9 +246,7 @@
 
 | 按键 / Key | 中文 | English |
 |---|---|---|
-| `j` / `↓` | 向下滚动一行 | Scroll down one line |
-| `k` / `↑` | 向上滚动一行 | Scroll up one line |
-| `pgdn` / `pgup` | 向下 / 向上翻页 | Page down / up |
+| `j` / `↓` / `k` / `↑` / `pgdn` / `pgup` | 滚动 / 翻页 | Scroll / page |
 | `?` / `esc` / `q` / `enter` | 关闭帮助 | Close the help |
 
 说明 / Notes: 浮层每行是「键列 | 中文 | 英文」，键列宽度**实测**得出（目录里最宽的 binding +2，钳制 10~22 列且不超半行——写死 12 曾窄于 `g / G / home / end`（18）和 `J / K / shift+↓ / shift+↑`（25），于是绑定直接贴住说明）；放不下时中文先排、英文换到续行；超长组合键独占一行；note 行整行 prose。滚动上限按**折行后的实际行数**计算。渲染规则见 [tui.md](tui.md#浮层--overlays)。
