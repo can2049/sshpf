@@ -269,7 +269,7 @@
 - **先确认再动手**：删除、停用、重启、批量启停 / 重启 / 删除、保存编辑、放弃编辑、退出、`ctrl+c` —— 全部先弹确认框，`y` / `enter` 执行，`n` / `esc` 取消。
 - **刻意不弹确认**（可逆、无副作用）：启动、新建、移动光标、过滤、帮助、详情。
 - `NO_COLOR=1` 关闭全部颜色，状态仍由符号和文字表达。
-- 日志在 `~/.local/state/sshpf/logs/sshpf.log`；`SSHPF_LOG_DIR` / `SSHPF_LOG_LEVEL` 可改目录与级别，详见 [logging.md](logging.md)。
+- 日志在 Linux `~/.local/state/sshpf/logs/sshpf.log`、Windows `%LOCALAPPDATA%\sshpf\logs\sshpf.log`；`SSHPF_LOG_DIR` / `SSHPF_LOG_LEVEL` 可改目录与级别，详见 [logging.md](logging.md)。
 
 ## 这张表怎么保证不遗漏 / How this list stays complete
 

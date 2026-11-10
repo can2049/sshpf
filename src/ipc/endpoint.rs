@@ -36,6 +36,28 @@
 //! resolution is used instead: make the path absolute against the current
 //! directory and fold `.`/`..` by hand.
 //!
+//! # Case is significant on every platform, on purpose
+//!
+//! The endpoint name is a byte-exact hash of the config path, and [`normalize`]
+//! deliberately does **not** fold case. This is a feature, not an oversight, and
+//! it is the one place where Windows is treated exactly like Linux even though
+//! its filesystem is case-insensitive:
+//!
+//! * a path is the user's stated identity for the configuration, so
+//!   `-c C:\cfg\a.toml` and `-c c:\cfg\A.TOML` are two *spellings*, and each gets
+//!   its own endpoint, its own lock and its own server;
+//! * folding case would need a per-platform case table (NTFS compares with
+//!   `$UpCase`, not Unicode's simple folding), and a wrong fold silently merges
+//!   two configurations into one server — the failure mode that matters;
+//! * a mismatch is not silent: the handshake compares the config path
+//!   ([`super::codec::check_config`]) and reports it, so a user who points a
+//!   second window at a different spelling is *told* it is a different endpoint.
+//!
+//! So: two spellings do run two servers. Keep it that way. Teaching `normalize`
+//! to lowercase on Windows would make the identity depend on the filesystem
+//! rather than on what the user typed, and would change the endpoint of every
+//! existing Windows user.
+//!
 //! Belongs here: path derivation only, no I/O.
 //! Does not belong: creating the directory or touching the files (that is
 //! [`super::transport`]), or connecting (the caller's job).
@@ -77,10 +99,14 @@ pub fn endpoint_for(config_path: &Path) -> Endpoint {
 /// The directory holding every endpoint.
 ///
 /// `$SSHPF_IPC_DIR` wins, which is what tests use to keep two suites from
-/// finding each other's servers. Otherwise `$XDG_RUNTIME_DIR` is preferred
-/// because it is per-user (`0700`), cleared at logout, and never world-writable;
-/// on Windows that variable is normally unset and the per-user temp directory
-/// takes over, which inherits the profile's ACL rather than being world-writable.
+/// finding each other's servers. Otherwise the platform's runtime directory:
+///
+/// * **Linux** — `$XDG_RUNTIME_DIR/sshpf`, preferred because it is per-user
+///   (`0700`), cleared at logout, and never world-writable.
+/// * **Windows** — `dirs::runtime_dir()` returns `None` unconditionally, so this
+///   falls through to `%TEMP%\sshpf-ipc`. That is the per-user temp directory
+///   (`%LOCALAPPDATA%\Temp`), which inherits the profile's ACL rather than being
+///   world-writable, so it is the closest equivalent available.
 fn ipc_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("SSHPF_IPC_DIR") {
         return PathBuf::from(dir);
@@ -94,7 +120,14 @@ fn ipc_dir() -> PathBuf {
 /// Make a path absolute and fold `.`/`..` lexically, without touching the disk.
 ///
 /// `std::path::absolute` already removes `.` and makes the path absolute, but it
-/// deliberately keeps `..`; folding that is the missing piece.
+/// deliberately keeps `..`; folding that is the missing piece. (On Windows
+/// `absolute` goes through `GetFullPathNameW`, which folds `..` itself, so the
+/// loop below is a no-op there — it is kept because it is what Linux needs, and
+/// because a no-op is cheaper than a `cfg`.)
+///
+/// **Case is never folded**, on any platform: see the module docs. This function
+/// is the identity of a configuration, so its output must depend only on what the
+/// user typed.
 pub fn normalize(path: &Path) -> PathBuf {
     let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
     let mut out = PathBuf::new();
@@ -118,6 +151,10 @@ pub fn normalize(path: &Path) -> PathBuf {
 /// Not a cryptographic hash and not meant to be: it names files after a config.
 /// A collision would point two configs at one server, which the handshake
 /// detects by comparing the real paths.
+///
+/// Byte-exact by design, case included: `a.toml` and `A.TOML` hash differently
+/// even on Windows, where they may name the same file. That is the intended
+/// behaviour — see "Case is significant on every platform" in the module docs.
 fn short_hash(path: &Path) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in path_bytes(path) {
@@ -220,6 +257,23 @@ mod tests {
         // A regression here would silently move every existing user's endpoint.
         assert_eq!(short_hash(Path::new("/tmp/x")), short_hash(Path::new("/tmp/x")));
         assert_ne!(short_hash(Path::new("/tmp/x")), short_hash(Path::new("/tmp/y")));
+    }
+
+    /// Case is part of a config's identity on **every** platform.
+    ///
+    /// This is deliberate, not an oversight: see "Case is significant on every
+    /// platform" in the module docs. The test runs on Windows too, where the two
+    /// spellings may name the same file — that is the point. If someone ever
+    /// teaches `normalize` to fold case "to fix Windows", this assertion is what
+    /// stops it: it would move every existing Windows user's endpoint and merge
+    /// two configurations into one server.
+    #[test]
+    fn case_is_significant_on_every_platform() {
+        let lower = endpoint_for(Path::new("/tmp/case/config.toml"));
+        let upper = endpoint_for(Path::new("/tmp/case/CONFIG.TOML"));
+        assert_ne!(lower.port_path, upper.port_path, "a different spelling must not share an endpoint");
+        assert_ne!(lower.lock_path, upper.lock_path, "nor a lock: two spellings are two servers");
+        assert_ne!(normalize(Path::new("/tmp/case/config.toml")), normalize(Path::new("/tmp/case/CONFIG.TOML")));
     }
 
     #[test]

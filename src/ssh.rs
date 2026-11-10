@@ -53,7 +53,14 @@ pub mod socks5;
 pub use client::{Options, classify};
 pub use config::{Endpoint, SshHost, list_hosts, resolve_host};
 
-/// Ports below this need elevated privileges on Unix.
+/// Ports below this need elevated privileges on Unix; Windows has no such rule.
+///
+/// This is the named boundary, but the two predicates that implement it —
+/// [`crate::model::TunnelConfig::uses_privileged_port`] and
+/// [`crate::model::plan_local_port`] — cannot *reference* it: `model` is a leaf
+/// layer and `ssh` sits above it, so the dependency would point backwards. They
+/// therefore spell `1023` / `1024` inline. Keep the three in step; the off-by-one
+/// (`<= 1023` vs `>= 1024`) is exactly what two hand-written copies get wrong.
 pub const PRIVILEGED_PORT_MAX: u16 = 1023;
 
 /// Max display width of the short failure phrase shown in the table.

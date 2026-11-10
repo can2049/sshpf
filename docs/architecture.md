@@ -64,7 +64,7 @@
 | `src/keys/` | 按键分发，一个上下文一个 handler 文件 |
 | `src/ui/` | 纯渲染（ratatui），每帧重建命中图 |
 | `src/tunnel.rs` | 隧道监督：一线程一 `current_thread` runtime |
-| `src/config.rs` | TOML 持久化（原子写、`0600`） |
+| `src/config.rs` | TOML 持久化（原子写；Unix `0600`，Windows 靠 ACL） |
 | `src/ssh/` | `~/.ssh/config`、known_hosts、SOCKS5、端口探测、russh 客户端 |
 | `src/ipc/`、`src/server/`、`src/client/` | client-server 协议的唯一定义处、权威进程、视图进程 |
 | `src/model/` | 纯数据：隧道、导入表、状态、表单、失败分类 |
@@ -72,7 +72,7 @@
 | `src/logging/` | 落盘日志 + 崩溃捕获（**唯一允许 `unsafe`**） |
 | `src/eventlog/` | `event=` 词汇表（唯一真相） |
 | `src/help/` | 双语帮助目录（数据，不是散文） |
-| `src/sys/` | 平台差异：文件权限、退出信号 |
+| `src/sys/` | 平台差异：文件权限（Unix mode bit / Windows 空实现）、退出信号（Unix 多 `SIGHUP`） |
 
 `src/*.rs` 与 `src/*/mod.rs` 是**模块根**：只做地图 + re-export + 入口函数，不堆实现。
 

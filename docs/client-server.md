@@ -4,7 +4,7 @@
 > **不负责**：帧格式与消息字段（[research/client-server/protocol.md](research/client-server/protocol.md)）、隧道本身的启停与重连（[runtime.md](runtime.md)）、渲染（[tui.md](tui.md)）。
 > **相关代码路径**：`src/server/`、`src/client/`、`src/ipc/`、`src/app/mirror.rs`。
 
-**一句话：一个 server 持有全部隧道，多个 client 连上它并渲染同一份快照；最后一个 client 退出时 server 才退出。**
+**一句话：一个 server 持有全部隧道，多个 client 连上它并渲染同一份快照；最后一个 client 退出时 server 才退出。Linux 和 Windows 都是这套模型、同一条代码路径。**
 
 ## 为什么不是"每个窗口自己转发"
 
@@ -51,11 +51,24 @@ client 的 `prepare_app` 遇到 mirror 会直接 return，所以两处不会抢�
 
 ### `127.0.0.1` 不是权限边界
 
-本机任何用户都能连任何回环端口。真正的边界是**令牌**：server 启动时生成 128-bit 令牌写入私有目录下的 `<hash>.token`（Unix `0600`，目录 `0700`，Windows 落在 per-user temp 继承 profile ACL）；client 必须把令牌放进 `Hello`，server 校验通过才发任何状态。所以「能连上端口」不等于「能被服务」——令牌错误回 `bad_token` 并立即断开，且**不回显密钥**。
+本机任何用户都能连任何回环端口。真正的边界是**令牌**：server 启动时生成 128-bit 令牌写入私有目录下的 `<hash>.token`，client 必须把令牌放进 `Hello`，server 校验通过才发任何状态。所以「能连上端口」不等于「能被服务」——令牌错误回 `bad_token` 并立即断开，且**不回显密钥**。
+
+令牌文件靠什么保护，**两平台机制不同**：Unix 是 `0600` 文件 + `0700` 目录（mode bit），Windows 没有 mode bit，靠端点目录继承的 profile ACL。见 [security.md](security.md#权限--file-permissions)。
+
+### 端点目录在哪个平台放哪 / Where the endpoint lives
+
+| 平台 | 目录 | 为什么 |
+|---|---|---|
+| Linux | `$XDG_RUNTIME_DIR/sshpf` | per-user、`0700`、登出即清空 |
+| Windows | `%TEMP%\sshpf-ipc` | `dirs::runtime_dir()` 在 Windows **恒返回 `None`**，只能落到 per-user temp（`%LOCALAPPDATA%\Temp`），那里继承 profile ACL |
+
+`SSHPF_IPC_DIR` 可整体改写目录（测试用它隔离）。
 
 ### 端点 = 哪份配置 / Identity is the config
 
-`config_path` 的 FNV-1a-64 → 三个文件：`<hash>.port`（server 绑定的端口，原子写：先写 `.tmp` 再 rename）、`<hash>.token`（本次运行的令牌）、`<hash>.lock`（单例锁，`File::try_lock`）。同一份配置的窗口连同一个 server；不同配置是两个 server，互不干扰。`SSHPF_IPC_DIR` 可整体改写目录（测试用它隔离）。
+`config_path` 的 FNV-1a-64 → 三个文件：`<hash>.port`（server 绑定的端口，原子写：先写 `.tmp` 再 rename）、`<hash>.token`（本次运行的令牌）、`<hash>.lock`（单例锁，`File::try_lock`）。同一份配置的窗口连同一个 server；不同配置是两个 server，互不干扰。
+
+**路径大小写在两个平台上都算数**（有意如此，不是 bug）：哈希按路径字节精确计算，`normalize` 不折叠大小写。所以在 Windows 上 `-c C:\cfg\a.toml` 与 `-c c:\cfg\A.TOML` 是两个端点、两个 server——即使它们可能指向同一个文件。理由：配置身份应该由**用户写下的路径**决定，而不是由文件系统的比较规则决定；折叠大小写需要一张按平台的 case 表，且一旦折错就会把两份配置悄悄并进一个 server。落差不是静默的——握手会比较 `config_path` 并明确报错。细节见 `src/ipc/endpoint.rs` 的模块文档。
 
 ## 单例：`try_lock` 就是选举 / The lock is the election
 

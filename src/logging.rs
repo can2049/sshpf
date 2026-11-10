@@ -49,7 +49,9 @@
 //!   the logger degrades to disabled; write errors are swallowed.
 //! * **Nothing secret is written.** No key material, no passphrases, no
 //!   `known_hosts` contents. Hosts, users and ports are recorded because they
-//!   are what a diagnosis needs; the file is `0600` inside a `0700` directory.
+//!   are what a diagnosis needs; on Unix the file is `0600` inside a `0700`
+//!   directory, and on Windows it inherits the per-user profile ACL (there is no
+//!   mode bit to set — see [`crate::sys`]).
 //! * **Nothing goes to stdout/stderr.** The TUI owns the terminal; records go to
 //!   the file only. The crash path is the single exception, after it has left
 //!   the alternate screen.

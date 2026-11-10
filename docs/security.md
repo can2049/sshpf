@@ -66,6 +66,16 @@
 
 ### 致命信号（`SIGSEGV` / `SIGBUS` / `SIGABRT` / `SIGILL` / `SIGFPE`）
 
+**仅 Unix。** Windows 没有 `sigaction`，`src/logging/crash.rs` 的 `imp` 在 `#[cfg(not(unix))]` 下是一组同签名的空实现（`install` / `adopt` / `release` / `set_tui_active` / `emergency`）。三个后果，都是设计上接受的：
+
+| 缺失 | 后果 |
+|---|---|
+| 无 `crash.signal` | 硬故障（访问违例、栈溢出）**不产生任何 sshpf 日志行**，只留 Windows 自己的 WER 事件日志 |
+| `emergency()` 空实现 | 日志重入（`crash.log_reentrant`）只剩 stderr 一行，文件里没有痕迹 |
+| `set_tui_active` 空实现 | 崩溃后终端停在备用屏，用户要自己 `chcp`/重开窗口，不会看到 Unix 那句 "请执行 reset" |
+
+Rust 层面的 panic **仍然被记录**（走 `crash.panic`，与平台无关）。
+
 `src/logging/crash.rs` 用 `sigaction` 装 handler，只做四件事：① TUI 持有终端时先写转义序列退出备用屏；② `write(2)` 一条**手工拼好**的记录到预先 `dup` 出的 fd；③ 往 stderr 写一行**启动时就拼好**的提示；④ 恢复默认处理器 → **解除内核对该信号的屏蔽** → `raise`。
 
 第 ④ 步最容易漏：内核在 handler 执行期间屏蔽该信号，不解除则 `raise` 只排队，`_exit(139)` 抢先执行，进程从"被 SIGSEGV 杀死"变成"以 139 退出"，**core dump 也不产生**（`a_fatal_signal_keeps_the_signal_exit_status` 钉住它）。代价：这条记录**没有格式化时间戳**，只有 `ts=<epoch 秒>`；递归崩溃由 `SA_RESETHAND` 兜住。
@@ -84,14 +94,17 @@ panic hook 要写日志，写日志要拿锁。**如果 panic 恰好发生在持
 
 ## 权限 / File permissions
 
-| 路径 | 权限 | 为什么 |
-|---|---|---|
-| `~/.config/sshpf/config.toml` | `0600`，目录 `0700` | 含主机名、用户名、端口、密钥路径 |
-| `~/.local/state/sshpf/state.toml` | `0600` | 运行状态，纯诊断 |
-| `~/.local/state/sshpf/logs/sshpf.log` | `0600`，目录 `0700` | 日志里有主机名和用户名，**不能比配置文件更宽松** |
+路径与权限**都按平台取**（`dirs` 解析）：
+
+| 内容 | Linux 路径 | Windows 路径 | Linux 权限 | Windows |
+|---|---|---|---|---|
+| 配置 | `~/.config/sshpf/config.toml` | `%APPDATA%\sshpf\config.toml` | `0600`，目录 `0700` | 无 mode bit，靠 ACL |
+| 运行状态 | `~/.local/state/sshpf/state.toml` | `%LOCALAPPDATA%\sshpf\state.toml` | `0600` | 无 mode bit，靠 ACL |
+| 日志 | `~/.local/state/sshpf/logs/sshpf.log` | `%LOCALAPPDATA%\sshpf\logs\sshpf.log` | `0600`，目录 `0700` | 无 mode bit，靠 ACL |
 
 - 载入时若配置对同组/所有人可读，收紧到 `0600` 并记 `config.perms_tightened`（`WARN`，`ok=false` 时 `ERROR`）。
-- Windows 走**用户配置文件 ACL 继承**，无需操作；`src/sys/windows.rs` 里对应函数是空实现。
+- **Windows 没有 mode bit**，走**用户配置文件目录继承的 ACL**（实测为 `SYSTEM` / `Administrators` / 本人，全部继承自 profile），所以 `src/sys/windows.rs` 里 `restrict_file` / `restrict_dir` 是空实现、`perms_too_open` **恒返回 `false`**。后果有两个，都是设计使然：Windows 上不会出现 `config.perms_tightened` 事件，也不会因为"权限过宽"提示用户。
+- 为什么 Windows 的 state 落在 `%LOCALAPPDATA%` 而不是 `%APPDATA%`：`dirs::state_dir()` 在 Windows 恒返回 `None`，`Paths::resolve` 用 `.or_else(dirs::data_local_dir)` 兜底（`src/config.rs`）。
 
 ## 日志脱敏 / Redaction
 
@@ -143,7 +156,9 @@ panic hook 要写日志，写日志要拿锁。**如果 panic 恰好发生在持
 | 每个源文件有 `//!` 模块文档 | `tests/safety_guards.rs` |
 | 单文件生产行 ≤ 400 | `tests/safety_guards.rs`（`MAX_PROD_LINES`） |
 | 恶意 ssh config / config.toml / 环境变量：**不是被信号杀死**且日志有对应事件 | `tests/panic_hardening.rs` |
-| 崩溃真写盘、轮转不切记录、重入不死锁、`0600`/`0700` | `tests/logging.rs` |
-| 致命信号保持信号退出状态 + 产生 core dump | `tests/logging.rs` |
+| 崩溃真写盘、轮转不切记录、重入不死锁、`0600`/`0700`（后两项仅 Unix） | `tests/logging.rs` |
+| 致命信号保持信号退出状态 + 产生 core dump（**仅 Unix**，Windows 无 `sigaction`） | `tests/logging.rs` |
+
+`tests/logging.rs` 与 `tests/panic_hardening.rs` **只在 Linux 跑**（`.github/workflows/ci.yml` 的 `hardening` job 是 `ubuntu-latest`），其中相当一部分用例又被 `#[cfg(unix)]` 门控。所以上表最后两行在 Windows 上是**没有断言**的——这正是"Windows 只覆盖 panic"这条限制的来源。
 
 测试分层与怎么跑见 [testing.md](testing.md)。

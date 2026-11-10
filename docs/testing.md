@@ -61,6 +61,20 @@ cargo test --test e2e -- --ignored --test-threads=1   # 真 sshd 端到端
 
 **为什么 `help_coverage` 必须在 `test` job 里单独一行**：`cargo test --lib` 只编译库自身的 `#[cfg(test)]`，不执行 `tests/*.rs`。不写这一行，"每个按键都有帮助"的保证就永远躺在一个 CI 不会跑的文件里。`host_key_policy` 同理：它测的是"密钥变了默认拒绝、显式开启才接受、吊销永不接受"这条安全契约。
 
+### 平台覆盖的不对称 / What Windows does not run
+
+| 只在 ubuntu 跑 | 后果 |
+|---|---|
+| `lint`（fmt + clippy `-D warnings`） | Windows 专属的 `cfg` 代码只被 `cargo test --lib` / `build` 编译，**不经 clippy** |
+| `hardening`（`tests/logging.rs`、`tests/panic_hardening.rs`） | 崩溃记录、轮转、重入、`0600`/`0700`、致命信号退出码全部无 Windows 断言 |
+| `e2e`（真实 sshd） | Windows 上无 sshd |
+
+再叠加 `#[cfg(unix)]` 门控：`tests/logging.rs` 有 7 处、`tests/panic_hardening.rs` 有 3 处，库内 `src/sys/mod.rs`、`src/config/tests.rs`、`src/cli/tests.rs`、`src/logging/sink/tests.rs` 各有几处，`src/logging/crash/tests.rs` 更是整个文件 `#![cfg(all(test, unix))]`。这些都是 Windows 上**不编译**的用例。
+
+`tests/e2e.rs` 是另一类陷阱：它在 Windows 上**静默 pass 而非 skip**——`sshd_available()` 检查 `/usr/sbin/sshd` 不存在就让每个测试 `return`，`cargo test` 仍显示通过。
+
+Windows 上真正跑真实进程 IPC 的是 `client_server`（`test` job 的矩阵里），这也是 0.8.0 之后唯一覆盖跨进程行为的 Windows 断言。
+
 ## 写新测试 / Write a new test
 
 | 你在改什么 | 测试放哪 | 断言什么 |

@@ -65,6 +65,9 @@ impl Default for Config {
 ///
 /// The state directory is where `state.toml` already lives, so bookkeeping and
 /// logs share a volume and neither pollutes the user-editable config directory.
+/// It is `~/.local/state/sshpf/logs` on Linux and `%LOCALAPPDATA%\sshpf\logs` on
+/// Windows, for the reason spelled out in [`crate::config::Paths::resolve`]:
+/// `dirs::state_dir()` is `None` there, so `data_local_dir()` takes over.
 pub fn default_dir() -> PathBuf {
     if let Some(p) = std::env::var_os(LOG_DIR_ENV) {
         return PathBuf::from(p);
