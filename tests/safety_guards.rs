@@ -19,6 +19,7 @@
 //! | one function ≤ [`MAX_FN_LINES`] lines | a 150-line function cannot be reviewed, tested or reasoned about |
 //! | every `pub mod` in `src/lib.rs` resolves to a real file | a stale declaration is a broken map |
 //! | no `#[cfg(test)]` module is entirely platform-gated | it compiles to nothing on one OS, so its glob imports break the Windows build |
+//! | every `src/*/tests.rs` opens with `#![cfg(test)]` | that attribute is what exempts it from the budgets above; an ungated one is production code sneaking past them |
 //!
 //! # Test code is exempt, deliberately
 //!
@@ -28,6 +29,15 @@
 //! attribute, so it cannot be fooled by re-indentation, and it also covers a
 //! `#[cfg(test)]` helper function in the middle of a file (which
 //! `src/ui/layout.rs` used to have).
+//!
+//! A module's tests may instead live in a whole file, `src/<module>/tests.rs`,
+//! opened by the inner attribute `#![cfg(test)]`. That is the preferred home once
+//! a module's tests outgrow its production half: the module file stays a readable
+//! map of *what it does*, and the assertions sit one directory deeper under a name
+//! that says exactly what they are. Such a file is skipped by the panic, `unsafe`
+//! and size rules — the attribute proves it compiles to nothing outside
+//! `cargo test` — and [`every_whole_file_test_module_is_gated`] keeps that
+//! exemption honest by requiring the attribute and the exact file name.
 //!
 //! # When this test fails
 //!
@@ -92,6 +102,50 @@ fn source_files() -> Vec<PathBuf> {
     walk(Path::new("src"), &mut out);
     out.sort();
     out
+}
+
+/// Whether a source file is a whole test module: it opens with the *inner*
+/// attribute `#![cfg(test)]` (or `#![cfg(all(test, …))]`).
+///
+/// Such a file is out of every non-test build, so the panic, `unsafe` and size
+/// rules do not apply to it — a test list is allowed to be long, and `.unwrap()`
+/// in a test is a good assertion, not a crash path. This is how the production
+/// budget stays enforceable *and* the tests stay in one predictable place: a
+/// module's tests live at `src/<same path>/tests.rs`.
+///
+/// The gate is checked rather than trusted: `every_whole_file_test_module_is_gated`
+/// below fails if a file sits next to production code without the attribute.
+fn is_whole_file_test(path: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    opens_with_cfg_test(&text)
+}
+
+/// `#![cfg(test)]` / `#![cfg(all(test, unix))]` as the file's first attribute.
+///
+/// Comments and the `//!` header may precede it; nothing else may.
+fn opens_with_cfg_test(text: &str) -> bool {
+    for line in text.lines() {
+        let l = line.trim();
+        if l.is_empty() || l.starts_with("//") {
+            continue;
+        }
+        let Some(rest) = l.strip_prefix("#![cfg(") else {
+            return false;
+        };
+        let Some(predicate) = rest.strip_suffix(")]") else {
+            return false;
+        };
+        return predicate.split(|c: char| !(c.is_alphanumeric() || c == '_')).any(|w| w == "test");
+    }
+    false
+}
+
+/// Source files that are *not* whole-file test modules: the ones the safety and
+/// size rules actually apply to.
+fn production_files() -> Vec<PathBuf> {
+    source_files().into_iter().filter(|p| !is_whole_file_test(p)).collect()
 }
 
 /// A source file with its test regions masked out.
@@ -423,7 +477,7 @@ fn overgrown_functions(scan: &Scan) -> Vec<(usize, String, usize)> {
 #[test]
 fn no_production_function_is_a_swamp() {
     let mut offenders = Vec::new();
-    for path in source_files() {
+    for path in production_files() {
         let Some(scan) = Scan::load(&path) else {
             continue;
         };
@@ -553,7 +607,7 @@ fn production_code_contains_no_panicking_constructs() {
     let mut violations: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut scanned = 0usize;
 
-    for path in source_files() {
+    for path in production_files() {
         let Some(scan) = Scan::load(&path) else {
             continue;
         };
@@ -598,7 +652,7 @@ fn unsafe_is_confined_to_the_crash_writer_and_is_documented() {
     let mut violations: Vec<String> = Vec::new();
     let mut total_blocks = 0usize;
 
-    for path in source_files() {
+    for path in production_files() {
         let Some(scan) = Scan::load(&path) else {
             continue;
         };
@@ -685,7 +739,7 @@ fn every_source_file_states_what_it_is_for() {
 #[test]
 fn no_source_file_is_a_maze() {
     let mut oversized = Vec::new();
-    for path in source_files() {
+    for path in production_files() {
         let Some(scan) = Scan::load(&path) else {
             continue;
         };
@@ -730,6 +784,40 @@ fn every_module_declared_in_lib_rs_exists() {
         }
     }
     assert!(missing.is_empty(), "src/lib.rs declares modules with no file behind them: {missing:?}");
+}
+
+#[test]
+fn every_whole_file_test_module_is_gated() {
+    // `src/<module>/tests.rs` is exempt from the panic/`unsafe`/size rules because
+    // `#![cfg(test)]` keeps it out of every real build. A file that *looks* like
+    // such a module but lacks the attribute would be production code escaping the
+    // budget — so require the attribute explicitly, and require that every file
+    // under a `tests.rs` path is named exactly that (no `tests2.rs` hiding place).
+    let mut bad = Vec::new();
+    for path in source_files() {
+        let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let Some(dir) = path.parent().and_then(|p| p.file_name()) else {
+            continue;
+        };
+        if dir != "tests" {
+            continue;
+        }
+        if name != "tests.rs" {
+            bad.push(format!("{}: a test module file must be named `tests.rs`", rel(&path)));
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if !opens_with_cfg_test(&text) {
+            bad.push(format!(
+                "{}: missing the inner `#![cfg(test)]` attribute — without it this file is production \
+                 code and must obey the size and panic rules",
+                rel(&path)
+            ));
+        }
+    }
+    assert!(bad.is_empty(), "whole-file test modules must be gated:\n{}", bad.join("\n"));
 }
 
 #[test]
