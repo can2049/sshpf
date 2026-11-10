@@ -5,6 +5,8 @@
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-10
+
 本次是 **client-server 运行时**落地：一份配置只有一个后台服务进程，多个窗口共享同一份状态。
 修的是「开第二个 `sshpf` 就报端口被占用、无法再打开」——旧版每个进程都自己拥有隧道并抢同一批
 本地端口，第二个自然撞车。**Windows 与 Linux 走同一套代码路径**。
@@ -508,7 +510,9 @@ DNS 失败被错报为「未知错误」的分类。无新增依赖、无配置�
 - 不统计流量；同一主机多条转发各自建连，未做连接复用。
 - macOS 走 Unix 分支，未实测。
 
-[Unreleased]: https://github.com/can2049/sshpf/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/can2049/sshpf/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/can2049/sshpf/compare/v0.7.0...v0.8.0
+[0.7.0]: https://github.com/can2049/sshpf/compare/v0.6.0...v0.7.0
 [0.5.0]: https://github.com/can2049/sshpf/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/can2049/sshpf/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/can2049/sshpf/compare/v0.3.1...v0.4.0
