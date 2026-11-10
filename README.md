@@ -101,7 +101,9 @@ sshpf --ignore-host-key-changes   # 接受已改变的主机密钥（全局降�
 
 ### 多个窗口共享同一份状态 / Several windows, one state
 
-在 Linux 上，**一份配置只有一个后台服务进程**（`sshpf --server`，由第一个窗口自动拉起），所有窗口都是它的客户端：开第二个窗口**不会再报「端口已被占用」**，而是显示同一份状态；任何窗口的操作都会广播给所有窗口；标题栏显示 `客户端 2/client 2`。**关掉最后一个窗口 = 停掉所有转发**，所以只有它会在退出前提示。想让它常驻用 `--keep-server`。Windows 暂无 socket 传输，仍是每进程独立。完整模型见 [docs/client-server.md](docs/client-server.md)。
+**一份配置只有一个后台服务进程**（`sshpf --server`，由第一个窗口自动拉起），所有窗口都是它的客户端：开第二个窗口**不会再报「端口已被占用」**，而是显示同一份状态；任何窗口的操作都会广播给所有窗口；标题栏显示 `客户端 2/client 2`。**关掉最后一个窗口 = 停掉所有转发**，所以只有它会在退出前提示。想让它常驻用 `--keep-server`。
+
+**Linux 与 Windows 走同一套代码路径**：传输层是回环 TCP（不是 Unix 域套接字，`std` 在 Windows 上没有 UDS API），端点目录在 Linux 是 `$XDG_RUNTIME_DIR/sshpf`、在 Windows 是 `%TEMP%\sshpf-ipc`（`dirs::runtime_dir()` 在 Windows 恒为 `None`，落到 per-user temp）。完整模型见 [docs/client-server.md](docs/client-server.md)。
 
 ### 从 `~/.ssh/config` 导入转发 / Import
 
@@ -137,7 +139,14 @@ sshpf --ignore-host-key-changes   # 接受已改变的主机密钥（全局降�
 
 ## 配置 / Configuration
 
-`~/.config/sshpf/config.toml`（`$XDG_CONFIG_HOME` 生效；`SSHPF_CONFIG` 可覆盖），权限 `0600`。运行状态单独放 `~/.local/state/sshpf/state.toml`，不污染用户编辑的配置。
+路径按平台取（`SSHPF_CONFIG` 可覆盖）：
+
+| 内容 | Linux | Windows |
+|---|---|---|
+| 配置 | `~/.config/sshpf/config.toml`（`$XDG_CONFIG_HOME` 生效） | `%APPDATA%\sshpf\config.toml` |
+| 运行状态 | `~/.local/state/sshpf/state.toml`（`$XDG_STATE_HOME` 生效） | `%LOCALAPPDATA%\sshpf\state.toml` |
+
+配置与状态分开，运行状态不污染用户编辑的配置。权限：Linux 上配置 `0600`、目录 `0700`；Windows 没有 mode bit，靠用户配置文件目录继承的 ACL（`SYSTEM` / `Administrators` / 本人）。
 
 ```toml
 version = 1
@@ -171,7 +180,7 @@ note = ""
 |---|---|
 | `SSHPF_CONFIG` | 配置文件路径（`state.toml` 与它同目录） |
 | `SSHPF_LOG_DIR` / `SSHPF_LOG_LEVEL` | 日志目录 / `off\|error\|warn\|info\|debug`（默认 `info`；`off` 仍写崩溃记录） |
-| `SSHPF_IPC_DIR` | client-server 的端点目录（端口/令牌/锁，默认 `$XDG_RUNTIME_DIR/sshpf`）；测试用它隔离 |
+| `SSHPF_IPC_DIR` | client-server 的端点目录（端口/令牌/锁；默认 Linux `$XDG_RUNTIME_DIR/sshpf`、Windows `%TEMP%\sshpf-ipc`）；测试用它隔离 |
 | `SSHPF_SSH_CONFIG` / `SSHPF_KNOWN_HOSTS` | 只解析这个 ssh config / 使用这个 known_hosts 文件 |
 | `NO_COLOR` | 关闭全部颜色（状态仍由符号和文字表达） |
 
@@ -180,7 +189,7 @@ note = ""
 ```bash
 sshpf --list-hosts          # 确认主机能被读到
 sshpf --check               # 确认配置没写坏
-tail -f ~/.local/state/sshpf/logs/sshpf.log   # 实时看结构化日志
+tail -f ~/.local/state/sshpf/logs/sshpf.log   # 实时看结构化日志（Windows: %LOCALAPPDATA%\sshpf\logs\sshpf.log）
 ```
 
 | 症状 | 先看什么 |
@@ -212,7 +221,7 @@ Host cloud_pc
 OpenSSH 因为 `StrictHostKeyChecking no` 根本不校验跳板机；sshpf 用自己的 `known_hosts` 校验器，照样拒绝。日志里 `host=` 指出被拒的是**哪一跳**：
 
 ```bash
-grep 'event=knownhosts.rejected' ~/.local/state/sshpf/logs/sshpf.log
+grep 'event=knownhosts.rejected' ~/.local/state/sshpf/logs/sshpf.log   # Windows 用 "$env:LOCALAPPDATA/sshpf/logs/sshpf.log"
 # ERROR … event=knownhosts.rejected host=desk-ssh.srv.deeproute.cn port=80 policy=accept-new
 ```
 
@@ -248,7 +257,7 @@ cargo fmt --check
 
 ## 已知限制（v1）
 
-- **端口占用反查进程**仅 Linux 可用（依赖 `/proc`）；**多窗口共享状态**仅在 Linux/macOS，Windows 仍是每进程独立的单进程模式。
+- **端口占用反查进程**仅 Linux 可用（依赖 `/proc`）；其它平台上该列只是空着，不影响转发本身。**多窗口共享状态**两平台都支持（回环 TCP + 令牌）。
 - 一份配置一个服务进程；用 `-c` 指向不同配置文件就是互相独立的两套状态（socket 路径由配置路径派生）。
 - 只支持公钥 / ssh-agent 认证，TUI 内不接管密码输入；不统计流量（需按 channel 累计字节，留待后续）。
 - 同一主机多条转发各自建连，未做连接复用；隧道既是 tokio task，杀进程即关闭 socket，不需要孤儿回收。

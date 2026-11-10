@@ -33,8 +33,10 @@ sshpf — SSH 端口转发 TUI 管理器 / SSH port-forward manager for the term
   sshpf [选项 / options]
 
 选项 / Options:
-  -c, --config <PATH>   使用指定的配置文件（默认 ~/.config/sshpf/config.toml）
-                        Use this config file (default ~/.config/sshpf/config.toml)
+  -c, --config <PATH>   使用指定的配置文件（默认 Linux ~/.config/sshpf/config.toml，
+                        Windows %APPDATA%\\sshpf\\config.toml）
+                        Use this config file (defaults: Linux ~/.config/sshpf/config.toml,
+                        Windows %APPDATA%\\sshpf\\config.toml)
       --no-restore      启动时不自动恢复上次启用的转发
                         Do not restore the forwards enabled in the last run
       --server          在前台作为 server 运行（拥有全部转发，不显示界面）
@@ -62,10 +64,14 @@ sshpf — SSH 端口转发 TUI 管理器 / SSH port-forward manager for the term
   -V, --version         显示版本 / Show the version
 
 日志 / Logging:
-  每次运行都会向 ~/.local/state/sshpf/logs/sshpf.log 追加结构化日志
-  （启动/关闭、隧道启停与重连、异常与失败原因、panic 与致命信号）。
-  Every run appends structured logs to ~/.local/state/sshpf/logs/sshpf.log
-  (start/exit, tunnel up/down/reconnect, failures, panics and fatal signals).
+  每次运行都会向日志文件追加结构化日志（启动/关闭、隧道启停与重连、异常与
+  失败原因、panic 与致命信号）。默认位置：
+  Linux   ~/.local/state/sshpf/logs/sshpf.log
+  Windows %LOCALAPPDATA%\\sshpf\\logs\\sshpf.log
+  Every run appends structured logs to a file (start/exit, tunnel up/down/reconnect,
+  failures, panics and fatal signals). Default location:
+  Linux   ~/.local/state/sshpf/logs/sshpf.log
+  Windows %LOCALAPPDATA%\\sshpf\\logs\\sshpf.log
   SSHPF_LOG_DIR=<目录/dir>     改日志目录 / Change the log directory
   SSHPF_LOG_LEVEL=<级别/level> off|error|warn|info|debug（默认/default info）
   SSHPF_IPC_DIR=<目录/dir>     改 client/server 端点目录（端口/令牌/锁）

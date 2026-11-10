@@ -119,8 +119,10 @@ impl Logger {
 
     /// Open (creating if needed) `<dir>/sshpf.log`.
     ///
-    /// The directory is tightened to `0700` and the file to `0600`: the log names
-    /// hosts, users and ports.
+    /// On Unix the directory is tightened to `0700` and the file created `0600`,
+    /// because the log names hosts, users and ports. Windows has neither bit:
+    /// the per-user profile ACL is the boundary there, and
+    /// [`crate::sys::restrict_dir`] is a no-op.
     pub fn open(cfg: &Config) -> io::Result<Logger> {
         let dir = cfg.dir.clone();
         fs::create_dir_all(&dir)?;

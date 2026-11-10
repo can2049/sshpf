@@ -1,10 +1,15 @@
 //! Persistence: tunnel definitions (user intent) and small runtime state.
 //!
-//! Layout (XDG compliant, override with `SSHPF_CONFIG`):
+//! Layout (override with `SSHPF_CONFIG`). The directories come from `dirs`, which
+//! resolves them per platform — `state_dir()` is `None` on Windows, so the
+//! `or_else(dirs::data_local_dir)` in [`Paths::resolve`] is what gives Windows its
+//! state directory. Permissions are `0600`/`0700` on Unix only; Windows has no
+//! mode bits and relies on the per-user profile ACL (see [`crate::sys`]).
 //!
 //! ```text
-//! ~/.config/sshpf/config.toml   definitions, 0600
-//! ~/.local/state/sshpf/state.toml  last-run bookkeeping, 0600
+//! Linux                              Windows
+//! ~/.config/sshpf/config.toml        %APPDATA%\sshpf\config.toml
+//! ~/.local/state/sshpf/state.toml    %LOCALAPPDATA%\sshpf\state.toml
 //! ```
 
 use std::fs;
@@ -267,7 +272,11 @@ pub struct Paths {
 }
 
 impl Paths {
-    /// `$SSHPF_CONFIG` wins (used by tests); otherwise XDG dirs.
+    /// `$SSHPF_CONFIG` wins (used by tests); otherwise the platform's dirs.
+    ///
+    /// `dirs::state_dir()` is `None` on Windows, which is why the state base falls
+    /// back to `data_local_dir()` there; on Linux it is `$XDG_STATE_HOME` or
+    /// `~/.local/state`.
     pub fn resolve() -> Paths {
         if let Some(p) = std::env::var_os("SSHPF_CONFIG") {
             let config = PathBuf::from(p);

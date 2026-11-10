@@ -11,18 +11,21 @@ TUI 详情面板的日志（`model::LogRing`）活在内存里、进程一退就
 ## 位置与轮转
 
 ```text
-~/.local/state/sshpf/logs/sshpf.log        ← 当前文件
-~/.local/state/sshpf/logs/sshpf.log.1      ← 上一次轮转（.1 最新）
-…  .2  …  .3                               ← 保留 3 个归档
+Linux                              Windows
+~/.local/state/sshpf/logs/sshpf.log        %LOCALAPPDATA%\sshpf\logs\sshpf.log      ← 当前文件
+~/.local/state/sshpf/logs/sshpf.log.1      %LOCALAPPDATA%\sshpf\logs\sshpf.log.1    ← 上一次轮转（.1 最新）
+…  .2  …  .3                       …  .2  …  .3                                     ← 保留 3 个归档
 ```
+
+Windows 落在 `%LOCALAPPDATA%` 是因为 `dirs::state_dir()` 在 Windows 恒为 `None`，`default_dir()` 用 `.or_else(dirs::data_local_dir)` 兜底——与 `state.toml` 同一个目录，理由见 [security.md](security.md#权限--file-permissions)。
 
 | 属性 | 值 |
 |---|---|
-| 目录 / 文件权限 | `0700` / `0600`（日志里有主机名、端口、用户名） |
+| 目录 / 文件权限 | Linux `0700` / `0600`（日志里有主机名、端口、用户名）；**Windows 无 mode bit**，靠 profile ACL 继承，两个 restrict 函数是空实现 |
 | 轮转阈值 / 归档数 | 单文件 2 MiB（`DEFAULT_MAX_BYTES`）/ 3（`DEFAULT_KEEP`）⇒ 磁盘上限约 8 MiB |
 | 写入方式 | **追加**，不覆盖历史；想清空直接删文件，下次运行重建 |
 | 顺序 | **先轮转，再写**——所以一条记录**永远不会跨两个文件** |
-| 归档重命名失败 | 一律忽略（丢历史好过丢当下） |
+| 归档重命名失败 | 一律忽略（丢历史好过丢当下）。注意 Windows 上 `MoveFileEx` 要求目标未被占用：编辑器/杀软持有日志且不带 `FILE_SHARE_DELETE` 时重命名会失败，此时活动文件继续增长、轮转被跳过 |
 | `SSHPF_LOG_DIR` / `SSHPF_LOG_LEVEL` | 换目录 / `off\|error\|warn\|info\|debug`，默认 `info` |
 
 `off` 只关常规记录，**崩溃记录照写**——想把日志关掉的人，往往正是最需要那一行崩溃信息的人。
@@ -82,6 +85,7 @@ TUI 详情面板的日志（`model::LogRing`）活在内存里、进程一退就
 
 ```bash
 L=~/.local/state/sshpf/logs/sshpf.log
+# Windows: L="$LOCALAPPDATA/sshpf/logs/sshpf.log"
 
 grep 'tunnel=3 ' "$L"                          # 一条隧道的完整时间线
 grep -E ' ERROR | event=crash\.' "$L"          # 只看真正出事的地方
@@ -91,6 +95,10 @@ grep -n 'event=crash' "$L"                     # 定位崩溃
 sed -n '/event=crash.panic.trace/p' "$L" | sed 's/\\n/\n/g'      # 把栈拉出来
 tar czf sshpf-logs.tgz ~/.local/state/sshpf/logs/                # 报 bug 时附上
 ```
+
+> Windows 上这段改用 PowerShell：`Select-String -Path "$env:LOCALAPPDATA\sshpf\logs\sshpf.log" -Pattern 'event=tunnel.retry_scheduled'`。`grep -oP` / `sed` / `tar` 在默认 Windows shell 里没有等价物。
+>
+> 另外：**Windows 上没有 `crash.signal` 记录**（无 `sigaction`，见 [security.md](security.md#崩溃捕获--crash-capture)），硬故障只留 Windows 自己的 WER 事件日志。
 
 **提 issue 时请附上整个 `logs/` 目录**（含 `.1`~`.3`）。单独贴最后几行通常不够——重连风暴、配置被改、主机密钥被学到的证据都在更早的位置。
 

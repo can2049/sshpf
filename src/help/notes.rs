@@ -120,8 +120,8 @@ pub(super) const SAFETY: HelpSection = HelpSection {
             "NO_COLOR=1 disables all colour; glyphs and words still carry the status.",
         ),
         HelpItem::note(
-            "日志在 ~/.local/state/sshpf/logs/sshpf.log；SSHPF_LOG_DIR / SSHPF_LOG_LEVEL 可改目录与级别，详见 docs/logging.md。",
-            "Logs live in ~/.local/state/sshpf/logs/sshpf.log; SSHPF_LOG_DIR / SSHPF_LOG_LEVEL change the directory and level, see docs/logging.md.",
+            "日志在 Linux ~/.local/state/sshpf/logs/sshpf.log、Windows %LOCALAPPDATA%\\sshpf\\logs\\sshpf.log；SSHPF_LOG_DIR / SSHPF_LOG_LEVEL 可改目录与级别，详见 docs/logging.md。",
+            "Logs live at ~/.local/state/sshpf/logs/sshpf.log on Linux and %LOCALAPPDATA%\\sshpf\\logs\\sshpf.log on Windows; SSHPF_LOG_DIR / SSHPF_LOG_LEVEL change the directory and level, see docs/logging.md.",
         ),
     ],
 };

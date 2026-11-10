@@ -149,7 +149,19 @@ impl TunnelConfig {
         identity_of(self.kind, &self.ssh_host, &self.local_addr, self.local_port, &self.remote_host, self.remote_port)
     }
 
-    /// 0..=33 are privileged ports on Linux.
+    /// Whether the *listening* end of this forward needs `root` on Unix.
+    ///
+    /// Ports `0..=1023` are privileged on Unix — binding one needs root or
+    /// `CAP_NET_BIND_SERVICE`, which is why the form and the importer steer new
+    /// forwards to `>= 1024` (see [`crate::model::plan_local_port`]).
+    ///
+    /// **Windows has no such rule**: an ordinary user binds port 80 directly, so
+    /// this predicate is asking a Unix question on a platform where the answer
+    /// never applies. It is kept platform-neutral because the value it feeds —
+    /// "would this collide with something a normal user cannot take?" — is still
+    /// the right *heuristic* for choosing an alias, and because making it return
+    /// `false` on Windows would need a `cfg` in a leaf data type. Callers that
+    /// surface it to the user should not claim "needs root" on Windows.
     pub fn uses_privileged_port(&self) -> bool {
         let listen_port = match self.kind {
             ForwardKind::Local | ForwardKind::Dynamic => self.local_port,
