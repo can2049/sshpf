@@ -1,12 +1,12 @@
 # 给 AI agent 的改码约定 / Working in this repo
 
-> **这份文档回答**：我是 AI agent，接手这个仓库要遵守哪些约定；加按键/加面板/加事件/加文档分别要动哪几处；怎么自检。
-> **不负责**：项目是什么、怎么用（见 [../README.md](../README.md)）、架构细节（见 [architecture.md](architecture.md)）。
-> **相关代码路径**：全部。真正的"地图"是每篇文档的开头路标 + `src/*/mod.rs` 的文件头注释。
+> **这份文档回答**：加按键/加面板/加事件/加失败分类/改文案/加文档分别要动哪几处；怎么自检；汇报什么。
+> **不负责**：六条硬约定（**在根 [`AGENTS.md`](../AGENTS.md)**）、项目是什么怎么用（见 [../README.md](../README.md)）、架构细节（见 [architecture.md](architecture.md)）。
+> **相关代码路径**：全部。真正的"地图"是每篇文档的开头路标 + 每个源文件的 `//!` 头注释。
 
 ## 先做什么 / Start here
 
-1. **开 worktree**（见下节）——只要会产生提交，就不在共享 checkout 里改。
+1. **开 worktree**（只要会产生提交，就不在共享 checkout 里改）——生命周期见根 [`AGENTS.md`](../AGENTS.md#一特性一-worktree--one-worktree-per-change)。
 2. 读 [index.md](index.md) 找到你的任务对应的文档。
 3. 读目标文件的 `//!` 模块文档——**每个源文件都必须有**（`tests/safety_guards.rs` 强制）。
 4. `grep` 你要改的函数名，读上下文，再动手。
@@ -18,22 +18,43 @@
 
 开发新特性、修复问题，**一律在独立 worktree 的独立分支里做**，不在仓库根直接改；纯文档改动同理，没有例外。理由：共享 checkout 的未提交改动、git index、`target/` 都是共享的，任一方 `git checkout`/`git stash`/`cargo fmt --all` 就会打断另一方，且没有任何提示。
 
-完整生命周期（开 → 开发 → 自检 → PR → 合并 → 清理）与清理检查清单见根 [`AGENTS.md`](../AGENTS.md#一特性一-worktree--one-worktree-per-change)。agent 必须记住的三条：**目录 = 分支名**、放 `.agents/worktrees/`（已 gitignore）、**合并即清理**（worktree + 本地分支 + 远端分支都不留，残留会被当成"这条线还在进行中"）。
+```bash
+git fetch origin
+git worktree add .agents/worktrees/feat/my-feature -b feat/my-feature origin/main
+cd .agents/worktrees/feat/my-feature
+# 开发 → 自检（本文末）→ 提交 → push → PR
+git push -u origin feat/my-feature && gh pr create --fill
+# CI 全绿 + 评审通过 → 合并（merge commit，与既有 PR 一致）
+# 合并后清理：worktree、本地分支、远端分支都不留（见下）
+```
 
-## 六条改码约定 / Six rules
+| 项 | 约定 |
+|---|---|
+| 分支名 | 前缀与提交前缀一致：`feat/…`、`fix/…`、`docs/…`、`refactor/…`、`release/…` |
+| worktree 路径 | `.agents/worktrees/<分支名>`，与分支同名；`.agents/` 在 `.gitignore` 里 |
+| 基线 | 从刚 `fetch` 的 `origin/main` 开；落后就 `rebase`，不要把 main merge 进分支 |
+| git 写操作 | 只在自己 worktree 里 `add`/`commit`/`push`；不要在主 checkout 切换分支或 stash |
+| 合并方式 | PR（不直接 push `main`）；`main` 上 CI 必须绿 |
 
-| # | 规则 | 为什么 |
-|---|---|---|
-| 1 | **一个文件一个职责，文件名即内容** | agent 靠路径定位，不靠读全文 |
-| 2 | **依赖只许向下**（详见 [architecture.md](architecture.md#依赖规则--dependency-rules)） | 反向依赖是缺陷，不是风格问题 |
-| 3 | **同一实现只许有一处** | 副本会漂移；字符串操作一律 `src/text.rs`，事件名一律 `src/eventlog/` |
-| 4 | **不许新增 `.unwrap()`/`.expect()`/`panic!`**（生产代码） | 见 [security.md](security.md#政策--policy全员硬约束) |
-| 5 | **不许 `#[allow(...)]` 压警告** | 有警告就改代码 |
-| 6 | **不改变可观察行为**：日志 `event=`、帮助文案、键位、渲染文本逐字不变 | 这是重构，不是改需求 |
+### 合并后清理 / Clean up after merge
 
-另加两条：**不要新增依赖**；**不要写 unix-only 代码到跨平台路径上**（CI 有 Windows job）。
+**PR 合并即这条线结束。** 残留的分支和 worktree 会让后来者（尤其是 agent）以为任务还在进行——`git worktree list` 和 `git branch` 是它们判断「谁在做什么」的唯一线索。
 
-**体积预算只管生产代码**：单文件 ≤ 400 行、单函数 ≤ 60 行（`tests/safety_guards.rs` 断言）。**测试不占这份预算**——小模块的测试留在文件尾，大模块的测试搬到 `src/<module>/tests.rs`（开头 `#![cfg(test)]`）。别为了迁就预算去删测试或放宽断言。
+```bash
+# 回到主 checkout 执行（在将被删除的 worktree 里执行会失败）
+git worktree remove .agents/worktrees/<分支名>   # 有未提交改动会拒绝删除；别用 --force 掩盖
+git branch -d <分支名>                           # -d 校验已合并；报「未合并」说明合并没到位
+git push origin --delete <分支名>
+git fetch --prune
+```
+
+| 检查 | 期望 |
+|---|---|
+| `git worktree list` | 只剩主 checkout（和别的**进行中**的线） |
+| `git branch --merged origin/main` | 不含刚删的分支 |
+| `gh pr view --json state` | `MERGED`，且远端分支已消失 |
+
+例外只有一个：`release/vX.Y.Z` 由发版流程保留，不随合并删除；`main` 永不删除。
 
 ## 命名 / Naming
 
@@ -68,7 +89,7 @@ SectionId 与文案在 src/help.rs 汇总。
 | 方向键用符号 | `↓ ↑ ← →`（不是 `down`） |
 | "任意字符"不写 keys | 用 `HelpItem::note`（note 不参与覆盖检查） |
 
-加完跑 `cargo test --test help_coverage`。若新 handler 是新函数，还要登记到测试里的 `HANDLERS` 表（`src/keys/` 下的 handler → `SectionId`）。跨 section 的刻意例外写进 `DOC_ONLY` 常量并注明理由——**不是**注释掉断言。
+加完跑 `cargo test --test help_coverage`。若新 handler 是新函数，还要登记到测试里的 `HANDLERS` 表。跨 section 的刻意例外写进 `DOC_ONLY` 常量并注明理由——**不是**注释掉断言。
 
 ## 加界面面板 / Add an overlay
 
@@ -88,18 +109,16 @@ SectionId 与文案在 src/help.rs 汇总。
 ## 加日志事件 / Add a log event
 
 ```text
-① src/eventlog/<族>.rs   加一个函数（族：process / tunnel / ssh / server / user）
+① src/eventlog/<族>.rs   加一个函数（族：process / server / tunnel / ssh / user）
 ② docs/logging/events.md 加一行（事件名 | 级别 | 关键字段 | 含义）
 ③ 若有排查价值         docs/logging.md 的「排查配方」加一条
 ```
 
-**硬约束**：函数名、`event=` 字符串、级别、字段名与顺序**逐字不变**——`docs/logging/events.md` 与既有测试依赖它们。级别按"读的人要做什么"分而不是按"严重程度"，四档判据与分工见 [logging/events.md](logging/events.md#约定--conventions) 与 [logging.md](logging.md#级别策略)。
+**硬约束**：函数名、`event=` 字符串、级别、字段名与顺序**逐字不变**——`docs/logging/events.md` 与既有测试依赖它们。级别按"读的人要做什么"分而不是按"严重程度"；四档判据与族分工见 [logging/events.md](logging/events.md#约定--conventions) 与 [logging.md](logging.md#级别策略)。
 
 ## 加失败分类 / Add a failure kind
 
-`src/model/failure.rs` 里 `FailureKind` 有**四个**必须同步的地方：`kind()`（ASCII 稳定值，给 grep）、`short()`（中文短句，给表格）、`displays()` 的中英双语、以及 `retryable()` 归类（配置类 vs 网络类）。
-
-然后 `docs/logging/events.md` 的 `kind` 稳定值列表加一项。**`kind()` 值是日志契约，不许改。**
+`src/model/failure.rs` 里 `FailureKind` 有**四个**必须同步的地方：`kind()`（ASCII 稳定值，给 grep）、`short()`（中文短句，给表格）、`displays()` 的中英双语、以及 `retryable()` 归类（配置类 vs 网络类）。然后 `docs/logging/events.md` 的 `kind` 稳定值列表加一项。**`kind()` 值是日志契约，不许改。**
 
 ## 改文案 / Change user-facing text
 
@@ -120,7 +139,7 @@ SectionId 与文案在 src/help.rs 汇总。
 ```text
 ① docs/<name>.md        开头 3–8 行：回答什么问题 / 不负责什么 / 相关代码路径
 ② docs/index.md         两张表都要登记（任务查找表 + 文档清单）
-③ 相关文档的链接         从 architecture.md / testing.md 等加相对链接
+③ 相互链接              从 architecture.md / agents.md 等加相对链接
 ```
 
 | 硬要求 | 值 |
@@ -129,7 +148,7 @@ SectionId 与文案在 src/help.rs 汇总。
 | 结构 | 表格 + 短句；agent 靠标题和表格定位，**不写散文** |
 | 不重复 | 同一事实只详述一处，其余用相对链接 |
 | 不重复模块注释 | 文件的 `//!` 已经写了"什么属于这里"，文档不要逐文件转录 |
-| 路径真实 | 文档链接与代码路径引用必须存在（见下方自检脚本） |
+| 路径真实 | 文档链接、代码路径引用、**锚点**都必须存在 |
 | 文件名 | 被 `src/` 引用的不能改：`docs/design.md`、`docs/logging.md`、`docs/keymap.md`、`docs/architecture.md`、`docs/dedup.md` |
 
 ## 提交前自检 / Pre-flight checklist
@@ -151,14 +170,13 @@ cargo test --test safety_guards        # 动了 src 结构必跑
 cargo test --lib -- --list | wc -l
 ```
 
-文档改动额外跑：
+文档改动额外跑（每个 md ≤ 400 行 + 全仓路径校验）：
 
 ```bash
-# 每个 md ≤ 400 行
 wc -l README.md CHANGELOG.md docs/*.md docs/**/*.md
 
-# 全仓路径校验：src/tests/docs/README 里出现的 md/rs 路径引用必须存在。
-# docs/research/ 被排除：那是历史调研，引用的是 v1 源码与 russh 上游 crate 内部路径，
+# 全仓路径校验：src/tests/docs/README 里的 md/rs 路径引用必须存在。
+# docs/research/ 被排除：那是历史调研，引用的是 v1 源码与上游 crate 内部路径，
 # 这些目标本来就不该存在（见 docs/research/README.md）。排除是记录在案的决定，不是放宽。
 python3 - <<'EOF'
 import re, pathlib
@@ -178,9 +196,9 @@ print('checked; missing:', len(bad))
 EOF
 ```
 
-**唯一的已知良性命中**：`src/logging/panic.rs` 里有一个测试夹具故意写 `Some("src/x.rs:1:1")` 当作"panic 位置"的假字符串。它不是文档引用，不该为了自检去改（那是别人的 write scope）。出现且**只有**这一条时视为通过。
+**唯一的已知良性命中**：`src/logging/panic.rs` 里有个测试夹具故意写 `Some("src/x.rs:1:1")` 当作"panic 位置"的假字符串。它不是文档引用，不该为了自检去改。出现且**只有**这一条时视为通过。
 
-**锚点也要校验**：上面的脚本只查文件存在性，不查 `#anchor`。改了标题就得同步所有引用它的链接；检查方法见本仓库 `docs/` 下任一文档的 `##` 层级，`grep -rn '](.*\.md#' docs README.md` 列出全部锚点引用。
+**上面的脚本不查锚点**。改了标题就得同步所有 `](foo.md#anchor)` 引用：`grep -rn '](.*\.md#' docs README.md` 列出全部锚点引用，逐个核对目标文件里是否有对应 `##` 标题。
 
 ## 汇报格式 / Reporting back
 
