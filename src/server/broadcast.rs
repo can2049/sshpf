@@ -1,165 +1,208 @@
-//! Turning "the state changed" into frames for every attached client.
+//! Fan-out: sending one snapshot to every attached client.
 //!
-//! # Full snapshots, not deltas
+//! # Why a process-global registry
 //!
-//! A snapshot restates everything, so a lost, duplicated or reordered frame is
-//! harmless: the next one repairs it. That property is what lets this file stay
-//! simple — there is no acknowledgement, no per-client sequence bookkeeping, and
-//! no way for two clients to end up with different pictures because one missed an
-//! increment.
+//! The publisher is reached from two directions — a client's command and the
+//! headless event pump — and both hold only a [`Shared`](super::state::Shared)
+//! handle, which is a per-serving concern rather than a per-session one. Passing a
+//! registry through both call paths would thread a `Mutex<HashMap>` through the
+//! `App` seam. A module-level registry keeps the session list owned by exactly the
+//! code that adds and removes sessions.
 //!
-//! # Revision discipline
+//! It is a single server per process, so "global" here means "one server's
+//! sessions", not a cross-server table: [`reset`] empties it at start-up.
 //!
-//! `revision` strictly increases and a client ignores anything not newer than what
-//! it already applied. It is bumped only when something a client could *see*
-//! changed (`App::state_signature`) or when the client count did — otherwise every
-//! 50 ms tick would send a frame whose only difference was the clock.
+//! # Frames, not payloads
 //!
-//! # Nothing here may block
+//! The queue carries **complete frames** — the `u32` big-endian length prefix
+//! followed by the TOML body — not bare payloads. That is load-bearing: a client
+//! reads with `ipc::read_server_msg`, which insists on the prefix, so a queue of
+//! raw payloads would desynchronise every client's stream on the first broadcast
+//! (the client would read the first four bytes of `revision = …` as its length).
+//! Encoding here, once per snapshot, also means one serialisation serves every
+//! client.
 //!
-//! Every send is a `try_send` into a bounded queue. A client that stopped reading
-//! is reported back as "drop this id", never waited on: one wedged window must not
-//! freeze every other window's view.
+//! # Why a bounded queue per client
 //!
-//! Belongs here: revision bookkeeping and fan-out.
-//! Does not belong: who the clients are ([`super::session`]), what triggered the
-//! change ([`super::commands`]), or when the server stops ([`super::lifecycle`]).
+//! A client that stops reading must not be allowed to stall the server, and a
+//! snapshot is a full restatement of the state, so a backed-up client only needs
+//! the *newest* one. Each session therefore gets a small queue and a send that
+//! never blocks; when it is full the session is marked lagging and dropped by its
+//! own thread. That converts "one wedged client freezes everything" into "one
+//! wedged client is disconnected", which is the only acceptable failure here.
+//!
+//! Belongs here: the session registry and one publish/send.
+//! Does not belong: building the snapshot ([`super::state`]), or the handshake
+//! ([`super::session`]).
 
-use crate::app::App;
-use crate::ipc::{ServerMsg, Snapshot};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::SyncSender;
+use std::sync::{Mutex, MutexGuard};
 
-use super::session::{Session, now_ms};
+use crate::ipc::Snapshot;
 
-/// Assign the next revision, build the snapshot, and queue it everywhere.
+/// How many undelivered snapshots one client may have queued.
 ///
-/// Returns the ids that must be dropped. They are not removed here: the caller
-/// owns the session list, and mutating it while iterating is how a session ends up
-/// half-closed.
-pub fn publish(
-    app: &App,
-    sessions: &mut [Session],
-    revision: &mut u64,
-    client_count: u32,
-    keep_server: bool,
-) -> Vec<u64> {
-    *revision = revision.saturating_add(1);
-    let snapshot = Snapshot::from_views(*revision, now_ms(), client_count, keep_server, &app.tunnels);
-    fan_out(sessions, &ServerMsg::Snapshot(snapshot))
+/// Two: the one being written and one replacement. More would only queue stale
+/// states that the newer one supersedes.
+pub const CLIENT_QUEUE: usize = 2;
+
+/// One connected client, as the broadcaster sees it.
+pub(crate) struct Outbox {
+    /// One encoded frame (length prefix + body), waiting to be written.
+    /// `try_send` never blocks.
+    pub tx: SyncSender<Vec<u8>>,
+    /// Set when the client could not keep up, so its thread tears it down.
+    pub lagging: std::sync::Arc<AtomicBool>,
 }
 
-/// Queue one message to every session, returning the ids that could not take it.
-pub fn fan_out(sessions: &mut [Session], msg: &ServerMsg) -> Vec<u64> {
-    let mut doomed = Vec::new();
-    for session in sessions.iter_mut() {
-        // `ServerMsg` is `Clone`, and a snapshot is a few hundred bytes, so
-        // cloning per client is cheap at this rate (a few frames per second).
-        if !session.try_send(msg.clone()) {
-            doomed.push(session.id);
+/// Every connected client, keyed by an id that is never reused.
+static SESSIONS: Mutex<Option<HashMap<u64, Outbox>>> = Mutex::new(None);
+
+/// The next session id. Monotonic so a stale registry entry can never be matched
+/// to a new client after a removal and re-add.
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Lock the registry, recovering from poisoning (see `state`'s note on why).
+fn registry() -> MutexGuard<'static, Option<HashMap<u64, Outbox>>> {
+    match SESSIONS.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// Empty the registry. Called once at server start-up so a previous run's state in
+/// the same process (tests) cannot leak into this one.
+pub fn reset() {
+    let mut guard = registry();
+    *guard = Some(HashMap::new());
+}
+
+/// Register a client and return the id its thread uses to unregister later.
+pub(crate) fn register(tx: SyncSender<Vec<u8>>, lagging: std::sync::Arc<AtomicBool>) -> u64 {
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let mut guard = registry();
+    guard.get_or_insert_with(HashMap::new).insert(id, Outbox { tx, lagging });
+    id
+}
+
+/// Remove a client.
+pub(crate) fn unregister(id: u64) {
+    let mut guard = registry();
+    if let Some(map) = guard.as_mut() {
+        map.remove(&id);
+    }
+}
+
+/// How many clients are registered.
+pub fn session_count() -> usize {
+    registry().as_ref().map(|m| m.len()).unwrap_or(0)
+}
+
+/// Encode one snapshot as a complete frame.
+///
+/// Wrapped in [`ServerMsg::Snapshot`] rather than encoded bare: the client decodes
+/// every frame as a `ServerMsg`, and a bare snapshot has no `t` tag, so a client
+/// would reject it as `missing field t` and lose every update. The message envelope
+/// is part of the wire contract, not a wrapper this layer may skip.
+///
+/// `None` when it cannot be encoded, which is a bug in the snapshot rather than in
+/// a client: the caller logs it and drops the frame, because keeping the server
+/// alive matters more than one lost update (the next change restates everything).
+fn encode(snapshot: &Snapshot) -> Option<Vec<u8>> {
+    let mut buf = Vec::new();
+    let msg = crate::ipc::ServerMsg::Snapshot(snapshot.clone());
+    match crate::ipc::write_message(&mut buf, &msg) {
+        Ok(()) => Some(buf),
+        Err(e) => {
+            crate::logging::error(
+                "server.snapshot_encode_failed",
+                &[("revision", &snapshot.revision), ("msg", &e.to_string())],
+            );
+            None
         }
     }
-    doomed
 }
 
-/// Queue one message to exactly one client, by id.
-///
-/// A message for a session that already went away is not an error: the command
-/// arrived, the reply was built, and the requester left meanwhile.
-pub fn send_to(sessions: &mut [Session], id: u64, msg: ServerMsg) -> Vec<u64> {
-    match sessions.iter_mut().find(|s| s.id == id) {
-        Some(session) => {
-            if session.try_send(msg) {
-                Vec::new()
-            } else {
-                vec![id]
+/// Send one snapshot to every registered client.
+pub fn publish(snapshot: &Snapshot) {
+    let Some(frame) = encode(snapshot) else {
+        return;
+    };
+    let mut guard = registry();
+    let Some(map) = guard.as_mut() else {
+        return;
+    };
+    for outbox in map.values() {
+        // `try_send` on a full queue is the "slow consumer" signal: mark it so its
+        // own thread stops, rather than blocking the server or silently losing
+        // every future state change for that client.
+        match outbox.tx.try_send(frame.clone()) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                outbox.lagging.store(true, Ordering::Relaxed);
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                // Its thread is gone; the registry entry is cleaned up by
+                // `unregister` on that thread's way out.
             }
         }
-        None => Vec::new(),
+    }
+}
+
+/// Send one already-encoded frame to a single client.
+///
+/// Unused by the session loop today — a reply is written directly to the socket,
+/// because it must be ordered against the frames queued for that client and going
+/// through the queue would put the answer behind a stale snapshot. Kept because it
+/// is the correct primitive for any future per-client push and because the
+/// starvation policy belongs with the queue it applies to.
+#[allow(dead_code)]
+pub(crate) fn send_to(id: u64, frame: Vec<u8>) -> bool {
+    let guard = registry();
+    let Some(map) = guard.as_ref() else {
+        return false;
+    };
+    let Some(outbox) = map.get(&id) else {
+        return false;
+    };
+    match outbox.tx.try_send(frame) {
+        Ok(()) => true,
+        Err(std::sync::mpsc::TrySendError::Full(_)) => {
+            outbox.lagging.store(true, Ordering::Relaxed);
+            false
+        }
+        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::mpsc::{Receiver, sync_channel};
+    use crate::ipc::{ServerMsg, read_server_msg};
 
-    fn session_with_queue(id: u64, cap: usize) -> (Session, Receiver<ServerMsg>) {
-        let (tx, rx) = sync_channel(cap);
-        (Session::with_queue(id, tx), rx)
+    /// Serialise these tests: the registry is process-global, so two tests running
+    /// concurrently would see each other's clients (and `reset` would erase them
+    /// mid-test). The lock is the honest fix — it matches production, where there
+    /// is exactly one server per process.
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Hold the serialisation lock for one test. Poisoning is irrelevant here: each
+    /// test starts by emptying the registry anyway.
+    fn exclusive() -> MutexGuard<'static, ()> {
+        match TEST_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
     }
 
-    fn snapshot(rev: u64) -> ServerMsg {
-        ServerMsg::Snapshot(Snapshot::from_views(rev, 0, 1, false, &[]))
-    }
-
-    fn an_app() -> App {
-        let dir = tempfile::tempdir().unwrap();
-        let paths =
-            crate::config::Paths { config: dir.path().join("config.toml"), state: dir.path().join("state.toml") };
-        App::new(paths)
-    }
-
-    #[test]
-    fn a_publish_bumps_the_revision_once_for_everyone() {
-        // Keep the receivers alive: dropping one disconnects the channel, which
-        // would make every send fail for a reason unrelated to the revision.
-        let (a, _a_rx) = session_with_queue(1, 2);
-        let (b, _b_rx) = session_with_queue(2, 2);
-        let mut sessions = vec![a, b];
-        let mut rev = 7;
-        let doomed = publish(&an_app(), &mut sessions, &mut rev, 2, false);
-        assert!(doomed.is_empty(), "both clients had room");
-        assert_eq!(rev, 8, "one publish is one revision, shared by every client");
-    }
-
-    #[test]
-    fn a_full_queue_marks_that_client_for_removal_and_no_other() {
-        let (slow, _slow_rx) = session_with_queue(1, 1);
-        let (fast, fast_rx) = session_with_queue(2, 4);
-        let mut sessions = vec![slow, fast];
-        // The slow client's single slot is taken by this first frame…
-        assert!(fan_out(&mut sessions, &snapshot(1)).is_empty());
-        // …so the next one finds it full, and only it is dropped.
-        let doomed = fan_out(&mut sessions, &snapshot(2));
-        assert_eq!(doomed, vec![1], "only the client that cannot keep up is dropped");
-        assert!(fast_rx.try_recv().is_ok(), "the healthy client still received a frame");
-    }
-
-    #[test]
-    fn a_closed_writer_also_marks_the_client_for_removal() {
-        let (session, rx) = session_with_queue(9, 2);
-        drop(rx);
-        let mut sessions = vec![session];
-        assert_eq!(fan_out(&mut sessions, &snapshot(1)), vec![9], "a client whose writer is gone must be removed");
-    }
-
-    #[test]
-    fn a_reply_goes_only_to_its_own_client() {
-        let (a, a_rx) = session_with_queue(1, 2);
-        let (b, b_rx) = session_with_queue(2, 2);
-        let mut sessions = vec![a, b];
-        let reply = ServerMsg::Reply { req_id: 1, ok: true, rev: 3, error: None, remaining: None, ports: vec![] };
-        assert!(send_to(&mut sessions, 1, reply).is_empty());
-        assert!(a_rx.try_recv().is_ok(), "the requester must get its reply");
-        assert!(b_rx.try_recv().is_err(), "another client must not see it");
-    }
-
-    #[test]
-    fn a_message_for_a_vanished_session_is_not_an_error() {
-        let mut sessions: Vec<Session> = Vec::new();
-        let reply = ServerMsg::Reply { req_id: 1, ok: true, rev: 1, error: None, remaining: None, ports: vec![] };
-        assert!(send_to(&mut sessions, 42, reply).is_empty());
-    }
-
-    #[test]
-    fn a_published_snapshot_carries_the_live_table() {
-        let mut app = an_app();
-        let paths = app.paths.clone();
-        let mut cfg = crate::config::ConfigFile::default();
-        cfg.tunnels.push(crate::model::TunnelConfig {
-            id: 1,
-            name: "web".into(),
+    fn view(id: u64) -> crate::model::TunnelView {
+        let cfg = crate::model::TunnelConfig {
+            id,
+            name: format!("t{id}"),
             kind: crate::model::ForwardKind::Local,
-            ssh_host: "host".into(),
+            ssh_host: "h".into(),
             local_addr: "127.0.0.1".into(),
             local_port: 8080,
             remote_host: "127.0.0.1".into(),
@@ -169,21 +212,86 @@ mod tests {
             ssh_options: vec![],
             note: String::new(),
             created_at: 0,
-        });
-        crate::config::save(&paths.config, &cfg).unwrap();
-        app = App::new(paths);
+        };
+        crate::model::TunnelView::new(cfg)
+    }
 
-        let (session, rx) = session_with_queue(1, 2);
-        let mut sessions = vec![session];
-        let mut rev = 0;
-        let _ = publish(&app, &mut sessions, &mut rev, 1, false);
-        match rx.try_recv() {
-            Ok(ServerMsg::Snapshot(s)) => {
-                assert_eq!(s.tunnels.len(), 1, "the snapshot must carry the server's table");
-                assert_eq!(s.client_count, 1);
-                assert_eq!(s.revision, 1);
+    #[test]
+    fn a_published_snapshot_is_readable_as_one_frame() {
+        // The regression this pins: the queue used to carry a bare TOML payload, so
+        // a client read `revi` (from `revision = …`) as a 1.9 GB frame length and
+        // lost every update after its Welcome.
+        let _guard = exclusive();
+        reset();
+        let (tx, rx) = std::sync::mpsc::sync_channel(CLIENT_QUEUE);
+        let lagging = std::sync::Arc::new(AtomicBool::new(false));
+        let id = register(tx, lagging);
+        let snapshot = Snapshot::from_views(7, 0, 1, false, &[view(1)]);
+        publish(&snapshot);
+
+        let frame = rx.try_recv().expect("a client must receive the broadcast");
+        let mut cursor = frame.as_slice();
+        let decoded = read_server_msg(&mut cursor).expect("the frame must decode");
+        match decoded {
+            Some(ServerMsg::Snapshot(got)) => {
+                assert_eq!(got.revision, 7);
+                assert_eq!(got.tunnels.len(), 1);
             }
             other => panic!("expected a snapshot, got {other:?}"),
         }
+        unregister(id);
+    }
+
+    #[test]
+    fn two_clients_both_receive_the_same_frame() {
+        let _guard = exclusive();
+        reset();
+        let (tx_a, rx_a) = std::sync::mpsc::sync_channel(CLIENT_QUEUE);
+        let (tx_b, rx_b) = std::sync::mpsc::sync_channel(CLIENT_QUEUE);
+        let flag = || std::sync::Arc::new(AtomicBool::new(false));
+        let a = register(tx_a, flag());
+        let b = register(tx_b, flag());
+        assert_eq!(session_count(), 2);
+
+        publish(&Snapshot::from_views(3, 0, 2, false, &[view(1), view(2)]));
+        let fa = rx_a.try_recv().expect("client A");
+        let fb = rx_b.try_recv().expect("client B");
+        assert_eq!(fa, fb, "one snapshot, one encoding, identical bytes");
+        unregister(a);
+        unregister(b);
+    }
+
+    #[test]
+    fn a_full_queue_marks_the_client_lagging_instead_of_blocking() {
+        let _guard = exclusive();
+        reset();
+        let (tx, _rx) = std::sync::mpsc::sync_channel(1);
+        let lagging = std::sync::Arc::new(AtomicBool::new(false));
+        let id = register(tx, lagging.clone());
+        let snapshot = Snapshot::from_views(1, 0, 1, false, &[view(1)]);
+        // The first fills the single slot; the second must not block.
+        publish(&snapshot);
+        publish(&snapshot);
+        assert!(lagging.load(Ordering::Relaxed), "a slow client must be flagged, not block the server");
+        unregister(id);
+    }
+
+    #[test]
+    fn a_publish_with_no_clients_is_harmless() {
+        let _guard = exclusive();
+        reset();
+        publish(&Snapshot::from_views(1, 0, 0, false, &[]));
+        assert_eq!(session_count(), 0);
+    }
+
+    #[test]
+    fn an_unregistered_client_stops_receiving() {
+        let _guard = exclusive();
+        reset();
+        let (tx, rx) = std::sync::mpsc::sync_channel(CLIENT_QUEUE);
+        let id = register(tx, std::sync::Arc::new(AtomicBool::new(false)));
+        unregister(id);
+        publish(&Snapshot::from_views(1, 0, 1, false, &[]));
+        assert!(rx.try_recv().is_err(), "a removed session must not be written to");
     }
 }

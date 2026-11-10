@@ -49,7 +49,7 @@ impl App {
     /// `cfg.id` itself is skipped, so editing a tunnel and re-submitting it does
     /// not collide with its own stored definition. Returns the *existing* name so
     /// the caller can tell the user which row was already there.
-    pub(crate) fn duplicate_of(&self, cfg: &TunnelConfig) -> Option<String> {
+    pub fn duplicate_of(&self, cfg: &TunnelConfig) -> Option<String> {
         let identity = cfg.forward_identity();
         self.cfg
             .tunnels

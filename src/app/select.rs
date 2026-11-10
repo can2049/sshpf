@@ -140,46 +140,6 @@ impl App {
         }
     }
 
-    /// A batch that covers every row is one command on a mirror (the server
-    /// applies the same "all" rule to its own list). Returns whether it was sent.
-    fn send_whole_set_batch(&mut self, ids: &[crate::model::TunnelId], action: BatchAction) -> bool {
-        if ids.len() != self.tunnels.len() {
-            return false;
-        }
-        let op = match action {
-            BatchAction::Start => crate::ipc::Op::StartAll,
-            BatchAction::Stop => crate::ipc::Op::StopAll,
-            _ => return false,
-        };
-        if !self.send_op(op) {
-            return false;
-        }
-        let n = ids.len();
-        self.set_status(StatusMsg::ok(help::bi(
-            &format!("已{} {n} 条", action.label()),
-            &format!("{} done for {n} forwards", action.label_en()),
-        )));
-        true
-    }
-
-    /// Apply one action to one marked tunnel. Returns whether it changed anything.
-    ///
-    /// Split out of [`Self::apply_batch`] so the loop below reads as a loop: the
-    /// interesting decision (`would_change`) is already made here, and each arm
-    /// is one routed primitive.
-    fn apply_batch_one(&mut self, action: BatchAction, id: crate::model::TunnelId) -> bool {
-        if !self.batch_would_change(action, id) {
-            return false;
-        }
-        match action {
-            BatchAction::Start => self.start_tunnel_with(id, "batch"),
-            BatchAction::Stop => self.stop_tunnel_with(id, "batch"),
-            BatchAction::Restart => self.restart_tunnel(id, "batch"),
-            BatchAction::Delete => self.delete_tunnel(id),
-        }
-        true
-    }
-
     /// Apply a confirmed batch action to every marked tunnel.
     pub fn apply_batch(&mut self, action: BatchAction) {
         let ids = self.marked_ids_in_view_order();
@@ -187,16 +147,40 @@ impl App {
             return;
         }
         let n = ids.len();
-        if self.send_whole_set_batch(&ids, action) {
-            return;
-        }
         // "marked" and "changed" differ (a batch stop over already-stopped rows),
         // and the discarded difference is exactly what makes a batch drain fast
         // with no visible effect — worth recording.
         let mut changed = 0usize;
         for id in &ids {
-            if self.apply_batch_one(action, *id) {
-                changed += 1;
+            match action {
+                BatchAction::Start => {
+                    if self.tunnel(*id).is_some_and(|t| !t.status.is_running_or_pending()) {
+                        self.start_tunnel_with(*id, "batch");
+                        changed += 1;
+                    }
+                }
+                BatchAction::Stop => {
+                    if self.tunnel(*id).is_some_and(|t| t.status.is_running_or_pending()) {
+                        self.stop_tunnel_with(*id, "batch");
+                        changed += 1;
+                    }
+                }
+                BatchAction::Restart => {
+                    // One command to the owner (see `ConfirmAction::Restart`): a
+                    // mirror has no supervisor to stop first.
+                    if self.forward(crate::ipc::Op::Restart { tunnel_id: *id }) {
+                        changed += 1;
+                        continue;
+                    }
+                    self.supervisor.stop(*id);
+                    self.forget_runtime_state(*id);
+                    self.start_tunnel_with(*id, "batch");
+                    changed += 1;
+                }
+                BatchAction::Delete => {
+                    self.delete_tunnel(*id);
+                    changed += 1;
+                }
             }
         }
         eventlog::action_batch(action.name(), n, changed);

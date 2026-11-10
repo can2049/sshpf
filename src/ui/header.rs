@@ -78,23 +78,18 @@ pub(crate) fn draw_title(frame: &mut Frame, app: &App, area: Rect) {
 /// `server` when this process owns the tunnels, `client 2/3` when it is one of
 /// several windows on a shared server.
 ///
-/// The count is the server's, not a local guess, so two windows always agree
-/// about how many are open. A client whose link has dropped says so here too:
-/// a table that quietly stops updating is worse than one that admits it is stale.
+/// The count is the server's, not a local guess, so two windows always agree about
+/// how many are open. It comes from the latest snapshot ([`App::client_count`]) and
+/// is therefore never a number this client invented.
 fn session_label(app: &App) -> String {
     if !app.is_mirror() {
         return help::bi("服务端/server", "server");
     }
-    match app.conn_state() {
-        Some(crate::app::remote::ConnState::Lost(_)) => help::bi("已断开/detached", "detached"),
-        _ => {
-            // `help::bi` joins the two halves itself, so each argument carries
-            // only its own language: the Chinese half must not repeat the English
-            // one or the title bar reads "客户端 2/client 2 client 2".
-            let n = app.remote_client_count().unwrap_or(1);
-            help::bi(&format!("客户端 {n}"), &format!("client {n}"))
-        }
-    }
+    // `help::bi` joins the two halves itself, so each argument carries only its own
+    // language: the Chinese half must not repeat the English one or the title bar
+    // reads "客户端 2/client 2 client 2".
+    let n = app.client_count.max(1);
+    help::bi(&format!("客户端 {n}"), &format!("client {n}"))
 }
 
 pub(crate) fn draw_counters(frame: &mut Frame, app: &App, area: Rect) {

@@ -1,186 +1,145 @@
-//! When the server stops: counting clients, the grace window, and the order of
-//! shutdown.
+//! When the server stops: the client count, the grace window, and the shutdown
+//! sequence.
 //!
-//! # The requirement this encodes
+//! # The requirement, stated as a rule
 //!
-//! "Every forward must stop when the last client closes" — because the server is
-//! the only thing holding the tunnels, and leaving them running after the user's
-//! last window is gone is a resource leak the user cannot see or stop.
+//! **The server lives exactly as long as its clients, unless `--keep-server`.**
+//! Closing the last window therefore stops every forward, including ones another
+//! (now closed) window started. That is the intended meaning, and it is also the
+//! most surprising thing this feature does — which is why the client warns about it
+//! before sending `Bye` and why the window below exists.
 //!
-//! But closing a window is also the most common accident there is (wrong window,
-//! Ctrl-W, a shell that exits). So the count reaching zero does not stop anything
-//! immediately: it starts a **grace window**, and any new client inside it cancels
-//! the shutdown. That is the whole mechanism, and it is why a user can close the
-//! last window and reopen it without dropping every connection.
+//! # Why a grace window instead of an immediate exit
 //!
-//! # Two different grace windows, deliberately
+//! A disconnect is not always a decision. A terminal can be killed, a window
+//! closed by accident, a client can crash. Exiting the instant the count hits zero
+//! would turn every accident into "all my forwards silently stopped". So the count
+//! reaching zero *arms* a timer instead of exiting; anything that reconnects during
+//! it calls the shutdown off.
 //!
-//! | trigger | window | why |
+//! # Two windows, because two causes need different patience
+//!
+//! | cause | window | why |
 //! |---|---|---|
-//! | the last client said `Bye` | short (500 ms) | the user confirmed; only a slip needs covering |
-//! | a client's socket just ended | long (5 s) | a crash or `SIGKILL` gave nobody a chance to object |
+//! | polite `Bye{last_exit:true}` | [`BYE_GRACE`] (~0.5 s) | the user said yes to a prompt that already explained it; just long enough to cover a `Bye` that crossed a simultaneous connect |
+//! | socket EOF with no `Bye` | [`ABRUPT_GRACE`] (~5 s) | an accident; long enough to reopen a terminal and attach again |
 //!
-//! Sharing one constant would either make deliberate exits feel sluggish or make
-//! a crashed terminal kill every tunnel before it can be reopened.
+//! Both are cancelled by the count becoming non-zero, and neither applies under
+//! `--keep-server`.
 //!
-//! # What `Bye` is, and is not
-//!
-//! `Bye { last_exit: true }` means *"the user was told the consequence and agreed"*.
-//! It is a **proposal**: the server recounts and decides. A client's snapshot can
-//! be seconds old, and letting a stale view stop someone else's forwards would be
-//! the worst failure this whole design exists to prevent. `last_exit` therefore
-//! only selects the **short** window; it never forces a shutdown.
-//!
-//! Belongs here: the client count, the grace state machine, and the shutdown order.
-//! Does not belong: the socket ([`super::election`]), the frames
-//! ([`super::broadcast`]), or what a command did ([`super::commands`]).
+//! Belongs here: the count-down decision, arming and cancelling the window, and
+//! the ordered teardown.
+//! Does not belong: counting clients itself ([`super::state`]) or writing frames
+//! ([`super::session`]).
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-/// How long to wait after the last client left on purpose.
-pub const GRACE_CONFIRMED: Duration = Duration::from_millis(500);
+use crate::eventlog;
 
-/// How long to wait after the last client vanished without saying goodbye.
-pub const GRACE_UNEXPECTED: Duration = Duration::from_secs(5);
+use super::state::Shared;
 
-/// Why the count reached zero, which selects the grace window.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Trigger {
-    /// The departing client had sent `Bye`.
-    Confirmed,
-    /// The socket ended with no `Bye` (crash, `SIGKILL`, closed terminal).
-    Unexpected,
+/// How long the server waits after a client's deliberate goodbye.
+pub const BYE_GRACE: Duration = Duration::from_millis(500);
+
+/// How long the server waits after a socket died without a goodbye.
+pub const ABRUPT_GRACE: Duration = Duration::from_secs(5);
+
+/// Called whenever a client's count dropped, with the count that remains.
+///
+/// `last_exit` is the departed client's *proposal* that it was the last. It is
+/// never trusted on its own — the count decides — but it does choose the shorter
+/// window, because a user who confirmed a prompt deserves a prompt answer.
+pub fn on_client_left(shared: &Shared, remaining: u32, last_exit: bool) {
+    if remaining > 0 {
+        // Someone is still here. If a shutdown had been armed, it has just been
+        // cancelled by definition (the count left zero), so say so once.
+        return;
+    }
+    if shared.keep_server() {
+        // `--keep-server`: the whole point is to outlive the clients.
+        return;
+    }
+    let grace = if last_exit { BYE_GRACE } else { ABRUPT_GRACE };
+    let trigger = if last_exit { "last_exit" } else { "eof" };
+    arm_shutdown(shared.clone(), grace, trigger);
 }
 
-impl Trigger {
-    /// The window for this trigger.
-    pub fn grace(self) -> Duration {
-        match self {
-            Trigger::Confirmed => GRACE_CONFIRMED,
-            Trigger::Unexpected => GRACE_UNEXPECTED,
+/// Wait out the grace window, then stop the server unless someone came back.
+///
+/// Runs on its own thread so the session that reported the departure can finish
+/// closing its socket.
+fn arm_shutdown(shared: Shared, grace: Duration, trigger: &'static str) {
+    // Serialise the arm: two clients leaving at once must not start two timers, and
+    // a timer started for a count that is no longer zero would stop a server that
+    // has just gained a client again.
+    if shared.grace_armed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    eventlog::server_grace_started(grace.as_millis(), trigger);
+    let timer = shared.clone();
+    let spawned = std::thread::Builder::new()
+        .name("sshpf-server-grace".to_string())
+        .spawn(move || wait_out_grace(&timer, grace, trigger));
+    if let Err(e) = spawned {
+        // Without the timer the server would live forever, which is the opposite of
+        // the requirement; the honest response is to stop now.
+        crate::logging::error("server.grace_thread_failed", &[("msg", &e.to_string())]);
+        shared.begin_stopping();
+    }
+}
+
+/// Poll until the grace window elapses, calling off the shutdown if a client
+/// returns.
+fn wait_out_grace(shared: &Shared, grace: Duration, trigger: &'static str) {
+    let deadline = std::time::Instant::now() + grace;
+    while std::time::Instant::now() < deadline {
+        if shared.client_count() > 0 {
+            cancel(shared);
+            return;
         }
-    }
-
-    /// Stable token for the log.
-    pub fn name(self) -> &'static str {
-        match self {
-            Trigger::Confirmed => "last_exit",
-            Trigger::Unexpected => "eof",
+        if shared.is_stopping() {
+            return;
         }
+        std::thread::sleep(Duration::from_millis(50));
     }
+    // Re-check after the last poll: a client may have attached between it and the
+    // deadline, and stopping with a client connected is the one outcome that must
+    // never happen.
+    if shared.client_count() > 0 {
+        cancel(shared);
+        return;
+    }
+    eventlog::server_shutdown_begin(shared.client_count(), shared.active_count(), trigger);
+    shared.begin_stopping();
 }
 
-/// The countdown that decides whether the server is allowed to exit.
-#[derive(Debug, Default)]
-pub struct Grace {
-    /// When the count hit zero, if it currently is zero.
-    deadline: Option<Instant>,
-    /// Which window is running, for the log and for tests.
-    trigger: Option<Trigger>,
+/// Call the armed shutdown off because a client came back.
+fn cancel(shared: &Shared) {
+    shared.grace_armed.store(false, std::sync::atomic::Ordering::SeqCst);
+    eventlog::server_grace_cancelled(shared.client_count());
 }
 
-impl Grace {
-    /// A client departed, leaving `remaining` attached.
-    ///
-    /// Returns `true` when this departure started a countdown (i.e. it was the
-    /// last one), so the caller can log it exactly once instead of every tick.
-    pub fn departed(&mut self, remaining: usize, trigger: Trigger) -> bool {
-        if remaining > 0 {
-            // Others are still attached: whatever countdown existed is irrelevant.
-            self.deadline = None;
-            self.trigger = None;
-            return false;
-        }
-        self.deadline = Some(Instant::now() + trigger.grace());
-        self.trigger = Some(trigger);
-        true
+/// The ordered teardown, run once the accept loop has exited.
+///
+/// Order matters and is the same one `main` uses for the single-process build:
+/// tunnels first, then the discovery files, then the persisted state — so a crash
+/// during shutdown cannot leave a client dialling a port that no longer answers
+/// while the tunnels are still up.
+///
+/// **Does not record `server.shutdown_begin`.** Whoever decided to stop already
+/// did: the grace timer names its `trigger` (`last_exit` / `eof`), and a signal or a
+/// natural end records `trigger=signal` / `trigger=process` on the way here. Two
+/// identical lines for one shutdown would make the log look like two events.
+pub fn shutdown(shared: Shared, trigger: super::ShutdownTrigger) {
+    // A signal or a natural exit has not yet said why; the grace timer has.
+    if !shared.is_stopping() {
+        eventlog::server_shutdown_begin(shared.client_count(), shared.active_count(), trigger.name());
     }
-
-    /// A client arrived. Returns `true` when this cancelled a running countdown.
-    pub fn arrived(&mut self) -> bool {
-        let was_waiting = self.deadline.take().is_some();
-        self.trigger = None;
-        was_waiting
-    }
-
-    /// Whether the countdown has expired.
-    pub fn expired(&self) -> bool {
-        self.deadline.is_some_and(|at| Instant::now() >= at)
-    }
-
-    /// Whether a countdown is running.
-    pub fn waiting(&self) -> bool {
-        self.deadline.is_some()
-    }
-
-    /// The window that is running, for the log and for tests.
-    pub fn trigger(&self) -> Option<Trigger> {
-        self.trigger
-    }
-
-    /// The remaining time, for diagnostics; zero when nothing is running.
-    pub fn remaining(&self) -> Duration {
-        self.deadline.map(|at| at.saturating_duration_since(Instant::now())).unwrap_or_default()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_departure_with_others_attached_starts_nothing() {
-        let mut grace = Grace::default();
-        assert!(!grace.departed(2, Trigger::Unexpected), "two clients still attached is not the last one");
-        assert!(!grace.waiting(), "no countdown may run while clients remain");
-    }
-
-    #[test]
-    fn the_last_departure_starts_a_countdown() {
-        let mut grace = Grace::default();
-        assert!(grace.departed(0, Trigger::Confirmed));
-        assert!(grace.waiting());
-        assert!(!grace.expired(), "the window must not be already over");
-        assert_eq!(grace.trigger(), Some(Trigger::Confirmed));
-    }
-
-    #[test]
-    fn a_confirmed_exit_waits_less_than_a_crash() {
-        // The two windows encode different knowledge: "the user said go" versus
-        // "nobody knows what happened". Sharing one value would break one of them.
-        assert!(GRACE_CONFIRMED < GRACE_UNEXPECTED, "a confirmed exit must not wait as long as a crash");
-    }
-
-    #[test]
-    fn a_new_client_cancels_a_running_countdown() {
-        let mut grace = Grace::default();
-        assert!(grace.departed(0, Trigger::Unexpected));
-        assert!(grace.arrived(), "a client inside the window must cancel the shutdown");
-        assert!(!grace.waiting(), "and no countdown may survive it");
-        assert!(!grace.expired(), "an expired countdown would have shut the server down");
-    }
-
-    #[test]
-    fn a_cancelled_countdown_does_not_report_as_having_been_waiting() {
-        let mut grace = Grace::default();
-        assert!(!grace.arrived(), "nothing was running, so nothing was cancelled");
-    }
-
-    #[test]
-    fn a_later_departure_with_others_clears_an_older_countdown() {
-        // Sequence: last client leaves (countdown), someone reconnects, then that
-        // someone leaves while a third is attached. The old countdown must not
-        // still be ticking: it belonged to a different configuration of clients.
-        let mut grace = Grace::default();
-        assert!(grace.departed(0, Trigger::Confirmed));
-        assert!(grace.arrived());
-        assert!(!grace.departed(2, Trigger::Confirmed), "two attached is still not the last one");
-        assert!(!grace.waiting());
-    }
-
-    #[test]
-    fn the_trigger_names_are_the_documented_tokens() {
-        assert_eq!(Trigger::Confirmed.name(), "last_exit");
-        assert_eq!(Trigger::Unexpected.name(), "eof");
-    }
+    // A `let _ =` because the app's own shutdown must run even if the lock is
+    // poisoned; `with_app` recovers from that.
+    shared.with_app(|app| app.shutdown());
+    // Publishing the final state is what lets a client that is still watching see
+    // "everything stopped" rather than a frozen table.
+    let _ = shared.publish_if_changed();
+    shared.begin_stopping();
 }

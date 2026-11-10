@@ -270,7 +270,7 @@ note = ""
 | `SSHPF_CONFIG` | 配置文件路径（`state.toml` 与它同目录） |
 | `SSHPF_LOG_DIR` | 日志目录（默认 `~/.local/state/sshpf/logs`） |
 | `SSHPF_LOG_LEVEL` | `off\|error\|warn\|info\|debug`，默认 `info`；`off` 仍写崩溃记录 |
-| `SSHPF_SOCKET_DIR` | client-server 的 socket/lock 目录（默认 `$XDG_RUNTIME_DIR/sshpf`）；测试用它隔离 |
+| `SSHPF_IPC_DIR` | client-server 的端点目录（端口/令牌/锁，默认 `$XDG_RUNTIME_DIR/sshpf`）；测试用它隔离 |
 | `SSHPF_SSH_CONFIG` | 只解析这个文件代替 `~/.ssh/config` |
 | `SSHPF_KNOWN_HOSTS` | 使用这个 known_hosts 文件 |
 | `NO_COLOR` | 关闭全部颜色（状态仍由符号和文字表达） |
@@ -288,7 +288,7 @@ tail -f ~/.local/state/sshpf/logs/sshpf.log   # 实时看结构化日志
 | 主机密钥校验失败 | 见下方[「ssh 能连但 sshpf 报 host key verification failed」](#ssh-能连但-sshpf-报-host-key-verification-failed) |
 | 认证失败 | 先手动 `ssh <主机>` 确认能免密登录，或 `ssh-add` 加载密钥 |
 | 端口被占用 | 详情页会显示占用进程的 `pid/进程名`。**如果占用者是 `sshpf` 自己**，说明有旧版本的单进程实例还在跑：退出它即可（新版本一份配置只有一个服务进程） |
-| 第二个窗口连不上 / 状态不一致 | 看日志里的 `client.attach_failed`、`server.election_lost`、`client.disconnected`；`SSHPF_SOCKET_DIR` 不同会让两个窗口连到不同的服务进程 |
+| 第二个窗口连不上 / 状态不一致 | 看日志里的 `client.attach_failed`、`server.election_lost`、`client.disconnected`；`SSHPF_IPC_DIR` 不同会让两个窗口连到不同的服务进程 |
 | 某条一直 `◌ 重试` | 网络类失败在退避；`grep 'event=tunnel.retry_scheduled'` 看排了几次，`tunnel.retry_abandoned` 表示已放弃 |
 | 显示 `● 已连通` 但端口不通 / 电脑休眠唤醒后不工作 | SSH 半开连接：先 `grep 'event=tunnel.health_failed'` 看 `cause`（`ping_timeout`/`ping_error`/`session_closed`），确认探活是否开着（`health_check_secs=0` 即人为关闭）；探活成功不写日志，所以**没有这条事件不等于探活没跑** |
 | 界面某块不见了 | `grep 'event=ui.render_degraded'`——渲染层主动跳过的块会留一条记录 |

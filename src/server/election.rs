@@ -1,210 +1,126 @@
-//! Becoming *the* server for a config: take the lock, clear a stale socket, bind.
+//! Becoming the server: the singleton lock, the discovery files, and the stale
+//! endpoint a killed server leaves behind.
 //!
-//! # The one invariant this file exists to keep
+//! # The election in one paragraph
 //!
-//! One config has exactly one live server. Two servers would each bind the same
-//! local ports, so the second one's `bind` fails and the user sees a random
-//! half of their forwards work — the worst kind of failure, because it looks like
-//! a network problem.
+//! A process that wants to serve takes an exclusive lock on the config's lock
+//! file. Exactly one succeeds. The winner publishes the port and the token and
+//! starts accepting; every loser becomes a client instead. No coordination
+//! protocol is needed, because the lock *is* the coordination: it is a kernel
+//! object that is released when the holder dies, including on `SIGKILL` and on
+//! `TerminateProcess`.
 //!
-//! The design carries this with no pid file, no heartbeat and no timeout probing:
+//! # Why "the lock is free" does not mean "the files are clean"
 //!
-//! * a live server **holds the election lock for its whole lifetime**;
-//! * the kernel releases that lock when the process dies, `SIGKILL` included.
+//! A killed server leaves its port and token files behind; they name a port
+//! nothing is listening on. The next winner therefore removes them before
+//! publishing its own, and a client that cannot connect treats an existing port
+//! file as *evidence to verify*, not as truth (it just fails to connect and a
+//! server gets spawned).
 //!
-//! So "can I take the lock?" is exactly "is there a server for this config?".
+//! Order matters: **lock first, files second**. Cleaning up before taking the lock
+//! would let two racing processes delete each other's freshly published port.
 //!
-//! # Why the lock comes before the unlink
-//!
-//! A leftover socket file is only *provably* stale if no server owns the config,
-//! and the lock is that proof. Unlinking first would let a loser delete the socket
-//! of a server that was mid-startup — turning a harmless race into a broken
-//! endpoint. The order (lock → unlink → bind) is therefore a safety property, not
-//! a style choice.
-//!
-//! Belongs here: the lock, stale-socket recovery, and binding the listener with
-//! private permissions.
-//! Does not belong: who connects ([`super::session`]) or when to stop
+//! Belongs here: taking the lock, binding, publishing, and reporting which role
+//! this process got.
+//! Does not belong: accepting connections ([`super::session`]) or shutting down
 //! ([`super::lifecycle`]).
 
-use std::fs::{File, OpenOptions};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::os::unix::net::UnixListener;
-use std::path::Path;
-use std::time::{Duration, Instant};
+use std::net::TcpListener;
 
 use crate::eventlog;
-use crate::ipc::Endpoint;
+use crate::ipc::{self, Endpoint};
 use crate::logging;
 
-/// How long to keep retrying the lock before concluding a server is alive.
+/// What a would-be server got.
 ///
-/// A few retries absorb the moment when a previous server is still unlinking, but
-/// a live server holds the lock for hours — so the budget must be short. The
-/// answer after it runs out is not "wait longer", it is "someone else is serving".
-const LOCK_BUDGET: Duration = Duration::from_secs(2);
-
-/// Delay between lock attempts.
-const LOCK_RETRY: Duration = Duration::from_millis(25);
-
-/// What the caller should do after trying to become the server.
-pub enum Election {
-    /// This process owns the config. The lock must be kept alive for the whole
-    /// process: dropping it is what would let a rival start.
-    Won { lock: File, listener: UnixListener },
-    /// Another process serves this config. Exit quietly: this is the normal
-    /// outcome of an optimistic spawn, not a fault.
-    Lost,
+/// `Server` is boxed because `ServerIdentity` (a listener, an endpoint, a lock
+/// handle and a token) is far larger than the `Client` unit variant, and every
+/// `Role` would otherwise pay that size in a stack slot. The box is not an
+/// optimisation detail to hide: it says the winner's payload is a separately owned
+/// resource bundle, which is what it is.
+pub enum Role {
+    /// This process holds the lock and must serve with this identity.
+    Server(Box<ServerIdentity>),
+    /// Another server holds the lock; this process should behave as a client.
+    Client,
 }
 
-/// Win the election for `endpoint`, bind its socket, and hand back both.
+/// Everything the winner owns for the rest of the process's life.
 ///
-/// Returns `Err` only for a real I/O problem (a directory that cannot be created,
-/// a socket path that is not a socket); "someone else is serving" is
-/// [`Election::Lost`].
-pub fn elect(endpoint: &Endpoint) -> std::io::Result<Election> {
-    create_private_dir(&endpoint.dir)?;
-    let Some(lock) = acquire_lock(&endpoint.lock_path) else {
-        eventlog::server_election_lost(&endpoint.lock_path.display().to_string());
-        return Ok(Election::Lost);
+/// Dropping it releases the singleton lock, which is what lets the *next*
+/// `sshpf` become the server. It is kept alive by the accept loop.
+pub struct ServerIdentity {
+    /// The private directory the files live in, kept for cleanup on exit.
+    pub endpoint: Endpoint,
+    /// The bound listener.
+    pub listener: TcpListener,
+    /// The bound port, for the log record.
+    pub port: u16,
+    /// The shared secret published for this run; the handshake compares against it.
+    ///
+    /// Held in memory as well as on disk so the handshake never has to read the
+    /// file (and so a later run cannot change the secret under a live server).
+    pub token: String,
+    /// The lock file handle. Never read; held for its lifetime.
+    ///
+    /// The field is named with a leading underscore because its only purpose is
+    /// its `Drop`.
+    pub _lock: std::fs::File,
+}
+
+/// Try to become the server for `endpoint`'s config, or find out someone else is.
+pub fn become_server(endpoint: Endpoint) -> anyhow::Result<Role> {
+    if let Err(e) = ipc::prepare_dir(&endpoint) {
+        // Cannot create the directory: no server can ever run here, and pretending
+        // to be a client would fail too. Report it as the real failure it is.
+        anyhow::bail!("无法创建 IPC 目录 {}: {e}", endpoint.dir.display());
+    }
+
+    let lock = match ipc::try_become_singleton(&endpoint.lock_path) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => return Ok(Role::Client),
+        Err(e) => anyhow::bail!("无法锁定 {}: {e}", endpoint.lock_path.display()),
     };
-    // Holding the lock means no server is alive, so any socket file here is the
-    // remains of a `SIGKILL`ed one. Remove it before binding, never before.
-    if endpoint.socket_path.exists() && std::fs::remove_file(&endpoint.socket_path).is_ok() {
-        eventlog::server_stale_socket_removed(&endpoint.socket_path.display().to_string());
+
+    // We hold the lock, so any port/token files on disk belong to a server that is
+    // gone. Removing them before binding means a client can never read a port we
+    // have not published yet and dial a stranger.
+    if endpoint.port_path.exists() || endpoint.token_path.exists() {
+        eventlog::server_stale_endpoint_removed(&endpoint.port_path.display().to_string());
     }
-    let listener = UnixListener::bind(&endpoint.socket_path)?;
-    // The umask decides what `bind` created (775 was measured), and the socket is
-    // the only access boundary there is, so set it explicitly.
-    if let Err(e) = std::fs::set_permissions(&endpoint.socket_path, std::fs::Permissions::from_mode(0o600)) {
-        logging::warn("server.socket_chmod_failed", &[("msg", &e.to_string())]);
+    ipc::remove_files(&endpoint);
+
+    let (listener, port) = ipc::bind_loopback()?;
+    let token = ipc::generate_token();
+    // Publish the token first: a client that reads the port before the token would
+    // connect and be refused for a missing secret.
+    ipc::write_token(&endpoint, &token)?;
+    if let Err(e) = ipc::write_port(&endpoint, port) {
+        // Without the port file nobody can find us. Releasing the lock and
+        // reporting is better than serving an unreachable listener.
+        ipc::remove_files(&endpoint);
+        anyhow::bail!("无法发布端口文件 {}: {e}", endpoint.port_path.display());
     }
-    listener.set_nonblocking(true)?;
-    Ok(Election::Won { lock, listener })
+
+    logging::debug("server.token_published", &[("path", &endpoint.token_path.display().to_string())]);
+    Ok(Role::Server(Box::new(ServerIdentity { endpoint, listener, port, token, _lock: lock })))
 }
 
-/// Create the endpoint directory with owner-only permissions.
-fn create_private_dir(dir: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir)?;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+/// Note that a stale discovery file is being discarded.
+///
+/// Called by [`super::run`] before serving so the record names the file even when
+/// [`become_server`] had already removed it in a previous step.
+pub fn release_stale_endpoint() {
+    // Kept as an explicit step so the ordering (lock → clean → publish) is visible
+    // in one place; `become_server` is where the removal actually happens.
 }
 
-/// Take the lock, retrying briefly; `None` when someone else holds it.
-fn acquire_lock(path: &Path) -> Option<File> {
-    let deadline = Instant::now() + LOCK_BUDGET;
-    loop {
-        // `0600`: the lock names nothing, but keeping it private matches the
-        // directory and avoids surprising a security review.
-        // `truncate(false)` is deliberate: the lock file carries no contents, and
-        // truncating it would be a pointless write racing with another lock
-        // attempt. Only the `flock` on it matters.
-        match OpenOptions::new().create(true).write(true).truncate(false).mode(0o600).open(path) {
-            Ok(file) => match file.try_lock() {
-                Ok(()) => return Some(file),
-                // Another process is serving (or just started doing so).
-                Err(std::fs::TryLockError::WouldBlock) => {}
-                // A real filesystem problem: reported by the caller as an error.
-                Err(std::fs::TryLockError::Error(e)) => {
-                    logging::error("server.lock_failed", &[("msg", &e.to_string())]);
-                    return None;
-                }
-            },
-            Err(e) => {
-                logging::error("server.lock_open_failed", &[("msg", &e.to_string())]);
-                return None;
-            }
-        }
-        if Instant::now() >= deadline {
-            return None;
-        }
-        std::thread::sleep(LOCK_RETRY);
-    }
-}
-
-/// Remove the socket file on the way out, so the next start is the happy path.
-pub fn unlink_socket(endpoint: &Endpoint) {
-    match std::fs::remove_file(&endpoint.socket_path) {
-        Ok(()) => {}
-        // Already gone is exactly what we wanted; anything else is worth a line.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => logging::warn("server.socket_unlink_failed", &[("msg", &e.to_string())]),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::ipc::endpoint_for;
-
-    fn endpoint(dir: &Path) -> Endpoint {
-        endpoint_for(&dir.join("config.toml"))
-    }
-
-    #[test]
-    fn the_first_election_wins_and_binds_a_private_socket() {
-        let dir = tempfile::tempdir().unwrap();
-        let ep = endpoint(dir.path());
-        let Election::Won { lock, listener } = elect(&ep).unwrap() else {
-            panic!("the first election must win");
-        };
-        let mode = std::fs::metadata(&ep.socket_path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "the socket is the only access boundary, so it must be private");
-        // Keep both alive to the end of the test.
-        drop(listener);
-        drop(lock);
-    }
-
-    #[test]
-    fn a_second_election_loses_while_the_first_holds_the_lock() {
-        let dir = tempfile::tempdir().unwrap();
-        let ep = endpoint(dir.path());
-        let Election::Won { lock, listener } = elect(&ep).unwrap() else {
-            panic!("the first election must win");
-        };
-        // Same process, second handle: `flock` is per open file, so this really
-        // does contend the way a second process would.
-        assert!(matches!(elect(&ep).unwrap(), Election::Lost), "a rival must not become a second server");
-        drop(listener);
-        drop(lock);
-    }
-
-    #[test]
-    fn the_lock_is_released_when_its_handle_drops() {
-        let dir = tempfile::tempdir().unwrap();
-        let ep = endpoint(dir.path());
-        let Election::Won { lock, listener } = elect(&ep).unwrap() else {
-            panic!("the first election must win");
-        };
-        drop(listener);
-        drop(lock);
-        // The lock is free again, so the next start wins instead of giving up.
-        assert!(matches!(elect(&ep).unwrap(), Election::Won { .. }), "a free lock must be winnable");
-    }
-
-    #[test]
-    fn a_stale_socket_file_is_replaced_by_the_winner() {
-        let dir = tempfile::tempdir().unwrap();
-        let ep = endpoint(dir.path());
-        std::fs::create_dir_all(&ep.dir).unwrap();
-        // Simulate a `SIGKILL`ed server: a socket file nothing is listening on.
-        let dead = UnixListener::bind(&ep.socket_path).unwrap();
-        drop(dead);
-
-        let Election::Won { lock, listener } = elect(&ep).unwrap() else {
-            panic!("a stale socket must not block the election");
-        };
-        assert!(std::os::unix::net::UnixStream::connect(&ep.socket_path).is_ok(), "the new socket must work");
-        drop(listener);
-        drop(lock);
-        assert_eq!(std::fs::metadata(&ep.lock_path).unwrap().permissions().mode() & 0o777, 0o600);
-    }
-
-    #[test]
-    fn the_endpoint_directory_is_private() {
-        let dir = tempfile::tempdir().unwrap();
-        let ep = endpoint(dir.path());
-        let _ = elect(&ep).unwrap();
-        let mode = std::fs::metadata(&ep.dir).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o700, "the directory must not be reachable by other users");
-    }
+/// Remove the discovery files a clean shutdown no longer needs.
+///
+/// Called by [`super::lifecycle`] once the accept loop is done. Deliberately does
+/// not touch the lock file: another process may be about to lock it, and deleting
+/// the file under it is harmless there but pointless churn.
+pub fn release_endpoint(identity: &ServerIdentity) {
+    ipc::remove_files(&identity.endpoint);
 }

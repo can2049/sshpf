@@ -22,14 +22,10 @@ use super::App;
 impl App {
     // -- persistence -------------------------------------------------------
 
-    /// Write the definitions to `config.toml`.
-    ///
-    /// A mirror must not: `config.toml` belongs to the server, and a client
-    /// writing its own possibly-stale copy would overwrite the authority's file —
-    /// the precise "stale view wins over the present" failure the client-server
-    /// split exists to prevent. The command that caused this call has already been
-    /// sent to the server, which persists on its own.
     pub fn persist(&mut self) -> Result<(), String> {
+        // Only the owner writes files. A mirror's `cfg` is a copy of what the
+        // server last sent, so writing it back would race the server's own write
+        // and could resurrect a tunnel the server just deleted.
         if self.is_mirror() {
             return Ok(());
         }
@@ -55,8 +51,8 @@ impl App {
     }
 
     pub fn save_state(&self) {
-        // Same rule as `persist`: `state.toml` describes the authority's tunnels,
-        // and only the authority may describe them.
+        // Same reason as `persist`: `state.toml` describes what *this* process
+        // ran. A mirror ran nothing, and its table is a copy of the server's.
         if self.is_mirror() {
             return;
         }

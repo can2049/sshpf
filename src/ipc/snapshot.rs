@@ -138,6 +138,72 @@ impl Snapshot {
         let tunnels = views.iter().map(|view| wire_tunnel(view, now_ms)).collect();
         Snapshot { revision, server_now_ms: now_ms, client_count, keep_server, tunnels }
     }
+
+    /// Rebuild live views from a snapshot, on the client side.
+    ///
+    /// The inverse of [`Snapshot::from_views`]: each server-clock stamp is turned
+    /// back into a local [`Instant`](std::time::Instant), so the renderer's
+    /// "running for 3m" arithmetic works unchanged. Only the *difference* between
+    /// a stamp and [`Self::server_now_ms`] is used, which is what makes this
+    /// immune to clock skew between the two processes.
+    ///
+    /// The log ring is truncated to the tail the snapshot carried; that is all a
+    /// client is ever sent, so the ring holds less history than the server's.
+    pub fn to_views(&self) -> Vec<TunnelView> {
+        self.tunnels.iter().map(|t| view_from_wire(t, self.server_now_ms)).collect()
+    }
+}
+
+/// Rebuild one live view, converting server-clock stamps back into local
+/// [`Instant`](std::time::Instant)s relative to `now_ms`.
+fn view_from_wire(wire: &WireTunnel, now_ms: i64) -> TunnelView {
+    let mut log = crate::model::LogRing::default();
+    for line in &wire.log_tail {
+        log.push(LogLine::new(level_from_token(&line.level), line.text.clone()));
+    }
+    TunnelView { cfg: wire.cfg.clone(), status: status_from_wire(&wire.status, now_ms), log, retries: wire.retries }
+}
+
+/// Turn one stamped status back into a local `Instant`-based one.
+///
+/// `unwind` orients the conversion: a start time is in the past, a retry deadline
+/// in the future, so each direction is named rather than guessed from the sign.
+fn status_from_wire(status: &WireStatus, now_ms: i64) -> TunnelStatus {
+    match status {
+        WireStatus::Stopped => TunnelStatus::Stopped,
+        WireStatus::Starting { since_ms } => TunnelStatus::Starting { since: instant_of(*since_ms, now_ms) },
+        WireStatus::Up { since_ms } => TunnelStatus::Up { since: instant_of(*since_ms, now_ms) },
+        WireStatus::Retrying { attempt, next_at_ms, reason } => TunnelStatus::Retrying {
+            attempt: *attempt,
+            next_at: instant_of(*next_at_ms, now_ms),
+            reason: failure_from_wire(reason),
+        },
+        WireStatus::Failed { reason } => TunnelStatus::Failed { reason: failure_from_wire(reason) },
+    }
+}
+
+/// Map a server-clock stamp onto a local `Instant`.
+///
+/// `now_ms` is the server's clock at snapshot time and `Instant::now()` is the
+/// local receipt time, so the pair means the same "when" in two process-local
+/// clocks. The arithmetic is saturating both ways: a stamp far in either
+/// direction must degrade to "a long time ago" / "a long time from now" rather
+/// than overflow.
+fn instant_of(stamp_ms: i64, now_ms: i64) -> std::time::Instant {
+    let now = std::time::Instant::now();
+    let delta = stamp_ms.saturating_sub(now_ms);
+    if delta >= 0 {
+        let ahead = std::time::Duration::from_millis(u64::try_from(delta).unwrap_or(u64::MAX));
+        now.checked_add(ahead).unwrap_or(now)
+    } else {
+        let behind = std::time::Duration::from_millis(u64::try_from(delta.saturating_neg()).unwrap_or(u64::MAX));
+        now.checked_sub(behind).unwrap_or(now)
+    }
+}
+
+/// Rebuild a classified failure from its wire form.
+fn failure_from_wire(wire: &WireFailure) -> FailureInfo {
+    FailureInfo::with_short(failure_kind_from_token(&wire.kind), wire.short.clone(), wire.detail.clone())
 }
 
 /// Project one live view onto the wire, truncating its log to the tail.
