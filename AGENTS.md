@@ -39,7 +39,7 @@ git branch -d feat/my-feature && git push origin --delete feat/my-feature
 2. **生产代码不许 `.unwrap()` / `.expect()` / `panic!`**。失败要么返回 `Result`/`Option`，要么记日志 + 显示在状态条。测试代码豁免。
 3. **`unsafe` 只允许出现在 `src/logging/crash.rs`**（崩溃写入器），每处必须有 `// SAFETY:`。
 4. **依赖只许向下**：`main → app/keys/ui → tunnel/config → ssh → model/text/logging/sys`。反向依赖是缺陷。
-5. **一个文件一个职责，单文件生产代码 ≤400 行，单函数 ≤60 行**。超了要拆，不是加注释。
+5. **一个文件一个职责，单文件生产代码 ≤400 行，单函数 ≤60 行**。超了要拆，不是加注释。**测试不占这份预算**：小模块的测试留在文件尾，大模块的测试搬到 `src/<module>/tests.rs`（开头 `#![cfg(test)]`），别为了迁就测试去删测试或放宽断言。
 6. **不改变可观察行为**：`event=` 名称、帮助文案、键位、渲染文本逐字保持不变（重构 ≠ 改需求）。
 
 以上 1/2/3/5 都是 [`tests/safety_guards.rs`](tests/safety_guards.rs) 里的**可执行断言**，不是文档里的口号。

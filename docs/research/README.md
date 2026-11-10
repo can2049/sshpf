@@ -46,16 +46,16 @@ client-server 改造。结论已经落实进代码，本目录只保留**为什�
 
 | 文件 | 内容 | 行数 |
 |---|---|---|
-| [prior-art.md](prior-art.md) | 同类工具盘点、表格列设计、录入流程、持久化与安全调研 | ~100 |
-| [tech-options.md](tech-options.md) | v1 选型实测：系统 `ssh` 子进程、`ssh -v` 失败面、进程树清理、TUI 栈（**§3.3 是 `src/app.rs` 事件循环的出处**） | ~143 |
-| [pure-rust-ssh-plan.md](pure-rust-ssh-plan.md) | 纯 Rust 化的**决策文档**：判据 C1–C6、目标架构、分阶段、否决的替代方案 | ~154 |
-| [pure-rust-ssh-spike.md](pure-rust-ssh-spike.md) | **实测主档**：三种转发 + ProxyJump 跑通、性能数字、known_hosts 缺陷（§8）、错误分类 | ~238 |
-| [pure-rust-ssh-russh.md](pure-rust-ssh-russh.md) | `russh` API 速查：哪项能力对哪个函数、签名陷阱 | ~120 |
-| [pure-rust-ssh-config.md](pure-rust-ssh-config.md) | config/密钥/agent/known_hosts 生态选型：候选 crate 对比、六处缺陷、依赖增量 | ~288 |
-| [client-server.md](client-server.md) | client-server 调研总览：为什么做、代价、52 条断言、**本文预测 vs 实际落地** | ~146 |
-| [client-server/protocol.md](client-server/protocol.md) | 帧格式、消息全集、命令、TOML 限制、体积预算、**§8.2 兼容变更契约** | ~261 |
-| [client-server/lifecycle.md](client-server/lifecycle.md) | 选举顺序、计数与宽限、关服时序、信号、崩溃重连 | ~194 |
-| [client-server/migration.md](client-server/migration.md) | 分阶段施工图、不变量、测试策略、**§11 退出提示的完整验收条款** | ~163 |
+| [prior-art.md](prior-art.md) | 同类工具盘点、表格列设计、录入流程、持久化与安全调研 | 100 |
+| [tech-options.md](tech-options.md) | v1 选型实测：系统 `ssh` 子进程、`ssh -v` 失败面、进程树清理、TUI 栈（**§3.3 是 `src/app.rs` 事件循环的出处**） | 143 |
+| [pure-rust-ssh-plan.md](pure-rust-ssh-plan.md) | 纯 Rust 化的**决策文档**：判据 C1–C6、目标架构、分阶段、否决的替代方案 | 154 |
+| [pure-rust-ssh-spike.md](pure-rust-ssh-spike.md) | **实测主档**：三种转发 + ProxyJump 跑通、性能数字、known_hosts 缺陷（§8）、错误分类 | 238 |
+| [pure-rust-ssh-russh.md](pure-rust-ssh-russh.md) | `russh` API 速查：哪项能力对哪个函数、签名陷阱 | 63 |
+| [pure-rust-ssh-config.md](pure-rust-ssh-config.md) | config/密钥/agent/known_hosts 生态选型：候选 crate 对比、六处缺陷、依赖增量 | 289 |
+| [client-server.md](client-server.md) | client-server 调研总览：为什么做、代价、52 条断言、**本文预测 vs 实际落地** | 146 |
+| [client-server/protocol.md](client-server/protocol.md) | 帧格式、消息全集、命令、TOML 限制、体积预算、**§8.2 兼容变更契约** | 261 |
+| [client-server/lifecycle.md](client-server/lifecycle.md) | 选举顺序、计数与宽限、关服时序、信号、崩溃重连 | 194 |
+| [client-server/migration.md](client-server/migration.md) | 分阶段施工图、不变量、测试策略、**§11 退出提示的完整验收条款** | 185 |
 
 ## 仍被代码引用的路径（**不许改名**）
 
@@ -125,4 +125,4 @@ sys.exit(1 if bad else 0)
 EOF
 ```
 
-最后一次运行结果：`checked 154 references in docs/research/**; problems: 0`。
+最后一次运行结果：`checked 155 references in docs/research/**; problems: 0`。

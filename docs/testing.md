@@ -8,13 +8,29 @@
 
 | 层 | 位置 | 数量级 | 依赖 | 守什么 |
 |---|---|---|---|---|
-| **单元** | 各模块尾部 `#[cfg(test)] mod tests` | 570+ | 无（不 spawn、不 I/O） | 状态机、判定、边界、渲染纯函数 |
+| **单元** | 各模块尾部 `#[cfg(test)] mod tests`，或大模块的 `src/<module>/tests.rs` | 570+ | 无（不 spawn、不 I/O） | 状态机、判定、边界、渲染纯函数 |
 | **覆盖**（源码即断言） | `tests/help_coverage.rs`、`tests/safety_guards.rs` | 10 + 8 | 只读源码 | 帮助不得遗漏/不得撒谎；panic/`unsafe` 政策、模块文档、单文件 ≤400 行、单函数 ≤60 行、测试模块不得被平台 cfg 整段吞掉 |
 | **加固**（真二进制） | `tests/logging.rs`、`tests/panic_hardening.rs` | 21 + 13 | 真进程，必须 `--test-threads=1` | 日志全链路、崩溃、恶意输入不 panic |
 | **端到端** | `tests/e2e.rs` | 19 | 真 `sshd`，默认 `#[ignore]` | 三种转发真的通、主机密钥真的拒/真的可忽略、端口真的释放、探活真的发现失效会话 |
 | **策略矩阵** | `tests/host_key_policy.rs` | 10 | 无（真实 `known_hosts` / `~/.ssh/config` 夹具） | 主机密钥判定完整矩阵：默认拒变更、`ignore` 接受但**不写盘**、`@revoked` 四策略恒拒；逐跳策略、全局开关优先 |
 
 单元测试**跟着被拆模块走**：`src/model/import/table.rs` 的测试就放该文件末尾，不放回 `src/model.rs`。跨模块共用的夹具放 `#[cfg(test)]` 的夹具文件（如 `src/model/fixtures.rs`、`src/ui/test_support.rs`）——不要把一个夹具复制三份。
+
+**测试放在哪，取决于文件大小**（两条都合法，不要混着猜）：
+
+| 情况 | 放哪 | 为什么 |
+|---|---|---|
+| 模块小，生产代码 + 测试 ≤ 400 行 | 文件尾部 `#[cfg(test)] mod tests` | 改行为时测试就在眼前，一次打开 |
+| 生产代码已接近预算 | `src/<module>/tests.rs`，开头 `#![cfg(test)]` | 生产文件回到"只讲它做什么"，测试在隔壁、文件名即承诺 |
+
+后者对整个文件生效：`#![cfg(test)]` 把它排除在所有非测试构建之外，所以 panic/`unsafe`/体积规则都不适用于它。这个豁免是**被校验的**，不是被信任的——`tests/safety_guards.rs` 的 `every_whole_file_test_module_is_gated` 要求属性存在且文件名必须是 `tests.rs`，无门控的文件无法混进来。当前这样放的有 24 个文件，其余仍是文件尾部。
+
+脚本化地判别当前状态：
+
+```bash
+# 哪些文件用整文件测试模块（都应以 #![cfg(test)] 开头）
+grep -rl '^#!\[cfg(test' src
+```
 
 ## 怎么跑 / Commands
 

@@ -155,11 +155,7 @@
 
 | 按键 / Key | 中文 | English |
 |---|---|---|
-| `j` / `↓` | 下一行 | Next row |
-| `k` / `↑` | 上一行 | Previous row |
-| `pgdn` / `pgup` | 向下 / 向上翻页 | Page down / up |
-| `g` / `home` | 跳到首行 | Jump to the first row |
-| `G` / `end` | 跳到末行 | Jump to the last row |
+| `j` / `↓` / `k` / `↑` / `pgdn` / `pgup` / `g` / `home` / `G` / `end` | 移动 / 翻页 / 首尾行 | Move / page / first & last row |
 | `space` | 勾选 / 取消当前行 | Tick / untick the current row |
 | `a` | 全选（只作用于筛选后可见行） | Tick all visible rows |
 | `U` | 全不选（只作用于可见行） | Untick all visible rows |
@@ -200,11 +196,7 @@
 
 | 按键 / Key | 中文 | English |
 |---|---|---|
-| `j` / `↓` | 下一行 | Next row |
-| `k` / `↑` | 上一行 | Previous row |
-| `pgdn` / `pgup` | 向下 / 向上翻页 | Page down / up |
-| `g` / `home` | 跳到首行 | Jump to the first row |
-| `G` / `end` | 跳到末行 | Jump to the last row |
+| `j` / `↓` / `k` / `↑` / `pgdn` / `pgup` / `g` / `home` / `G` / `end` | 移动 / 翻页 / 首尾行 | Move / page / first & last row |
 | `space` | 勾选 / 取消当前行 | Tick / untick this row |
 | `a` | 全选 | Tick every row |
 | `U` | 全不选 | Untick every row |
