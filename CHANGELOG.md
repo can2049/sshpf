@@ -10,6 +10,18 @@
 
 ## [Unreleased]
 
+### 行为变更（clap 语义）
+
+参数解析现在以 `clap` 的规则为准，三处与旧手写循环不同：
+
+- **重复参数是用法错误。** `sshpf --check --check` 现在退出 2（旧版静默接受，把 bool 置两次）。
+  新文案双语：`参数不能重复 / Option given more than once: --check`。
+- **`--config` 的值不能是旗标形状。** `sshpf -c --help` 现在是「需要一个路径参数」退出 2；
+  旧版会把 `--help` 当作配置文件路径。路径真以 `--` 开头请写成 `--config=--help`。
+- **接受连写形式。** `--config=PATH` 与 `-cPATH` 现在可用，旧解析器报「未知参数」。
+
+`--help` / `-V` 的输出、未知参数与缺值的文案、退出码 2 全部不变。
+
 ### 移除（**行为变更**）
 
 - **client-server 架构整体删除，回归单进程。** 一个 `sshpf` 进程拥有全部隧道：启动的那个
@@ -29,10 +41,9 @@
 ### 变更
 
 - **命令行参数解析改用 `clap`**（`src/cli/args.rs`，flag 只在一处 derive 结构上声明）。
-  帮助文本没有交给 clap：`USAGE` 仍是那 111 行双语手册，`--help` 输出逐字节不变；错误文案与
-  退出码（未知参数/缺值 → 2）也逐字不变。**唯一可观察的行为放宽**：`--config=PATH` 与 `-cPATH`
-  两种连写形式现在被接受（旧解析器报"未知参数"），因为 clap 实现的是 GNU 惯例。新增 5 个
-  依赖包、release 二进制 +398 KiB，理由与约束见 [docs/design.md](docs/design.md) D38。
+  帮助文本没有交给 clap：`USAGE` 仍是那 111 行双语手册，`--help` 输出逐字节不变；未知参数与
+  `--config` 缺值的文案、退出码 2 也逐字不变。新增 5 个依赖包、release 二进制 +398 KiB，
+  理由与约束见 [docs/design.md](docs/design.md) D38。
 - **文档合并**：`import-forwards.md` / `import-pane.md` / `import-save.md` / `port-scan.md`
   四篇讲的是同一件事（「导入与新增」整条链：发现 → 面板 → 保存 → 对端端口），读者为回答一个
   问题要开四个文件，所以合成一篇 [docs/import.md](docs/import.md)。

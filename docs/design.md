@@ -165,6 +165,10 @@ panic 走 hook（链式调用上一个，所以 ratatui 恢复终端照常生效
 原先 `cli.rs` 里是一段手写 `while let`（约 35 行）逐 token 匹配。它没有错，但**字段与规则是两份真相**：`Args` 的字段和 `match` 的分支靠人保证一致，加一个 flag 要改两处，漏一处编译器不吭声。
 现在 flag 只在 `src/cli/args.rs` 的 derive 结构上声明一次，`Args::try_parse_from` 负责解析。**帮助文本没有交给 clap**：`USAGE` 是 111 行双语手册，含快捷键表、鼠标表、日志段这些不挂任何 flag 的自由段落，任何 derive 属性都装不下；它的措辞还被 `docs/keymap.md` 与 README 镜像。让 clap 渲染等于把这份文案重写一遍，属硬约定 6 的「改可观察行为」。
 **这突破了 D37 立的规矩**（加直接依赖的唯一正当理由是「零新增包，只提升已有包」）：clap 新增 5 个包（`clap`、`clap_builder`、`clap_derive`、`clap_lex`、`anstyle`），故此处显式记账。用 `default-features = false` + `std/help/usage/error-context/derive` 把这 5 个压到最小；默认 features 会经 `anstream` 再拉进 7 个纯终端染色包。代价是二进制 +398 KiB（+6.0%）。
-三条必须记住的实现约束，都写在 `src/cli/args.rs` 头注释里：① 每个 bool flag 要 `overrides_with` 自指，否则重复 flag 从「合法」变成 usage error；② `--config` 要 `allow_hyphen_values`，否则 `-c --help` 不再把 `--help` 当路径；③ 只能用 `try_parse_from`，`Args::parse()` 走 `process::exit` 会跳过所有 `Drop`（隧道不停、终端不还）。
-**唯一的对外行为放宽**：`--config=PATH` / `-cPATH` 现在被接受，旧解析器会报未知参数。这是 clap 的 GNU 惯例带来的，已在 `src/cli/tests.rs` 里用测试钉住并写进 CHANGELOG。
+**clap 的语义优先于旧的手写循环**：两者不一致的地方，按 clap 的规则来，不做兼容垫片。三处差异都写进了 `src/cli/tests.rs`：
+- **重复 flag 是错误**。`--check --check` 现在退出 2（旧循环只是把 bool 置两次）。文案映射成双语，不漏 clap 的英文 `error:`/`Usage:` 块。
+- **`--config` 的值不能是旗标形状**。`-c --help` 现在是「需要一个路径参数」退出 2（旧行为把 `--help` 当路径）。真要路径以 `--` 开头，写成 `--config=--help`。
+- **接受连写形式**。`--config=PATH` / `-cPATH` 可用（旧解析器只匹配精确 token）。
+
+仍有一条实现约束必须记住，写在 `src/cli/args.rs` 头注释里：**只能用 `try_parse_from`**，`Args::parse()` 走 `process::exit` 会跳过所有 `Drop`（隧道不停、终端不还）；官方示例的 `err.print().expect(..)` 也不行，`.expect` 是 panic，而 `--help > /dev/full` 不许 panic。
 → [architecture.md](architecture.md#模块地图--module-map) · `src/cli/args.rs`、`src/cli.rs`

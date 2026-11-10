@@ -27,16 +27,22 @@
 //! * **The write path.** Nothing here prints. Help and version go through
 //!   [`super::write_stdout`] so a broken pipe or a full disk cannot panic.
 //!
-//! # Two clap behaviours that needed pinning down
+//! # Three places where clap's behaviour wins over the old hand-written loop
 //!
-//! Both were measured against the old parser, and both are covered by tests:
+//! The parser this replaced accepted things clap rejects, and vice versa. Where
+//! they disagree, **clap's rule is the rule** — the shims that used to paper over
+//! the difference are gone on purpose, and the new behaviour is pinned by tests in
+//! `src/cli/tests.rs` so it is a decision rather than drift:
 //!
-//! * **A repeated flag is legal.** `sshpf --check --check` used to be accepted
-//!   (the loop just set the bool twice). clap rejects a second occurrence by
-//!   default, so every flag carries `overrides_with` pointing at itself.
-//! * **`--config` takes the next argument verbatim.** `sshpf -c --help` used to
-//!   store `--help` as the *path*. clap would treat it as the help flag, so
-//!   `--config` carries `allow_hyphen_values`.
+//! * **A repeated flag is an error.** `sshpf --check --check` now exits 2 with
+//!   clap's "cannot be used multiple times". The old loop silently set the bool
+//!   twice; a flag given twice is a mistake worth reporting.
+//! * **`--config` needs a value that is not flag-shaped.** `sshpf -c --help` now
+//!   fails with "--config needs a path argument" (exit 2) instead of storing
+//!   `--help` as the config path. A path that starts with `--` has to be written
+//!   as `--config=--help` if someone really means it.
+//! * **An attached value is accepted.** `--config=PATH` / `-cPATH` work; the old
+//!   loop only matched the exact tokens `-c` / `--config`.
 //!
 //! Belongs here: the flag declarations, and the error→message mapping.
 //! Does not belong: the help text ([`super::USAGE`]), the non-TUI modes
@@ -66,22 +72,21 @@ use clap::Parser as _;
 pub struct Args {
     /// Kept as an `OsString`: a config path need not be valid UTF-8.
     ///
-    /// `allow_hyphen_values` keeps the old parser's rule that the value is
-    /// whatever comes next, even if it looks like a flag (`-c --help` names a
-    /// file called `--help`). `overrides_with` keeps a repeated flag legal.
-    #[arg(short = 'c', long, value_name = "PATH", allow_hyphen_values = true, overrides_with = "config")]
+    /// The value must not look like a flag: `-c --help` is a usage error, not a
+    /// file called `--help`. Write `--config=--help` to mean the path.
+    #[arg(short = 'c', long, value_name = "PATH")]
     pub config: Option<OsString>,
     /// Start without restoring the forwards that were enabled in the last run.
-    #[arg(long, action = clap::ArgAction::SetTrue, overrides_with = "no_restore")]
+    #[arg(long, action = clap::ArgAction::SetTrue)]
     pub no_restore: bool,
     /// Print the hosts from `~/.ssh/config`, then exit.
-    #[arg(long, action = clap::ArgAction::SetTrue, overrides_with = "list_hosts")]
+    #[arg(long, action = clap::ArgAction::SetTrue)]
     pub list_hosts: bool,
     /// Validate the config file, then exit (no UI).
-    #[arg(long, action = clap::ArgAction::SetTrue, overrides_with = "check")]
+    #[arg(long, action = clap::ArgAction::SetTrue)]
     pub check: bool,
     /// Accept a changed host key instead of refusing the connection.
-    #[arg(long, action = clap::ArgAction::SetTrue, overrides_with = "ignore_host_key_changes")]
+    #[arg(long, action = clap::ArgAction::SetTrue)]
     pub ignore_host_key_changes: bool,
     /// Declared only so the flag parses; `cli.rs` prints the real help.
     #[arg(short = 'h', long, action = clap::ArgAction::Help)]
@@ -163,6 +168,13 @@ fn classify(e: clap::Error) -> Result<Option<Args>, String> {
         }
         ErrorKind::MissingRequiredArgument => {
             Err("--config 需要一个路径参数 / --config needs a path argument".to_string())
+        }
+        // A flag given twice (`--check --check`). clap's wording is English and
+        // carries a `Usage:` block the manual help does not have, so it gets the
+        // same bilingual treatment as the other usage errors.
+        ErrorKind::ArgumentConflict => {
+            let bad = context_string(&e, ContextKind::InvalidArg);
+            Err(format!("参数不能重复 / Option given more than once: {bad}\n\n用法 / Usage:  sshpf [选项 / options]"))
         }
         // A value given to a flag that takes none (`--check=1`). The old parser
         // never got here — it treated the whole token as an unknown option — so
