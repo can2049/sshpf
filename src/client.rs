@@ -178,9 +178,9 @@ impl Session {
 /// spawned server is given `-c` only in that case, so both processes resolve the same
 /// default otherwise. Returns as soon as the handshake completes — the read loop runs
 /// on its own thread and reconnects by itself from then on.
-pub fn run(config_path: &Path, explicit_config: bool) -> Result<Session, ClientError> {
+pub fn run(config_path: &Path, explicit_config: bool, no_restore: bool) -> Result<Session, ClientError> {
     let endpoint = ipc::endpoint_for(config_path);
-    let connection = first_attach(&endpoint, config_path, explicit_config)?;
+    let connection = first_attach(&endpoint, config_path, explicit_config, no_restore)?;
     let (outbox, commands) = mpsc::channel();
     let (messages, inbox) = mpsc::channel();
     let handle = thread::Builder::new()
@@ -191,7 +191,12 @@ pub fn run(config_path: &Path, explicit_config: bool) -> Result<Session, ClientE
 }
 
 /// Attach once, spawning a server when that is the only thing that can help.
-fn first_attach(endpoint: &Endpoint, config_path: &Path, explicit_config: bool) -> Result<Connection, ClientError> {
+fn first_attach(
+    endpoint: &Endpoint,
+    config_path: &Path,
+    explicit_config: bool,
+    no_restore: bool,
+) -> Result<Connection, ClientError> {
     match connect::attach(endpoint) {
         Ok(connection) => return Ok(connection),
         // A server is running and refused us (token, version, config). Spawning a
@@ -202,7 +207,7 @@ fn first_attach(endpoint: &Endpoint, config_path: &Path, explicit_config: bool) 
     // Only the path the user actually named travels: an absent `-c` means the child
     // resolves the same default this process did.
     let named = if explicit_config { Some(config_path) } else { None };
-    let spawned = spawn::spawn_server(named).map_err(|e| {
+    let spawned = spawn::spawn_server(named, no_restore).map_err(|e| {
         eventlog::client_spawn_failed(&e.to_string());
         ClientError::Spawn(e)
     })?;

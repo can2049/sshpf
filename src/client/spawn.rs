@@ -67,6 +67,13 @@ pub struct SpawnRequest {
     pub config: Option<PathBuf>,
     /// The pid of the client that is starting it, for the server's log.
     pub attach_from: u32,
+    /// Whether the user passed `--no-restore`.
+    ///
+    /// The **server** owns the restore (it is the only process that may start a
+    /// tunnel), so the flag has to travel with the spawn or it would be silently
+    /// ignored in client-server mode: the window asked for no restore and every
+    /// forward came up anyway.
+    pub no_restore: bool,
 }
 
 impl SpawnRequest {
@@ -80,6 +87,11 @@ impl SpawnRequest {
         if let Some(config) = &self.config {
             args.push(OsString::from("-c"));
             args.push(config.clone().into_os_string());
+        }
+        // Only when asked for: an absent flag means "restore", which is the default
+        // on both sides, so no argument is more honest than `--restore`.
+        if self.no_restore {
+            args.push(OsString::from("--no-restore"));
         }
         args
     }
@@ -97,9 +109,10 @@ pub struct SpawnedServer {
 /// `config` is the path the **user** named, or `None` when they named none: the
 /// child must serve the same configuration this client is talking about, which is
 /// how the two agree on an endpoint without a handshake on the command line.
-pub fn spawn_server(config: Option<&Path>) -> io::Result<SpawnedServer> {
+pub fn spawn_server(config: Option<&Path>, no_restore: bool) -> io::Result<SpawnedServer> {
     let exe = std::env::current_exe()?;
-    let request = SpawnRequest { exe, config: config.map(Path::to_path_buf), attach_from: std::process::id() };
+    let request =
+        SpawnRequest { exe, config: config.map(Path::to_path_buf), attach_from: std::process::id(), no_restore };
     launch(&request)
 }
 
@@ -165,6 +178,7 @@ mod tests {
             exe: PathBuf::from("/usr/local/bin/sshpf"),
             config: config.map(PathBuf::from),
             attach_from: 4242,
+            no_restore: false,
         }
     }
 
@@ -204,10 +218,26 @@ mod tests {
         assert!(!args.iter().any(|a| a.contains("keep-server")), "{args:?}");
     }
 
+    /// The server is the only process that may start a tunnel, so a `--no-restore`
+    /// the user typed has to travel with the spawn — otherwise the flag is silently
+    /// ignored in client-server mode and every forward comes up anyway.
+    #[test]
+    fn a_users_no_restore_travels_to_the_child() {
+        let mut req = request(None);
+        assert!(!req.args().iter().any(|a| a == "--no-restore"), "restore is the default, so the flag is absent");
+        req.no_restore = true;
+        let args = text(&req.args());
+        assert_eq!(args, vec!["--server", "--attach-from", "4242", "--no-restore"], "{args:?}");
+    }
+
     #[test]
     fn a_missing_binary_is_an_error_not_a_panic() {
-        let request =
-            SpawnRequest { exe: PathBuf::from("/nonexistent/sshpf-does-not-exist"), config: None, attach_from: 1 };
+        let request = SpawnRequest {
+            exe: PathBuf::from("/nonexistent/sshpf-does-not-exist"),
+            config: None,
+            attach_from: 1,
+            no_restore: false,
+        };
         // Any `io::Error` is fine; the point is that it is returned, not panicked.
         assert!(launch(&request).is_err(), "a missing executable must be reported");
     }

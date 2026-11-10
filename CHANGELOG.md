@@ -23,6 +23,25 @@
 - **架构文档不再逐文件转录**：`architecture.md` 只保留分层、依赖方向、进程模型与目录级地图，
   「这个文件放什么」以文件自身的 `//!` 头注释为准（`tests/safety_guards.rs` 强制每个文件都有）。
 
+### 修复
+
+- **修复「sshpf 启动后界面上的转发一直显示连接中，但在同一终端里 `ssh <host>` 却是通的」。**
+  这是 0.8.0 client-server 的一个缺陷：服务端的广播泵只在 `revision` 变化时才下发快照，而
+  `revision` 只在**客户端命令**被应用时自增。隧道的 `Ready`、安排重试、进度行都来自隧道线程、
+  不经过命令，于是泵认为「没有变化」、什么都不发——转发其实早已在监听（`netstat` 能看到端口），
+  但每个窗口都停在 `◐ 连接中`。
+  现在泵按**客户端会看到的内容**判断是否下发（新增 `src/server/signature.rs`），`revision`
+  仍是独立触发条件。快照里的时钟戳不入签名，否则「无变化」永不成立、会退化成每 200 ms 全量广播。
+- **服务端现在真的执行 `restore_on_start`。** 同一个 bug 的另一半：`App::restore_enabled`
+  只在 `main::prepare_app` 里被调用，而 `--server` 走的是 `server::start`，从不经过那里——
+  于是 `config.toml` 里写着 `restore_on_start = true`、单进程版也照做，**只有 client-server
+  路径静默不恢复**：服务端启动后每条转发都是 `Stopped`，直到用户按 `a`。
+  （`src/client.rs` 的注释一直声称「启动 server 会跑 `restore_enabled`」，代码里从来没有。）
+- **`--no-restore` 现在会传到服务端。** 补上一半的必然结果：恢复是服务端做的，而这个 flag
+  此前根本没进 `--server` 的启动参数，于是「我要跳过自动恢复」在 client-server 模式下被忽略。
+- **`tests/client_server.rs` 接进 CI。** 这套跨进程测试从 client-server 落地起就没进过 CI，
+  所以上面两个缺陷没有任何 job 能抓到。
+
 ## [0.8.0] - 2026-11-10
 
 本次是 **client-server 运行时**落地：一份配置只有一个后台服务进程，多个窗口共享同一份状态。

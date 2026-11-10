@@ -61,6 +61,7 @@ pub mod election;
 pub mod framing;
 pub mod lifecycle;
 pub mod session;
+pub mod signature;
 pub mod start;
 pub mod state;
 
@@ -106,6 +107,23 @@ pub fn run(paths: Paths, args: ServerArgs, identity: election::ServerIdentity) -
     // terminal, so it must not steal the cursor or leave raw mode behind.
     app.keep_server = args.keep_server;
     app.client_count = 0;
+
+    // Restore the tunnels the user left enabled, exactly once, here.
+    //
+    // This is the server's job and nobody else's: a client that restored too would
+    // race it, and the visible result is every forward bouncing ("connected,
+    // dropped, reconnected") the moment a second window opens. `--no-restore` is
+    // therefore a server-side flag once a server is in play — see
+    // `main::prepare_app`, which skips restore for mirrors for this same reason.
+    //
+    // Before this ran, the server started with every tunnel `Stopped` until someone
+    // pressed `a`: the config says `restore_on_start = true`, the single-process
+    // build honoured it, and only the client-server path quietly did not.
+    if args.no_restore {
+        logging::info("app.restore_skipped", &[("reason", &"no-restore")]);
+    } else {
+        app.restore_enabled();
+    }
 
     let shared = state::Shared::new(app, args.keep_server, identity.token.clone());
     eventlog::server_started(
@@ -203,6 +221,12 @@ pub struct ServerArgs {
     pub host_key_policy: crate::ssh::known_hosts::HostKeyPolicy,
     /// Why this server is stopping (recorded in `server.shutdown_begin`).
     pub trigger: ShutdownTrigger,
+    /// Do not re-open the tunnels the config says were enabled.
+    ///
+    /// Honoured here rather than in the client, because the server is the only
+    /// process that may start a tunnel. A client that asked for `--no-restore` gets
+    /// it through the spawn arguments — see [`crate::client::spawn::SpawnRequest`].
+    pub no_restore: bool,
 }
 
 /// Why the server is being asked to stop.

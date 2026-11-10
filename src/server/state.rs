@@ -60,6 +60,20 @@ pub struct ServerState {
     pub revision: u64,
 }
 
+/// One lock read of the state, in both the shapes the publisher needs.
+///
+/// A struct rather than a tuple so the two fields cannot be swapped at a call site:
+/// they are both "the state" and a mistake between them would publish a snapshot
+/// under the wrong signature.
+struct Captured {
+    /// The revision this reading is at.
+    revision: u64,
+    /// Everything a client would see, timestamps excluded.
+    signature: super::signature::StateSignature,
+    /// The wire form, timestamped from one clock reading.
+    snapshot: Snapshot,
+}
+
 /// A handle to the server, cheap to clone and safe to share with every session.
 #[derive(Clone)]
 pub struct Shared {
@@ -79,6 +93,14 @@ pub struct Shared {
     /// Kept outside the state mutex so the pump's very frequent poll
     /// (`publish_if_changed`) does not contend with a command being applied.
     published: Arc<AtomicU64>,
+    /// What the clients last received, other than the revision.
+    ///
+    /// The second trigger for a publish, and the one that makes a state change the
+    /// pump caused visible at all: `revision` only moves when a *command* is
+    /// applied, so without this a tunnel that reached `Up` on its own would be
+    /// published never — the exact bug this field exists to prevent. See
+    /// [`super::signature`].
+    last_sent: Arc<Mutex<Option<super::signature::StateSignature>>>,
     /// The shared secret published for this run; the handshake compares against it.
     token: String,
 }
@@ -91,6 +113,7 @@ impl Shared {
             stopping: Arc::new(AtomicBool::new(false)),
             grace_armed: Arc::new(AtomicBool::new(false)),
             published: Arc::new(AtomicU64::new(0)),
+            last_sent: Arc::new(Mutex::new(None)),
             token,
         }
     }
@@ -113,27 +136,72 @@ impl Shared {
 
     /// Take a copy of the current state as a wire snapshot.
     pub fn snapshot(&self) -> Snapshot {
+        self.capture().snapshot
+    }
+
+    /// Read the state once, as both the wire snapshot and the comparable signature.
+    ///
+    /// One lock for both on purpose: a signature computed from state A paired with a
+    /// snapshot of state B would either publish a change twice or — worse — record
+    /// "already sent" for a state no client ever received. Cheap enough to be the
+    /// shared path because the clone is of the same per-tunnel views the snapshot
+    /// needs anyway.
+    fn capture(&self) -> Captured {
         let state = self.lock_state();
         let keep = state.keep_server;
         let revision = state.revision;
         let views = state.app.tunnels.clone();
         drop(state);
         let count = self.client_count.load(Ordering::Relaxed);
-        Snapshot::from_views(revision, now_ms(), count, keep, &views)
+        let signature = super::signature::StateSignature::of(count, keep, &views);
+        Captured { revision, signature, snapshot: Snapshot::from_views(revision, now_ms(), count, keep, &views) }
     }
 
-    /// Send the current state to every client, if it differs from the last send.
+    /// Send the current state to every client, if they would see anything new.
     ///
-    /// Safe to call on every pump tick: with no change it costs one lock.
+    /// Two independent triggers, because the state changes for two unrelated
+    /// reasons:
+    ///
+    /// * **the revision moved** — a command was applied. Even when it changes
+    ///   nothing a client renders, the client needs the new revision to stamp its
+    ///   next `expect_rev` with, so this publishes by itself.
+    /// * **the signature moved** — the event pump did something on its own. This is
+    ///   the trigger that was missing: `Ready`, a retry being scheduled, a progress
+    ///   line, a closed session. None of them applies a command, so the revision
+    ///   never moved and no window ever learned that its forward had come up.
+    ///
+    /// Safe to call on every pump tick: with nothing new it costs one lock, one
+    /// clone of the views, and a comparison.
     pub fn publish_if_changed(&self) -> bool {
-        let revision = self.lock_state().revision;
-        if self.published.load(Ordering::Relaxed) == revision {
+        let captured = self.capture();
+        let revision_sent = self.published.load(Ordering::Relaxed) == captured.revision;
+        let signature_sent = self.last_sent_is(&captured.signature);
+        if revision_sent && signature_sent {
             return false;
         }
-        self.published.store(revision, Ordering::Relaxed);
-        let snapshot = self.snapshot();
-        super::broadcast::publish(&snapshot);
+        self.published.store(captured.revision, Ordering::Relaxed);
+        self.remember_signature(captured.signature);
+        super::broadcast::publish(&captured.snapshot);
         true
+    }
+
+    /// Whether `signature` is exactly what the clients were last sent.
+    ///
+    /// Kept outside the state mutex for the same reason as `published`: the pump
+    /// calls this every tick, and it must not contend with a command being applied.
+    fn last_sent_is(&self, signature: &super::signature::StateSignature) -> bool {
+        match self.last_sent.lock() {
+            Ok(guard) => guard.as_ref() == Some(signature),
+            Err(poisoned) => poisoned.into_inner().as_ref() == Some(signature),
+        }
+    }
+
+    /// Record what the clients are about to be sent.
+    fn remember_signature(&self, signature: super::signature::StateSignature) {
+        match self.last_sent.lock() {
+            Ok(mut guard) => *guard = Some(signature),
+            Err(poisoned) => *poisoned.into_inner() = Some(signature),
+        }
     }
 
     /// Register a client, or refuse it when the registry is full or the server is
@@ -298,5 +366,112 @@ pub fn request_stop_via_hook() -> bool {
             true
         }
         None => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{ConfigFile, Paths};
+    use crate::model::{FailureInfo, FailureKind, ForwardKind, TunnelConfig, TunnelStatus};
+    use std::time::Instant;
+
+    /// A server handle over an empty temp config.
+    ///
+    /// **No client is registered.** Publishing to an empty registry is a documented
+    /// no-op, and registering one would mean touching the process-global session
+    /// table that [`super::broadcast`]'s own tests serialise; the return value of
+    /// `publish_if_changed` is the whole property under test, and it does not depend
+    /// on anyone listening.
+    fn shared_with_one_tunnel() -> (tempfile::TempDir, Shared) {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let paths = Paths { config: dir.path().join("config.toml"), state: dir.path().join("state.toml") };
+        crate::config::save(&paths.config, &ConfigFile::default()).expect("saving the fixture config");
+        (dir, Shared::new(App::new(paths), false, "test-token".to_string()))
+    }
+
+    fn config(id: u64) -> TunnelConfig {
+        TunnelConfig {
+            id,
+            name: format!("t{id}"),
+            kind: ForwardKind::Local,
+            ssh_host: "h".into(),
+            local_addr: "127.0.0.1".into(),
+            local_port: 8080,
+            remote_host: "127.0.0.1".into(),
+            remote_port: 80,
+            enabled: true,
+            auto_restart: false,
+            ssh_options: vec![],
+            note: String::new(),
+            created_at: 0,
+        }
+    }
+
+    /// The reported bug, end to end inside one process: the event pump moves a row
+    /// to `Up` without applying any command, so `revision` does not move — and the
+    /// old implementation therefore published nothing, leaving every window on
+    /// `◐ 连接中` forever while `ssh <host>` worked.
+    #[test]
+    fn a_status_change_from_the_event_pump_is_published() {
+        let (_dir, shared) = shared_with_one_tunnel();
+        shared.with_app(|app| {
+            app.tunnels.push(crate::model::TunnelView::new(config(1)));
+            app.tunnels[0].status = TunnelStatus::Starting { since: Instant::now() };
+        });
+
+        // First tick: the state has never been sent, so it must be.
+        assert!(shared.publish_if_changed(), "the initial state must reach the clients");
+
+        // Nothing changed: a second tick must stay quiet, or every client would be
+        // republished five times a second forever.
+        let revision_before = shared.revision();
+        assert!(!shared.publish_if_changed(), "an idle tick must not publish");
+        assert_eq!(shared.revision(), revision_before, "an idle tick must not invent a revision");
+
+        // `Ready` arrives from the tunnel thread. No command is applied, so the
+        // revision is untouched — this is precisely the case the old code missed.
+        shared.with_app(|app| app.tunnels[0].status = TunnelStatus::Up { since: Instant::now() });
+        assert_eq!(shared.revision(), revision_before, "the pump must not bump the revision");
+        assert!(shared.publish_if_changed(), "a row that came up must reach every window");
+
+        // And it settles again once the clients have it.
+        assert!(!shared.publish_if_changed(), "a published change must not repeat on every tick");
+    }
+
+    /// A log line is a change too: it is what the detail panel renders, and a
+    /// reconnect loop that only ever logs would otherwise look frozen.
+    #[test]
+    fn a_log_line_from_the_event_pump_is_published() {
+        let (_dir, shared) = shared_with_one_tunnel();
+        shared.with_app(|app| {
+            app.tunnels.push(crate::model::TunnelView::new(config(1)));
+            app.tunnels[0].status = TunnelStatus::Up { since: Instant::now() };
+        });
+        assert!(shared.publish_if_changed());
+
+        shared.with_app(|app| app.on_line(1, "已连接 10.0.0.1".into()));
+        assert!(shared.publish_if_changed(), "a progress line must reach the detail panel");
+        assert!(!shared.publish_if_changed());
+    }
+
+    /// A retry being scheduled is a state change with no command behind it.
+    #[test]
+    fn a_scheduled_retry_is_published() {
+        let (_dir, shared) = shared_with_one_tunnel();
+        shared.with_app(|app| {
+            app.tunnels.push(crate::model::TunnelView::new(config(1)));
+            app.tunnels[0].status = TunnelStatus::Up { since: Instant::now() };
+        });
+        assert!(shared.publish_if_changed());
+
+        shared.with_app(|app| {
+            app.tunnels[0].status = TunnelStatus::Retrying {
+                attempt: 2,
+                next_at: Instant::now(),
+                reason: FailureInfo::new(FailureKind::Timeout, "read timed out"),
+            };
+        });
+        assert!(shared.publish_if_changed(), "a scheduled retry must be visible to every window");
     }
 }

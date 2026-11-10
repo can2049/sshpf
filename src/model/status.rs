@@ -88,6 +88,8 @@ impl LogLine {
 pub struct LogRing {
     buf: VecDeque<LogLine>,
     cap: usize,
+    /// How many writes this ring has seen. See [`LogRing::generation`].
+    generation: u64,
 }
 
 impl LogRing {
@@ -97,7 +99,7 @@ impl LogRing {
         // whole point of this type, so enforce it here rather than at every
         // call site.
         let cap = cap.max(1);
-        LogRing { buf: VecDeque::with_capacity(cap.min(1024)), cap }
+        LogRing { buf: VecDeque::with_capacity(cap.min(1024)), cap, generation: 0 }
     }
 
     pub fn push(&mut self, line: LogLine) {
@@ -105,6 +107,17 @@ impl LogRing {
             self.buf.pop_front();
         }
         self.buf.push_back(line);
+        self.generation = self.generation.saturating_add(1);
+    }
+
+    /// How many times this ring has been written to.
+    ///
+    /// Exists for one question, asked once per server tick: "is there anything new
+    /// here?" — see [`TunnelSignature`]. A counter answers it in O(1) and, unlike
+    /// `len()`, still changes when a *full* ring is written to (the oldest line is
+    /// evicted, so the length stays put while the contents change).
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = &LogLine> {
@@ -119,12 +132,18 @@ impl LogRing {
         self.buf.len()
     }
 
+    /// How many lines this ring holds before evicting.
+    pub fn capacity(&self) -> usize {
+        self.cap
+    }
+
     pub fn is_empty(&self) -> bool {
         self.buf.is_empty()
     }
 
     pub fn clear(&mut self) {
         self.buf.clear();
+        self.generation = self.generation.saturating_add(1);
     }
 
     /// Last `n` lines, oldest first.
