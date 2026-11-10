@@ -294,7 +294,7 @@ fn run_tui(paths: Paths, args: &cli::Args, started: Instant) -> std::io::Result<
 /// caller exits with failure rather than starting a UI that has no server behind
 /// it.
 fn attach_or_report(paths: &Paths, args: &cli::Args) -> std::io::Result<Option<sshpf::client::Session>> {
-    match sshpf::client::run(&paths.config, args.config.is_some()) {
+    match sshpf::client::run(&paths.config, args.config.is_some(), args.no_restore) {
         Ok(session) => Ok(Some(session)),
         Err(e) => {
             logging::error("client.attach_failed", &[("msg", &e.message())]);

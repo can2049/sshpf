@@ -32,6 +32,7 @@
 //! | [`a_new_client_during_the_grace_window_cancels_the_shutdown`] | reopening inside that window keeps the tunnels up |
 //! | [`only_one_server_can_hold_the_config`] | the singleton lock, across processes |
 //! | [`keep_server_survives_its_last_client`] | `--keep-server` opts out of "last one out turns off the lights" |
+//! | [`a_status_change_from_the_event_pump_reaches_the_client`] | state the pump changed **without a command** is still broadcast |
 //! | [`check_mode_never_starts_a_server`] | `--check` stays a pure read |
 //!
 //! # Timeouts, not sleeps
@@ -705,6 +706,106 @@ fn keep_server_survives_its_last_client() {
     let again = attach(&env);
     assert_eq!(again.snapshot.tunnels.len(), env.tunnels, "the kept server must still serve the tunnels");
     assert!(again.snapshot.keep_server, "the flag must still be reported after the restart of a session");
+}
+
+// ---------------------------------------------------------------------------
+// state the event pump changes on its own
+// ---------------------------------------------------------------------------
+
+/// A status change the event pump produced — **no command behind it** — must still
+/// reach the clients.
+///
+/// This is the reported bug, across real processes. The pump ticks, notices a tunnel
+/// event, updates the owner `App`… and the old publish check compared only
+/// `revision`, which moves when a *command* is applied and not when a tunnel event
+/// arrives. So the change was applied to the state and never broadcast: every window
+/// kept drawing `◐ 连接中` for a forward that had been listening for minutes, while
+/// `ssh <host>` from the same terminal worked fine.
+///
+/// # How this isolates the trigger
+///
+/// The `Start` command itself moves the revision, so the *first* snapshot proves
+/// nothing — the revision alone explains it. The proof is the **second** one: a
+/// snapshot describing a different state at the *same* revision. No command runs
+/// after `Start`, so only a signature-driven publish can produce it.
+///
+/// A single failed connect is not enough to observe that reliably: the DNS failure
+/// can land before the pump's first tick, collapsing `Starting` and `Failed` into
+/// one snapshot. So the fixture keeps retrying (`auto_restart = true`), which cycles
+/// `Retrying → Starting → Retrying` forever — **all at the same revision**. Counting
+/// the distinct states seen at one fixed revision is therefore a direct measure of
+/// "did the pump publish changes nobody commanded?".
+#[test]
+fn a_status_change_from_the_event_pump_reaches_the_client() {
+    let env = TempEnv::new(1);
+
+    // `.invalid` is reserved (RFC 2606) and cannot resolve, so every attempt fails
+    // quickly and without touching the network.
+    std::fs::write(
+        &env.config,
+        "version = 1\n[defaults]\nretry_initial_secs = 1\nretry_max_secs = 1\nhealth_check_secs = 0\n\n\
+         [[tunnels]]\nid = 1\nname = \"doomed\"\nkind = \"local\"\n\
+         ssh_host = \"sshpf-test-host-that-cannot-resolve.invalid\"\n\
+         local_addr = \"127.0.0.1\"\nlocal_port = 17001\n\
+         remote_host = \"127.0.0.1\"\nremote_port = 8001\n\
+         enabled = false\nauto_restart = true\n",
+    )
+    .expect("writing the fixture config");
+
+    let server = ServerGuard::start(&env, "pump", &[]);
+    server.published_port(&env.endpoint, 15);
+    let mut client = attach(&env);
+
+    assert_eq!(
+        client.latest.tunnels[0].status,
+        sshpf::ipc::WireStatus::Stopped,
+        "the tunnel must start stopped, or the fixture proves nothing"
+    );
+
+    // The one and only command in this test.
+    let start = ClientMsg::Command {
+        req_id: 1,
+        expect_rev: Some(client.latest.revision),
+        op: sshpf::ipc::Op::Start { tunnel_id: 1 },
+    };
+    ipc::write_message(&mut client.stream, &start).expect("the start command must be writable");
+
+    // Lock onto the revision of the first snapshot that is no longer `Stopped`: that
+    // is the state the command produced, and everything after it must arrive without
+    // another command.
+    let first = drain_until(&mut client.stream, 15, |msg| match msg {
+        ServerMsg::Snapshot(s) => !matches!(s.tunnels[0].status, sshpf::ipc::WireStatus::Stopped),
+        _ => false,
+    });
+    let first = match first {
+        Ok(ServerMsg::Snapshot(s)) => s,
+        Ok(other) => panic!("expected a snapshot, got {other:?}"),
+        Err(e) => panic!("the start command was never published: {e}; {}", server.diagnostics()),
+    };
+    let revision = first.revision;
+    let mut states = std::collections::BTreeSet::new();
+    states.insert(format!("{:?}", first.tunnels[0].status));
+
+    // Collect everything the server publishes at that same revision. A retry every
+    // second means a second distinct state is due well inside this window; a slow CI
+    // machine only makes the test slower, not flaky.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline && states.len() < 2 {
+        if let Next::Msg(ServerMsg::Snapshot(s)) = read_next(&mut client.stream, 500)
+            && s.revision == revision
+        {
+            states.insert(format!("{:?}", s.tunnels[0].status));
+        }
+    }
+
+    assert!(
+        states.len() >= 2,
+        "the pump applied {} distinct state(s) at revision {revision} but only {} reached the \
+         client: the client was never told the forward changed. States seen: {states:#?}; {}",
+        "at least two",
+        states.len(),
+        server.diagnostics()
+    );
 }
 
 // ---------------------------------------------------------------------------

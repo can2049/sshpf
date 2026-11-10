@@ -28,6 +28,17 @@
 
 见 `src/app/mirror.rs`。这就是为什么 `ui`/`keys`/`form` 一行都不用改。
 
+### 恢复 `enabled` 只在 server 里发生一次
+
+`App::restore_enabled` 由 [`server::run`](../../src/server.rs) 在起 pump 之前调用**一次**；
+client 的 `prepare_app` 遇到 mirror 会直接 return，所以两处不会抢。
+`--no-restore` 由此也必须是 **server 侧**的开关：client 通过 `SpawnRequest` 的
+`--no-restore` 参数把它传给拉起的 server（`src/client/spawn.rs`）。
+
+> 这曾是实测缺陷：`--server` 从不调用 `restore_enabled`，于是配置写着
+> `restore_on_start = true`、单进程版也照做，**只有 client-server 路径静默不恢复**——
+> 服务端启动后每条转发都是 `Stopped`，直到用户按 `a`。
+
 ## 传输层为什么用回环 TCP / Why loopback TCP
 
 | 方案 | Linux | Windows |
@@ -67,6 +78,27 @@ client 线程 ─► 帧 ─► sync::drain（每帧一次）─► 丢弃旧 re
 | 只发**全量**快照，不发增量 | 丢一帧、重一帧都不会让某个窗口永久落后 |
 | `revision` 单调，旧的不覆盖新的 | 乱序到达不该让表格倒退 |
 | 快照只替换**共享**部分 | 光标、浮层、正在填的表单属于这一屏，不能被别人的改动关掉 |
+
+### 什么时候发 / When a snapshot goes out
+
+泵每 200ms 问一次「客户端需要被告知吗」，有**两个独立的触发条件**，缺一个就会出
+「明明连上了却一直显示连接中」：
+
+| 触发 | 由谁产生 | 漏掉它的后果 |
+|---|---|---|
+| `revision` 变了 | 一条**命令**被应用（[`commands`](../src/server/commands.rs)） | 客户端拿不到新的 `expect_rev` |
+| **内容签名**变了 | 事件泵自己做的任何事：`Ready`、安排重试、进度行、会话结束 | **转发已经通了，所有窗口却一直停在 `◐ 连接中`** |
+
+第二行是曾经的实测缺陷。`revision` 只在命令路径上自增，而 `Ready` 来自隧道线程、
+根本不经过命令，于是泵认为「没变化」、什么都不发——用户看到界面一直转圈，
+但在同一个终端里 `ssh <host>` 却是通的。判据必须是**客户端会看到什么**，
+不能是**谁改的**。
+
+签名（[`signature`](../src/server/signature.rs)）只保留读者能感知的部分：
+每条隧道的 `TunnelStatus`（含 `Instant`）、`retries`、日志环的**写入计数**
+（不是 `len()`——环满时压入会逐出最旧的，长度不变而内容已变），外加 `client_count`。
+时钟读数一律不入签名：快照的时间戳每次都要重新取，带上它们会让「无变化」永不成立，
+从而每 200ms 全量广播一次。
 
 **client 从不读自己的墙钟**：`Instant` 是进程内单调钟，跨进程无意义，所以 wire 上一律是 server 时钟的毫秒戳，client 用「与 `server_now_ms` 的差值」重建本地 `Instant`。两台机器的时钟差 5 分钟也不影响"已运行 3m"的显示。
 
@@ -116,6 +148,7 @@ client 发的是**意图**（启动这条、删那条），不是指令。server
 | 症状 | 先看 |
 |---|---|
 | 两个窗口内容不一样 | `grep 'event=server.client_connected\|server.grace' 日志`（同一个日志文件，两个角色都写） |
+| **界面一直显示「连接中」，但端口其实在监听** | 这是「泵不发快照」的特征。先确认端口：`netstat -ano \| findstr :<端口>`。若确实在监听而界面不动，检查 `server::signature` 是否漏了某个可观察字段 |
 | 关了窗口转发还在 | 是不是 `--keep-server`？看 `server.shutdown_begin` 有没有出现 |
 | 关了窗口转发全停了，但还有别的窗口 | 那个窗口是否已崩溃/被 kill；`server.client_disconnected` 的 `reason` |
 | 「已有 server 在运行该配置」 | 正常：`--server` 是单例，第二个以 0 退出 |

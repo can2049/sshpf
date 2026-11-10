@@ -54,6 +54,7 @@ pub fn start(config_path: Paths, args: &Args) -> std::process::ExitCode {
         keep_server: args.keep_server,
         host_key_policy: args.host_key_policy(),
         trigger: ShutdownTrigger::Process,
+        no_restore: args.no_restore,
     };
     match run(config_path, server_args, *identity) {
         Ok(()) => {
