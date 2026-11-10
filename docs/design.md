@@ -155,3 +155,8 @@ panic 走 hook（链式调用上一个，所以 ratatui 恢复终端照常生效
 ## D36 连通性靠主动探活，不靠 accept 循环
 `-L`/`-D` 的就绪判据是 `bind` 成功，而**已建立的会话死亡对 listener 完全不可见**：`accept()` 照样返回，每条连接随后都失败，状态列永远 `●`。修法是每 `health_check_secs` 发 `keepalive@openssh.com` 并等回复。探活放在**隧道线程**里而不是另起 task——另起 task 会让 serve 循环继续陪伴死会话，那正是要修的 bug。也**不新增状态机**：`StaleConnection` 只是普通的网络类失败分类。
 → [runtime.md](runtime.md#健康检查--health-checks) · `src/ssh/client/health.rs`、`src/ssh/client/driver.rs`、`src/model/failure.rs`
+
+## D37 宽度用 `unicode-width` 量字符串，不手维护区间表、不逐字符相加
+原先 `text.rs` 手维护一张 East-Asian 宽度区间表，并假设 `display_width` = 各字符宽度之和。两个假设都是错的：① 表只返回 1 或 2，**永远不返回 0**，于是组合符（combining mark）、零宽连接符（ZWJ）、变体选择符都被当成占一列；② **字符串宽度不是逐字符相加**——ZWJ 序列 `👨‍👩‍👧` 是一个 2 列字形，逐字符相加得 8。表格里带 emoji 的行因此整体错位。
+现在 `char_width` / `display_width` 直接走 `unicode-width`（UAX #11）。**零新增依赖**：它早已在依赖树里（经 `ratatui-core`），提升为直接依赖只是让本模块与终端、ratatui 用同一把尺子。代价是三条连带规则，都写进了 `src/text.rs` 的头注释：字符宽度可能是 **0**；`display_width` 必须**量整串**；因此 `truncate_to_width` 与 `wrap` 用**前缀测量**而不是累加，否则会超出预算或截断字形。
+→ `src/text.rs`、`Cargo.toml`（`unicode-width`）
