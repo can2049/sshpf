@@ -81,15 +81,6 @@ impl App {
             eventlog::orphan_event("start", id);
             return;
         };
-        // A mirror does not own the tunnel: the server decides whether it can
-        // start (and is the only process holding the `Supervisor`), so the
-        // request goes over the wire and this process only shows the result when
-        // the next snapshot arrives. The intent is still recorded locally, so a
-        // log read from the client side shows what the user asked for.
-        if self.forward(crate::ipc::Op::Start { tunnel_id: id }) {
-            eventlog::tunnel_start_requested(&cfg, trigger);
-            return;
-        }
         eventlog::tunnel_start_requested(&cfg, trigger);
         self.arm_retry(id);
 
@@ -253,14 +244,6 @@ impl App {
         }
     }
 
-    /// Stop the supervised thread for `id`, leaving the row's status alone.
-    ///
-    /// Split out so `server_api` can bounce a session without reaching into the
-    /// private `supervisor` field, and so the "stop the thread" step has one name.
-    pub(crate) fn supervisor_stop_inner(&mut self, id: TunnelId) {
-        self.supervisor.stop(id);
-    }
-
     /// Stop one tunnel and clear its `enabled` flag (user intent).
     pub fn stop_tunnel(&mut self, id: TunnelId) {
         self.stop_tunnel_with(id, "manual");
@@ -271,12 +254,6 @@ impl App {
         match self.tunnels.iter().find(|t| t.cfg.id == id) {
             Some(view) => eventlog::tunnel_stopped(&view.cfg, trigger),
             None => eventlog::orphan_event("stop", id),
-        }
-        // A mirror asks the owner to stop; the row keeps its current status until
-        // the next snapshot confirms, so the UI never claims a state nobody has
-        // verified.
-        if self.forward(crate::ipc::Op::Stop { tunnel_id: id }) {
-            return;
         }
         self.supervisor.stop(id);
         self.forget_runtime_state(id);

@@ -91,10 +91,15 @@ fn every_logged_event_is_in_the_catalogue() {
         "docs/logging/events.md has no row for these events (write the name in backticks):\n{}",
         missing.join("\n")
     );
-    // A scanner that found nothing would pass vacuously; the catalogue is large,
-    // so the source side must be too.
+    // A scanner that found nothing would pass vacuously. The bound is deliberately
+    // a floor rather than an exact count: it must survive events being added or
+    // removed, and only catch a scanner that has stopped reading the sources (a
+    // regex change, an `include_str!` pointing at a moved file). The four
+    // vocabulary modules emit ~60 names, so a floor of 40 leaves room for the
+    // ordinary churn of adding and retiring events while still failing on
+    // "found almost nothing".
     let total: usize = EVENTLOG_SOURCES.iter().map(|(_, src)| event_names(src).len()).sum();
-    assert!(total > 60, "the event scan found only {total} events, so it is not reading the sources");
+    assert!(total > 40, "the event scan found only {total} events, so it is not reading the sources");
 }
 
 /// Every `eventlog` module that owns `event=` names.

@@ -166,12 +166,6 @@ impl App {
                     }
                 }
                 BatchAction::Restart => {
-                    // One command to the owner (see `ConfirmAction::Restart`): a
-                    // mirror has no supervisor to stop first.
-                    if self.forward(crate::ipc::Op::Restart { tunnel_id: *id }) {
-                        changed += 1;
-                        continue;
-                    }
                     self.supervisor.stop(*id);
                     self.forget_runtime_state(*id);
                     self.start_tunnel_with(*id, "batch");

@@ -46,10 +46,9 @@ pub(crate) fn draw_title(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         format!("ssh-config: {} hosts", app.hosts.len())
     };
-    // Which process owns the state, and how many windows are sharing it. This is
-    // not decoration: closing the last client stops every forward, so the user
-    // has to be able to see that they are one of several — or the only one.
-    let session = session_label(app);
+    // Who owns the forwards. Not decoration: it is the answer to "is some other
+    // process holding my port", which used to be the hardest question here.
+    let session = session_label();
     // Progressive disclosure: the absolute config path is the first thing to go
     // when it would collide with the clock, then the host count.
     let left = if area.width >= 84 {
@@ -75,21 +74,14 @@ pub(crate) fn draw_title(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(Line::from(Span::styled(clock, p.fg(p.dim)))), clock_area);
 }
 
-/// `server` when this process owns the tunnels, `client 2/3` when it is one of
-/// several windows on a shared server.
+/// Whether this process owns the tunnels.
 ///
-/// The count is the server's, not a local guess, so two windows always agree about
-/// how many are open. It comes from the latest snapshot ([`App::client_count`]) and
-/// is therefore never a number this client invented.
-fn session_label(app: &App) -> String {
-    if !app.is_mirror() {
-        return help::bi("服务端/server", "server");
-    }
-    // `help::bi` joins the two halves itself, so each argument carries only its own
-    // language: the Chinese half must not repeat the English one or the title bar
-    // reads "客户端 2/client 2 client 2".
-    let n = app.client_count.max(1);
-    help::bi(&format!("客户端 {n}"), &format!("client {n}"))
+/// Always true now: one process owns every forward, so the title bar states it
+/// rather than leaving the reader to wonder whether some other process does. The
+/// label is kept because it is the first thing to look at when a forward "does
+/// not work" — the answer to "who owns this" is on screen.
+fn session_label() -> String {
+    help::bi("单进程/owner", "owner")
 }
 
 pub(crate) fn draw_counters(frame: &mut Frame, app: &App, area: Rect) {

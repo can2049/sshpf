@@ -14,15 +14,12 @@
 
 pub mod app;
 pub mod cli;
-pub mod client;
 pub mod config;
 pub mod eventlog;
 pub mod help;
-pub mod ipc;
 pub mod keys;
 pub mod logging;
 pub mod model;
-pub mod server;
 pub mod ssh;
 pub mod sys;
 pub mod text;

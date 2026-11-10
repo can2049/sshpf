@@ -29,7 +29,6 @@ pub mod form_submit;
 pub mod helpers;
 pub mod import;
 pub mod import_pane;
-pub mod mirror;
 pub mod mouse;
 pub mod overlay;
 pub mod persist;
@@ -39,11 +38,9 @@ pub mod port_scan;
 pub mod query;
 pub mod runtime;
 pub mod select;
-pub mod server_api;
 
 pub(crate) use helpers::deadline_after;
 pub use helpers::{backoff, build_views, sanitize_config};
-pub use mirror::Mirror;
 
 pub use form::{EditMode, FormState};
 
@@ -158,20 +155,6 @@ pub struct App {
     /// field is the hand-off between them. Empty for a clean config, which is the
     /// normal case.
     pub folded_on_load: Vec<crate::model::Folded>,
-    /// The client-server outbox, when this process is a **mirror** rather than the
-    /// owner of the tunnels.
-    ///
-    /// `None` is the single-process owner: every mutation acts on this process's
-    /// own `Supervisor`. `Some` means the truth lives in a server and every
-    /// mutating method must forward instead of acting — see [`app::mirror`].
-    pub(crate) mirror: Option<Mirror>,
-    /// How many clients the server says are attached (from the latest snapshot).
-    ///
-    /// Drives the "you are the last client" warning on quit. Always `1` for an
-    /// owner, which is exactly right: a single-process sshpf has one client.
-    pub client_count: u32,
-    /// Whether the server outlives its clients (mirrors the snapshot's flag).
-    pub keep_server: bool,
 }
 
 impl App {
@@ -229,10 +212,6 @@ impl App {
             port_seq: 0,
             pending_port_skipped: Vec::new(),
             folded_on_load,
-            mirror: None,
-            // A process that owns its tunnels has exactly one client: itself.
-            client_count: 1,
-            keep_server: false,
         }
     }
 
@@ -342,12 +321,6 @@ impl App {
         if let Some(view) = self.tunnels.iter().find(|t| t.cfg.id == id) {
             eventlog::tunnel_deleted(&view.cfg);
         }
-        // A mirror asks the owner to delete: the config file is the server's to
-        // write, and removing the row locally would make the table disagree with
-        // the file until the next snapshot put it back.
-        if self.forward(crate::ipc::Op::Delete { tunnel_id: id }) {
-            return;
-        }
         self.supervisor.stop(id);
         self.forget_runtime_state(id);
         self.cfg.tunnels.retain(|t| t.id != id);
@@ -376,9 +349,6 @@ impl App {
     }
 
     pub fn start_all(&mut self) {
-        if self.forward(crate::ipc::Op::StartAll) {
-            return;
-        }
         let ids: Vec<TunnelId> =
             self.tunnels.iter().filter(|t| !t.status.is_running_or_pending()).map(|t| t.cfg.id).collect();
         for id in ids {
@@ -387,9 +357,6 @@ impl App {
     }
 
     pub fn stop_all(&mut self) {
-        if self.forward(crate::ipc::Op::StopAll) {
-            return;
-        }
         let ids: Vec<TunnelId> = self.tunnels.iter().map(|t| t.cfg.id).collect();
         for id in ids {
             self.stop_tunnel_with(id, "stop_all");
@@ -398,15 +365,6 @@ impl App {
 
     /// Stop every tunnel immediately without touching persisted intent.
     pub fn shutdown(&mut self) {
-        // A mirror owns no `Supervisor`, so there is nothing here to stop — the
-        // tunnels belong to the server and outlive this process by design. It says
-        // goodbye (`Bye`) through the connection thread instead; the server
-        // decides, by recounting, whether that goodbye ends the server.
-        // Inspecting the supervisor here would be the bug the split exists to
-        // prevent, so this branch is deliberately first.
-        if self.is_mirror() {
-            return;
-        }
         let up = self.tunnels.iter().filter(|t| t.status.is_active()).count();
         logging::info("app.shutdown", &[("tunnels_active", &up), ("running", &self.supervisor.running_count())]);
         self.supervisor.stop_all();
