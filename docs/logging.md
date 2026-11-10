@@ -4,31 +4,26 @@
 > **不负责**：每个 `event=` 是什么（**完整事件目录在 [logging/events.md](logging/events.md)**）、安全政策（见 [security.md](security.md)）。
 > **相关代码路径**：`src/logging/`（写入/轮转/崩溃）、`src/eventlog/`（事件词汇，`event=` 的唯一真相）。
 
-## 为什么有第二份日志
+## 两条日志通道，不合并
 
-TUI 的详情面板已经有一份日志（`model::LogRing`），但它活在内存里、进程一退就没了、且只覆盖单条隧道——这三个属性恰好都在**出问题之后**变成致命缺陷：崩溃时没有界面可读；要贴给别人必须是**文件**；"一小时前开始不对劲"需要跨隧道的时间线。
-
-所以另开一条落盘通道。两者**不合并**：面板要"当下这条隧道发生了什么"，文件要"事后能不能还原现场"，容量、留存、格式要求不同。
+TUI 详情面板的日志（`model::LogRing`）活在内存里、进程一退就没了、只覆盖单条隧道——这三个属性恰好都在**出问题之后**变成致命缺陷：崩溃时没有界面可读；要贴给别人必须是**文件**；"一小时前开始不对劲"需要跨隧道的时间线。所以另开一条落盘通道：面板要"当下这条隧道发生了什么"，文件要"事后能不能还原现场"。
 
 ## 位置与轮转
 
-```
+```text
 ~/.local/state/sshpf/logs/sshpf.log        ← 当前文件
 ~/.local/state/sshpf/logs/sshpf.log.1      ← 上一次轮转（.1 最新）
-~/.local/state/sshpf/logs/sshpf.log.2
-~/.local/state/sshpf/logs/sshpf.log.3      ← 保留 3 个归档
+…  .2  …  .3                               ← 保留 3 个归档
 ```
 
 | 属性 | 值 |
 |---|---|
 | 目录 / 文件权限 | `0700` / `0600`（日志里有主机名、端口、用户名） |
-| 轮转阈值 | 单文件 2 MiB（`DEFAULT_MAX_BYTES`） |
-| 归档数 | 3（`DEFAULT_KEEP`）⇒ 磁盘上限约 8 MiB |
+| 轮转阈值 / 归档数 | 单文件 2 MiB（`DEFAULT_MAX_BYTES`）/ 3（`DEFAULT_KEEP`）⇒ 磁盘上限约 8 MiB |
 | 写入方式 | **追加**，不覆盖历史；想清空直接删文件，下次运行重建 |
 | 顺序 | **先轮转，再写**——所以一条记录**永远不会跨两个文件** |
 | 归档重命名失败 | 一律忽略（丢历史好过丢当下） |
-| `SSHPF_LOG_DIR` | 换目录 |
-| `SSHPF_LOG_LEVEL` | `off\|error\|warn\|info\|debug`，默认 `info` |
+| `SSHPF_LOG_DIR` / `SSHPF_LOG_LEVEL` | 换目录 / `off\|error\|warn\|info\|debug`，默认 `info` |
 
 `off` 只关常规记录，**崩溃记录照写**——想把日志关掉的人，往往正是最需要那一行崩溃信息的人。
 
@@ -53,9 +48,9 @@ TUI 的详情面板已经有一份日志（`model::LogRing`），但它活在内
 | 隧道身份 | `tunnel` `name` `forward` `listen` `target` `host`，固定 6 个且在最前 ⇒ `grep 'tunnel=3 '` 就是完整时间线 |
 | 其它字段 | `key=value` |
 
-**不用 JSON**：这个文件的读者是"拿着终端排障的人"和 `grep`/`awk`，不是日志聚合器。JSON 每行重复键名，肉眼扫起来噪声占一半；`key=value` 用 `grep 'tunnel=3 '` 就能切出时间线。真需要机器消费时，这个格式解析也只比 JSON 多一行 `split`。
+**不用 JSON**：读者是"拿着终端排障的人"和 `grep`/`awk`，不是日志聚合器。JSON 每行重复键名，肉眼扫起来噪声占一半；`key=value` 用 `grep 'tunnel=3 '` 就能切出时间线，真需要机器消费时也只多一行 `split`。
 
-**值必须转义**：含空白/引号/反斜杠/控制字符的值一律加引号并转义（`\n` `\r` `\t` `\\` `\"` `\xNN`），键名与事件名把这类字符替换成 `_`。记录里塞进裸换行会把一条日志劈成两条，后面所有按行处理全部错位。有测试钉住"一条记录不跨行"。
+**值必须转义**：含空白/引号/反斜杠/控制字符的值一律加引号并转义（`\n` `\r` `\t` `\\` `\"` `\xNN`），键名与事件名把这类字符替换成 `_`。裸换行会把一条日志劈成两条，后面所有按行处理全部错位。有测试钉住"一条记录不跨行"。
 
 ## 级别策略
 
@@ -68,7 +63,7 @@ TUI 的详情面板已经有一份日志（`model::LogRing`），但它活在内
 | `INFO` | 预期内生命周期，足以在不看 UI 的情况下重建一次会话 | `app.start`、`tunnel.ready`、`action.applied` |
 | `DEBUG` | 高频细节：每条转发行、每次 SOCKS5 失败 | `tunnel.line`、`socks5.rejected` |
 
-关键判断：**掉线（`was_up=true`）是 WARN，从未连上的失败是 ERROR。** 前者网络抖了一下、系统会自己重连；后者要用户动手。同理 `tunnel.failed` 带 `retryable` 字段——读者不用去猜"这个错等一下会不会自己好"。
+关键判断：**掉线（`was_up=true`）是 WARN，从未连上的失败是 ERROR。** 前者网络抖了一下、系统会自己重连；后者要用户动手。同理 `tunnel.failed` 带 `retryable` 字段——读者不用猜"这个错等一下会不会自己好"。
 
 **高频路径不写**：`tunnel.line` / `socks5.rejected` / `forward.target_failed`（线程侧）只在 `DEBUG` 写，且**先查级别再拼字符串**（`logger.enabled(Level::Debug)` 短路），避免为了丢弃而格式化。
 
@@ -76,31 +71,12 @@ TUI 的详情面板已经有一份日志（`model::LogRing`），但它活在内
 
 两条独立通路。机制与 `unsafe` 边界见 [security.md](security.md#崩溃捕获--crash-capture)。
 
-### panic
-
-```
-… ERROR seq=42 event=crash.panic thread=sshpf-tunnel-3 location=src/app.rs:112:9 msg="index out of bounds" backtrace=yes
-… ERROR seq=43 event=crash.panic.trace msg="  | panic backtrace\n  |    0: sshpf::tunnel::run\n  | …"
-```
-
-- `thread` 是关键：隧道各自跑在自己的线程上（`sshpf-tunnel-<id>`），线程名能区分"UI 线程挂了"和"某条隧道的线程挂了"——后者在状态列上看起来只是"没连上"。
-- 栈最多 25 帧，且走**单独一条记录**、每行 `  | ` 前缀（保持"一条记录一行"，让 `grep event=` 仍然有效）。
-
-### 致命信号（`SIGSEGV` / `SIGBUS` / `SIGABRT` / `SIGILL` / `SIGFPE`）
-
-```
-ts=1794000000 ERROR seq=0 event=crash.signal signal=11 name=SIGSEGV pid=4242
-```
-
-这一类**没有格式化时间戳**，只有 `ts=<epoch 秒>`：信号处理器里只能用 async-signal-safe 调用，`localtime_r` 首次调用会分配内存。其余字段仍是 `key=value`，解析器不用开特例。
-
-### 日志重入
-
-```
-ts=1794000000 ERROR seq=0 event=crash.log_reentrant cause=crash.panic msg="日志写入重入，记录被跳过以避免死锁"
-```
-
-看到它说明：**日志里缺了一条 panic 记录，但进程确实是 panic 死的**，栈要去 stderr 或 `RUST_BACKTRACE=1` 重跑一次拿。
+| 事件 | 样子 | 读法 |
+|---|---|---|
+| `crash.panic` | `… ERROR seq=42 event=crash.panic thread=sshpf-tunnel-3 location=src/app.rs:112:9 msg="index out of bounds" backtrace=yes` | `thread` 是关键：隧道各自跑在自己的线程上（`sshpf-tunnel-<id>`），线程名能区分"UI 线程挂了"和"某条隧道的线程挂了"——后者在状态列上看起来只是"没连上" |
+| `crash.panic.trace` | `… ERROR seq=43 event=crash.panic.trace msg="  \| panic backtrace\n  \|    0: …"` | 栈最多 25 帧，且走**单独一条记录**、每行 `  \| ` 前缀（保持"一条记录一行"，让 `grep event=` 仍然有效） |
+| `crash.signal` | `ts=1794000000 ERROR seq=0 event=crash.signal signal=11 name=SIGSEGV pid=4242` | `SIGSEGV`/`SIGBUS`/`SIGABRT`/`SIGILL`/`SIGFPE`。**没有格式化时间戳**，只有 `ts=<epoch 秒>`：信号处理器里只能用 async-signal-safe 调用，`localtime_r` 首次调用会分配内存 |
+| `crash.log_reentrant` | `ts=… ERROR seq=0 event=crash.log_reentrant cause=crash.panic msg="日志写入重入，记录被跳过以避免死锁"` | 说明：**日志里缺了一条 panic 记录，但进程确实是 panic 死的**，栈要去 stderr 或 `RUST_BACKTRACE=1` 重跑一次拿 |
 
 ## 怎么用
 
@@ -158,7 +134,6 @@ grep -E 'event=crash\.|event=tunnel\.thread_panic' "$L"; tail -5 "$L"
 | 断在 | 一次**会话**结束 | 一条**重试链**放弃（退避排了很多次，最后那次也修不好） |
 | 还重试吗 | 看 `retryable` 字段 | 不重试了，到此为止 |
 | 典型 `kind` | `connection_refused` `auth_failed` `timeout` | `port_in_use` `spawn_failed` `dns_failure` |
-| 说明 | 这次连接失败了 | 为什么这一行不再自己忽上忽下 |
 
 一句话：`tunnel.failed` 是"这次没成"，`tunnel.retry_abandoned` 是"别等了"。排查重连风暴时数 `tunnel.retry_scheduled`，看它最后落在哪个。
 
@@ -168,13 +143,13 @@ grep -E 'event=crash\.|event=tunnel\.thread_panic' "$L"; tail -5 "$L"
 grep 'event=tunnel.health_failed' "$L"
 ```
 
-本地 `-L`/`-D` 的 listener 感知不到 SSH 会话已死（`accept()` 照样成功），所以 `●` 不代表通。探活是唯一的证据来源：有这条事件说明**探活已经发现会话失效**，`cause` 指出死法——`ping_timeout`（等 5s 没回复，休眠/断网最常见）、`ping_error`（请求发不出去）、`session_closed`（russh 已关闭）。随后本次运行以 `stale_connection` 结束并走退避重连。
+本地 `-L`/`-D` 的 listener 感知不到 SSH 会话已死（`accept()` 照样成功），所以 `●` 不代表通。有这条事件说明**探活已经发现会话失效**，`cause` 指出死法——`ping_timeout`（等 5s 没回复，休眠/断网最常见）、`ping_error`（请求发不出去）、`session_closed`（russh 已关闭）。随后本次运行以 `stale_connection` 结束并走退避重连。
 
 | 看到 | 结论 / 下一步 |
 |---|---|
 | 有 `health_failed`，随后有 `tunnel.retry_scheduled` | 正常自愈路径，等下一次重连即可 |
 | 有 `health_failed`，但停在 `✗ 失败` | `auto_restart = false`（该条或 `defaults`）：重连被关掉了，按 `r` 或改配置 |
-| **完全没有**这条事件 | 先确认探活没被关：`health_check_secs = 0` 表示人为关闭。**探活成功不写 INFO 日志**（否则每 30s 一条噪声），所以"没有日志"不等于探活没跑 |
+| **完全没有**这条事件 | 先确认探活没被关：`health_check_secs = 0` 表示人为关闭。**探活成功不写 INFO 日志**，所以"没有日志"不等于探活没跑 |
 
 ### 「配置被谁改了」
 
@@ -200,7 +175,7 @@ stdout 写失败（`| head -1` 提前关管道、`> /dev/full`、磁盘满）不
 grep -E 'event=(sshconfig\.include_capped|sshconfig\.load_failed)' "$L"
 ```
 
-`Include` 的待读文件超过 256 个时不再继续展开（防生成式配置卡住 UI 线程），剩余文件不读，导入结果会少。`max` 是上限。收窄 `~/.ssh/config` 的 `Include` 通配即可。
+`Include` 的待读文件超过 256 个时不再继续展开（防生成式配置卡住 UI 线程），剩余文件不读，导入结果会少。`max` 是上限。收窄 `~/.ssh/config` 的 `Include` 通配即可。详见 [import.md](import.md#include总文件数预算--include-budget)。
 
 ### 「确认框里没有名字 / 点了没反应」
 
@@ -208,13 +183,11 @@ grep -E 'event=(sshconfig\.include_capped|sshconfig\.load_failed)' "$L"
 grep -E 'event=(action\.target_missing|import\.click_stale)' "$L"
 ```
 
-- `action.target_missing` → 确认框的目标隧道已不存在（别处删掉了，或按过期 id 操作）。确认框仍会弹（不卡住你），但文案里没有名字，这一行解释了原因。
+- `action.target_missing` → 确认框的目标隧道已不存在（别处删掉了，或按过期 id 操作）。确认框仍会弹（不卡住你），但文案里没有名字。
 - `import.click_stale` → 鼠标点中的导入行已不在当前筛选视图里（hit 图比点击早一帧），这次点击被丢弃。重点一次即可。
 
 ## 隐私
 
-写：主机名、端口、用户名、失败原因、路径、版本、pid、栈。
-**从不写**：私钥内容、passphrase、`known_hosts` 内容、任何从 agent 读出的密钥材料。
+写：主机名、端口、用户名、失败原因、路径、版本、pid、栈。**从不写**：私钥内容、passphrase、`known_hosts` 内容、任何从 agent 读出的密钥材料。
 
-主机名和用户名仍是敏感信息，报 bug 前如果不方便公开，可以先
-`sed -E 's/(host|name)=[^ ]*/\1=REDACTED/g'` 处理一遍。权限与脱敏的完整边界见 [security.md](security.md#日志脱敏--redaction)。
+主机名和用户名仍是敏感信息，报 bug 前如果不方便公开，可以先 `sed -E 's/(host|name)=[^ ]*/\1=REDACTED/g'` 处理一遍。权限与脱敏的完整边界见 [security.md](security.md#日志脱敏--redaction)。

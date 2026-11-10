@@ -4,15 +4,15 @@
 > **不负责**：具体断言内容（读测试本身）、安全政策的理由（见 [security.md](security.md)）。
 > **相关代码路径**：`src/**/#[cfg(test)]`（单元）、`tests/`（集成）、`.github/workflows/ci.yml`（CI）。
 
-## 四层 / Four suites
+## 五层 / Five suites
 
 | 层 | 位置 | 数量级 | 依赖 | 守什么 |
 |---|---|---|---|---|
 | **单元** | 各模块尾部 `#[cfg(test)] mod tests` | 570+ | 无（不 spawn、不 I/O） | 状态机、判定、边界、渲染纯函数 |
-| **覆盖**（源码即断言） | `tests/help_coverage.rs`、`tests/safety_guards.rs` | 9 + 8 | 只读源码 | 帮助不得遗漏/不得撒谎；panic/`unsafe` 政策、模块文档、单文件 ≤400 行、单函数 ≤60 行、测试模块不得被平台 cfg 整段吞掉 |
+| **覆盖**（源码即断言） | `tests/help_coverage.rs`、`tests/safety_guards.rs` | 10 + 8 | 只读源码 | 帮助不得遗漏/不得撒谎；panic/`unsafe` 政策、模块文档、单文件 ≤400 行、单函数 ≤60 行、测试模块不得被平台 cfg 整段吞掉 |
 | **加固**（真二进制） | `tests/logging.rs`、`tests/panic_hardening.rs` | 21 + 13 | 真进程，必须 `--test-threads=1` | 日志全链路、崩溃、恶意输入不 panic |
 | **端到端** | `tests/e2e.rs` | 19 | 真 `sshd`，默认 `#[ignore]` | 三种转发真的通、主机密钥真的拒/真的可忽略、端口真的释放、探活真的发现失效会话 |
-| **策略矩阵** | `tests/host_key_policy.rs` | 10 | 无（真实 `known_hosts` / `~/.ssh/config` 夹具，不 spawn） | 主机密钥判定的完整矩阵：默认拒变更、`ignore` 接受但**不写盘**、`@revoked` 四策略恒拒；逐跳策略、全局开关优先 |
+| **策略矩阵** | `tests/host_key_policy.rs` | 10 | 无（真实 `known_hosts` / `~/.ssh/config` 夹具） | 主机密钥判定完整矩阵：默认拒变更、`ignore` 接受但**不写盘**、`@revoked` 四策略恒拒；逐跳策略、全局开关优先 |
 
 单元测试**跟着被拆模块走**：`src/model/import/table.rs` 的测试就放该文件末尾，不放回 `src/model.rs`。跨模块共用的夹具放 `#[cfg(test)]` 的夹具文件（如 `src/model/fixtures.rs`、`src/ui/test_support.rs`）——不要把一个夹具复制三份。
 
@@ -22,7 +22,7 @@
 cargo test                                     # 单元 + 集成（e2e 默认跳过）
 cargo test --lib                               # 只跑单元（最快，CI 双平台跑这个）
 cargo test --lib model::                       # 只跑某个模块
-cargo test --test help_coverage                # 帮助覆盖（8 个断言，秒级）
+cargo test --test help_coverage                # 帮助覆盖（秒级）
 cargo test --test safety_guards                # 安全/体积政策扫描
 cargo test --test host_key_policy              # 主机密钥策略矩阵（进程内，秒级）
 cargo test --test logging -- --test-threads=1  # 崩溃与日志（会 fork 自杀子进程）
@@ -41,7 +41,7 @@ cargo test --test e2e -- --ignored --test-threads=1   # 真 sshd 端到端
 | `hardening` | ubuntu | `--test logging` 与 `--test panic_hardening`，均 `--test-threads=1` |
 | `e2e` | ubuntu | `cargo test --test e2e -- --ignored --test-threads=1` |
 
-**为什么 `help_coverage` 必须在 `test` job 里单独一行**：`cargo test --lib` 只编译库自身的 `#[cfg(test)]`，不执行 `tests/*.rs`。不写这一行，"每个按键都有帮助"的保证就永远躺在一个 CI 不会跑的文件里。`host_key_policy` 同理：它测的是"密钥变了默认拒绝、显式开启才接受、吊销永不接受"这条安全契约，漏掉就等于没有。
+**为什么 `help_coverage` 必须在 `test` job 里单独一行**：`cargo test --lib` 只编译库自身的 `#[cfg(test)]`，不执行 `tests/*.rs`。不写这一行，"每个按键都有帮助"的保证就永远躺在一个 CI 不会跑的文件里。`host_key_policy` 同理：它测的是"密钥变了默认拒绝、显式开启才接受、吊销永不接受"这条安全契约。
 
 ## 写新测试 / Write a new test
 
@@ -70,7 +70,7 @@ cargo test --test e2e -- --ignored --test-threads=1   # 真 sshd 端到端
 
 ## 变异测试 / Mutation check
 
-补完测试后，**故意改坏关键逻辑**确认测试变红。以下变异历史上全部被捕获（作为"测试真的有效"的证据）：
+补完测试后，**故意改坏关键逻辑**确认测试变红。以下变异历史上全部被捕获：
 
 | 变异 | 捕获它的测试 |
 |---|---|
@@ -99,13 +99,13 @@ cargo test --test e2e -- --ignored --test-threads=1   # 真 sshd 端到端
 - **不许**为了变绿而放宽断言（尤其 `help_coverage` 的双向断言语义）。白名单只能是**常量 + 写明理由的设计决策**。
 - **不许**在单元测试里依赖真实 `~/.ssh/config`、网络或 `sshd`——那是 e2e 的事。
 - **不许**用真实时间 sleep 等待状态；用 `wait_for` 轮询断言（`tests/e2e.rs` 的写法）。
-- 单元测试里的 `.unwrap()` / `.expect()` 是**好断言**（"这里必须是 Some，否则就在这里失败"），`tests/safety_guards.rs` 会屏蔽 `#[cfg(test)]` 区域。
+- 单元测试里的 `.unwrap()` / `.expect()` 是**好断言**，`tests/safety_guards.rs` 会屏蔽 `#[cfg(test)]` 区域。
 
 ## 新增测试的清单 / Checklist
 
 1. 测试放**离被测代码最近**的文件。
 2. 名字说清**行为**，不是"test_foo"：`a_drop_after_up_is_a_warning_while_a_failed_start_is_an_error`。
 3. 断言消息带上下文（把实际值打进 `assert!` 消息），否则 CI 红了还得本地复现。
-4. 如果加了按键/可点控件/事件，同步 [help_coverage](keymap.md) / `HitTarget` / [logging/events.md](logging/events.md)。
+4. 如果加了按键/可点控件/事件，同步 [keymap.md](keymap.md) / `HitTarget` / [logging/events.md](logging/events.md)。
 5. 迁移/拆分时**测试数量必须守恒**：`cargo test --lib -- --list | wc -l` 不能减少。
 6. 跑 `cargo test --lib <模块前缀>` 与 `cargo test --test help_coverage`，两条都绿再交。

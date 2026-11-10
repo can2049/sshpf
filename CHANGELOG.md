@@ -3,7 +3,25 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+> **读历史条目时注意**：条目按当时的事实记录，链接指向当时的文件名。已被后续版本改名的文档
+> （例如 `docs/import-forwards.md` / `import-pane.md` / `import-save.md` / `port-scan.md`
+> 已并入 [docs/import.md](docs/import.md)）在旧条目里保留原名，**不要**为它们补建文件。
+> 当前事实一律以 [docs/index.md](docs/index.md) 指向的文档为准。
+
 ## [Unreleased]
+
+### 变更
+
+- **文档合并**：`import-forwards.md` / `import-pane.md` / `import-save.md` / `port-scan.md`
+  四篇讲的是同一件事（「导入与新增」整条链：发现 → 面板 → 保存 → 对端端口），读者为回答一个
+  问题要开四个文件，所以合成一篇 [docs/import.md](docs/import.md)。
+- **`docs/research/` 精简**：删掉两个不在构建路径上的弃用探针工程
+  （`spike/`、`client-server-spike/`），并压缩调研正文；保留 `design.md` 决策所引用的
+  实测证据与库缺陷复现。该目录仍是**历史调研，不是当前事实**。
+- **测试搬出大文件**：`src/<module>/tests.rs`（`#![cfg(test)]` 整文件门控）接管了 24 个
+  生产文件的尾部测试模块，使每个文件都回到 400 行预算内。测试数量不变（930 条，函数名逐一相同）。
+- **架构文档不再逐文件转录**：`architecture.md` 只保留分层、依赖方向、进程模型与目录级地图，
+  「这个文件放什么」以文件自身的 `//!` 头注释为准（`tests/safety_guards.rs` 强制每个文件都有）。
 
 ## [0.8.0] - 2026-11-10
 

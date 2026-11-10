@@ -3,46 +3,41 @@
 > **这份文档回答**：某个键（或鼠标手势）在当前上下文里做什么？界面底部提示和 `?` 帮助里写的是真的吗？
 > **不负责**：为什么这样设计（见 [design.md](design.md)）、渲染规则（见 [tui.md](tui.md)）、按键路由代码结构（见 [architecture.md](architecture.md#keys-键分发--srckeys)）。
 > **相关代码路径**：`src/keys/`（真正的 dispatch）、`src/help.rs`（界面内帮助目录，本文与之同源）、`tests/help_coverage.rs`（机器校验）。
->
+
 > **本文被 `tests/help_coverage.rs` 用 `include_str!` 嵌入并校验**：帮助目录里的每个 token 都必须在本文中以反引号出现。**不要删除任何按键 token**，只加不删。
 > This page is parsed by `tests/help_coverage.rs`; every catalog token must appear here as a backticked cell. Never delete a token.
 
-界面内随时按 `?` 打开分区帮助，内容与本文一致（帮助浮层是同一份数据渲染出来的）。
-Press `?` anywhere to open the in-app help; it renders the same catalog as this page.
+界面内随时按 `?` 打开分区帮助，内容与本文同源（帮助浮层由同一份数据渲染）。
 
 ## 目录 / Contents
 
-| 上下文 / Context | 说明 / What it is |
+| 上下文 | 一句话 |
 |---|---|
-| [主界面](#主界面--main-screen) | 转发表格，没有弹层 / the tunnel table, no overlay |
-| [多选模式](#多选模式--selection-mode) | `v` 进入，部分键**重绑** / entered with `v`, some keys are **re-bound** |
-| [表单·导航态](#表单导航态--form-navigating) | 新建 / 编辑表单，只移动高亮 / create & edit form, highlight moves only |
-| [表单·编辑态](#表单编辑态--form-editing) | 某个文本字段正在接收输入 / a text field is taking input |
-| [主机下拉](#主机下拉--host-dropdown) | 表单里的 `~/.ssh/config` 主机列表 / the host list inside the form |
-| [导入面板](#导入面板--import-pane) | 主机已声明的转发 / forwards already declared by the host |
-| [导入列筛选](#导入列筛选--import-column-filter) | 导入面板某一列的筛选正在输入 / typing one column's filter |
-| [对端端口列表](#对端端口列表--peer-port-list) | `p` 扫描到的对端监听端口 / the peer's listening ports scanned with `p` |
-| [确认框](#确认框--confirmation-dialog) | 破坏性操作前的对话框 / the dialog before a destructive action |
-| [详情 / 日志](#详情--日志--detail--log) | 单条转发的完整诊断 / full diagnostics for one tunnel |
-| [过滤输入](#过滤输入--main-filter) | `/` 打开的主表过滤 / the table filter opened with `/` |
-| [帮助浮层](#帮助浮层--help-overlay) | `?` 打开的本帮助 / this help, opened with `?` |
-| [鼠标](#鼠标--mouse) | 点击、shift 点击、滚轮 / click, shift-click, wheel |
-| [状态图例](#状态图例--status-legend) | 状态列符号的含义 / what the status glyphs mean |
-| [安全规则](#安全规则--safety-rules) | 哪些操作先确认 / which actions ask first |
+| [主界面](#主界面--main-screen) | 转发表格，没有弹层 |
+| [多选模式](#多选模式--selection-mode) | `v` 进入，部分键**重绑** |
+| [表单·导航态](#表单导航态--form-navigating) | 新建 / 编辑表单，只移动高亮 |
+| [表单·编辑态](#表单编辑态--form-editing) | 某个文本字段正在接收输入 |
+| [主机下拉](#主机下拉--host-dropdown) | 表单里的 `~/.ssh/config` 主机列表 |
+| [导入面板](#导入面板--import-pane) | 主机已声明的转发 |
+| [导入列筛选](#导入列筛选--import-column-filter) | 某一列的筛选正在输入 |
+| [对端端口列表](#对端端口列表--peer-port-list) | `p` 扫描到的对端监听端口 |
+| [确认框](#确认框--confirmation-dialog) | 破坏性操作前的对话框 |
+| [详情 / 日志](#详情--日志--detail--log) | 单条转发的完整诊断 |
+| [过滤输入](#过滤输入--main-filter) | `/` 打开的主表过滤 |
+| [帮助浮层](#帮助浮层--help-overlay) | `?` 打开的本帮助 |
+| [鼠标](#鼠标--mouse) | 点击、shift 点击、滚轮 |
+| [状态图例](#状态图例--status-legend) | 状态列符号的含义 |
+| [安全规则](#安全规则--safety-rules) | 哪些操作先确认 |
 
-三种约定 / Three conventions:
+三种写作约定 / Three conventions（`tests/help_coverage.rs` 靠它们切分 token，不是审美）：
 
-- **中文在前、英文在后**（`中文 English`）是界面所有文案的统一形式，窄列放不下时用
-  `help::fit` 退化为纯中文。Chinese always comes first; narrow columns fall back to
-  Chinese-only via `help::fit`.
+- **中文在前、英文在后**（`中文 English`）；窄列放不下时用 `help::fit`（= `text::fit`）退化为纯中文。
 - 并列可选的键写作 `a / b`。Parallel alternatives are written `a / b`.
-- 组合键用 `+` 连接，不分隔：`ctrl+s`、`shift+tab`。Modifiers use `+` and stay glued.
+- 组合键用 `+` 粘住，不分隔：`ctrl+s`、`shift+tab`。Modifiers use `+` and stay glued.
 
 ---
 
 ## 主界面 / Main screen
-
-没有弹层时的转发表格。The tunnel table with no overlay open.
 
 | 按键 / Key | 中文 | English |
 |---|---|---|
@@ -68,15 +63,11 @@ Press `?` anywhere to open the in-app help; it renders the same catalog as this 
 说明 / Notes:
 
 - `a` 在没有未启用条目时只给提示，`x` 在没有运行中条目时只给提示，都不弹确认框。
-  `a` only reports when nothing is off, and `x` only reports when nothing is running;
-  neither opens a dialog in that case.
 - **启动**某条未启用的转发不弹确认（可逆）；停用它才需要确认。
-  Starting a disabled tunnel never asks (it is reversible); stopping one does.
 
 ## 多选模式 / Selection mode
 
 按 `v` 进入。这不是"叠加键"，而是**重新绑定**——`space`、`j`/`k` 的语义都变了。
-Entered with `v`. This **re-binds** keys rather than adding to them.
 
 | 按键 / Key | 中文 | English |
 |---|---|---|
@@ -94,20 +85,13 @@ Entered with `v`. This **re-binds** keys rather than adding to them.
 
 说明 / Notes:
 
-- 本模式下 `r` / `d` / `n` / `e` **不生效**，`space` 也不再启停隧道。底部提示会整体换掉，
-  因为留着旧提示等于广告一批会做别的事或什么都不做的键。
-  Here `r` / `d` / `n` / `e` do nothing and `space` no longer starts or stops; the footer
-  is replaced entirely, because leaving the old hints would advertise keys that now do
-  something else or nothing at all.
-- `R` / `D` 用大写，是为了不与单行的 `r` / `d` 混淆。`R` / `D` are uppercase so they
-  cannot be confused with the single-row `r` / `d`.
+- 本模式下 `r` / `d` / `n` / `e` **不生效**，`space` 也不再启停隧道。底部提示会整体换掉，因为留着旧提示等于广告一批会做别的事或什么都不做的键。
+- `R` / `D` 用大写，是为了不与单行的 `r` / `d` 混淆。
 - 批量确认框里的条数是**实际会变化的条数**，不是勾选条数。
-  The batch prompt counts the rows that will actually change, not all marked rows.
 
 ## 表单·导航态 / Form (navigating)
 
-新建 / 编辑表单的默认阶段：方向键只移动高亮，**不会改动任何值**。
-The default stage: arrows only move the highlight and never change a value.
+新建 / 编辑表单的默认阶段：方向键只移动高亮，**不会改动任何值**。The default stage: arrows only move the highlight and never change a value.
 
 | 按键 / Key | 中文 | English |
 |---|---|---|
@@ -125,16 +109,12 @@ The default stage: arrows only move the highlight and never change a value.
 
 说明 / Notes:
 
-- 保存选 **`ctrl+s` / `f10`** 而不是 `enter`，因为 `enter` 在这个阶段已经用来进入编辑。
-  Save is `ctrl+s` / `f10` rather than `enter`, because `enter` already means "start editing".
+- 保存用 **`ctrl+s` / `f10`** 而不是 `enter`，因为 `enter` 在这个阶段已经用来进入编辑。
 - `space` 在导入面板打开后归面板（勾选当前行），收面板用 `i` 或 `esc`。
-  Once the import pane is open `space` belongs to it (tick the cursor row); close it with
-  `i` or `esc`.
 
 ## 表单·编辑态 / Form (editing)
 
 某个文本字段正在接收输入。注意 `esc` 在这里**不关闭表单**，只是结束编辑。
-A text field is taking input. `esc` here does **not** close the form, it only ends editing.
 
 | 按键 / Key | 中文 | English |
 |---|---|---|
@@ -149,34 +129,14 @@ A text field is taking input. `esc` here does **not** close the form, it only en
 
 说明 / Notes:
 
-- `ctrl+s` / `f10` 在两个阶段都能保存：编辑态会先结束当前字段的编辑，再提交表单，
-  所以**不会**把字母 `s` 打进字段。此前编辑态的 `ctrl+s` 会把 `s` 插进正在编辑的内容
-  （静默的数据损坏），`f10` 则完全无反应——而提示行一直写着「`ctrl+s` 保存」。
-  `ctrl+s` / `f10` save from both stages: in the editing stage the current field's edit is
-  ended first, then the form is submitted, so the letter `s` is never typed into the field.
-  This used to be broken — `ctrl+s` inserted `s` into the field being edited (silent data
-  corruption) and `f10` did nothing at all, while the footer kept advertising `ctrl+s`.
-- **`ctrl+s` / `f10` 在任何子焦点下都能保存**：主机下拉框开着、导入面板某列筛选正在
-  输入、或对端端口列表开着时，保存键都属于表单，都会真的保存。这里曾经有个静默缺陷：
-  `ctrl+s` 是 `Char('s')`，字符本身不是控制字符，于是下拉框与列筛选末尾的
-  `Char(c) if !c.is_control()` 兜底分支把它当普通输入吃掉——查询框里多出 `s`、筛选里
-  出现 `s`，保存没有发生，**也没有任何日志**（详见 `docs/design.md` D35）。
-  `ctrl+s` / `f10` save from **any** sub-focus: with the host dropdown open, while typing an
-  import column filter, or with the peer port list open, the save key belongs to the form.
-  This used to fail silently — `ctrl+s` is a `Char('s')` whose char is not a control
-  character, so the `Char(c) if !c.is_control()` catch-all typed it into a text buffer and
-  nothing was saved (and nothing was logged).
+- `ctrl+s` / `f10` 在**两个阶段都能保存**：编辑态会先结束当前字段的编辑再提交，所以**不会**把字母 `s` 打进字段。此前编辑态的 `ctrl+s` 会把 `s` 插进正在编辑的内容（静默的数据损坏），`f10` 则完全无反应——而提示行一直写着「`ctrl+s` 保存」。Both stages save: the editing stage ends the field edit first, so the letter `s` is never typed into the field.
+- **`ctrl+s` / `f10` 在任何子焦点下都能保存**：主机下拉开着、导入列筛选正在输入、或对端端口列表开着时，保存键都属于表单。这里曾经有个静默缺陷：`ctrl+s` 是 `Char('s')`，字符本身不是控制字符，于是下拉框与列筛选末尾的 `Char(c) if !c.is_control()` 兜底分支把它当普通输入吃掉——查询框里多出 `s`、保存没有发生、**也没有任何日志**（详见 [design.md](design.md) D35）。
 - 在 `远端端口` 输入会联动推荐本地端口；手改过 `本地端口` 后不再被推荐覆盖。
-  Typing the remote port derives the local-port suggestion; once the local port is
-  hand-edited the suggestion stops overwriting it.
 - 两段式 `esc`：第一次退出编辑，第二次才是"放弃并关闭表单"（有未保存内容会确认）。
-  `esc` is two-stage: the first press leaves editing, the second requests discarding the form
-  (which asks when there are unsaved edits).
 
 ## 主机下拉 / Host dropdown
 
 表单里 `SSH 主机` 字段上的 `~/.ssh/config` 主机列表（内嵌下拉，不是独立弹窗）。
-The host list on the `SSH host` field; it is inline, not a separate overlay.
 
 | 按键 / Key | 中文 | English |
 |---|---|---|
@@ -191,9 +151,7 @@ The host list on the `SSH host` field; it is inline, not a separate overlay.
 
 ## 导入面板 / Import pane
 
-主机已经声明的转发列表。面板打开后，键位**归面板**——`j`/`k`、`↑`/`↓`、`g`/`G`、
-`pgup`/`pgdn` 移动的是导入行，不再是表单字段。
-The forwards the host already declares. Once open, navigation keys belong to the pane.
+主机已经声明的转发列表。面板打开后，键位**归面板**——`j`/`k`、`↑`/`↓`、`g`/`G`、`pgup`/`pgdn` 移动的是导入行，不再是表单字段。
 
 | 按键 / Key | 中文 | English |
 |---|---|---|
@@ -217,21 +175,14 @@ The forwards the host already declares. Once open, navigation keys belong to the
 
 说明 / Notes:
 
-- `space` 只能**展开**面板。面板打开后 `space` 已经被"勾选当前行"占用，再按一次会勾行而
-  不是收起；收起用 `i` 或 `esc`，与展开它的键对称。
-  `space` can only open the pane. Once open it means "tick this row", so a second `space`
-  ticks instead of collapsing; close with `i` or `esc`, symmetric with the key that opened it.
-- 代价是**字面字符 `f` 无法输入到筛选里**（`f` 优先切列）。每列内容是端口、主机名或指令名，
-  `←`/`→` 加退格足够覆盖。
-  The cost is that a literal `f` cannot be typed into a filter (`f` always switches columns).
-  Every column holds a port, a host or a directive name, so `←`/`→` plus backspace cover it.
+- `space` 只能**展开**面板。面板打开后 `space` 已被"勾选当前行"占用，再按一次会勾行而不是收起；收起用 `i` 或 `esc`，与展开它的键对称。
+- 代价是**字面字符 `f` 无法输入到筛选里**（`f` 优先切列）。每列内容是端口、主机名或指令名，`←`/`→` 加退格足够覆盖。
 - `ctrl+s` 与 `tab` 不被面板吞掉，仍然和普通表单里一样工作——面板是**增量**，不是模态。
-  `ctrl+s` and `tab` are not swallowed by the pane; it is an addition, not a modal.
+- 语义与勾选规则（自动展开、`touched`、「已存在」行、全选只看筛选视图）见 [import.md](import.md)。
 
 ## 导入列筛选 / Import column filter
 
 某一列的筛选正在输入。`enter` / `esc` 只是结束输入，面板**不**收起。
-One column's filter is being typed. `enter` / `esc` only end the input; the pane stays open.
 
 | 按键 / Key | 中文 | English |
 |---|---|---|
@@ -245,11 +196,7 @@ One column's filter is being typed. `enter` / `esc` only end the input; the pane
 
 ## 对端端口列表 / Peer port list
 
-在 `远端端口` 字段按 `p` 扫描对端正在监听的端口。`enter` 选中一个填进字段；勾选多行后保存，
-每个端口建一条 `-L` 转发。列表打开期间这些键**归列表**，表单字段不动。
-Pressing `p` on the `Remote port` field scans the peer for listening ports. `enter` fills
-one into the field; ticking rows and saving creates one `-L` tunnel per port. While the list
-is open these keys belong to it and the form's fields stay put.
+在 `远端端口` 字段按 `p` 扫描。`enter` 选中一个填进字段；勾选多行后保存，每个端口建一条 `-L` 转发。列表打开期间这些键**归列表**，表单字段不动。
 
 | 按键 / Key | 中文 | English |
 |---|---|---|
@@ -270,28 +217,20 @@ is open these keys belong to it and the form's fields stay put.
 说明 / Notes:
 
 - 勾选多行后保存，每个端口生成一条 `-L` 转发；`enter` 是"只填这一个"的单选路径。
-  Saving after ticking rows creates one `-L` tunnel per port; `enter` is the single-pick path.
 - `-R` 转发的列表是**只读**的（对端那些端口已被占用），`space` / `a` / `I` 不会勾上任何行。
-  A `-R` forward's list is **read-only** (those ports are already taken on the peer), so
-  `space` / `a` / `I` tick nothing.
 - 改了 `SSH 主机` 或 `类型` 后旧的列表会被丢弃，不会把上一台主机的端口填进来。
-  Changing `SSH host` or `Type` drops the old list, so the previous host's ports cannot leak in.
+- 探测命令、哪些端口不列出、扫描线程与代次见 [import.md](import.md#对端监听端口--the-peers-listening-ports)。
 
 ## 确认框 / Confirmation dialog
 
 所有破坏性或有副作用的操作都会先弹出它。
-Shown before every destructive or side-effecting action.
 
 | 按键 / Key | 中文 | English |
 |---|---|---|
 | `y` / `Y` / `enter` | 执行该操作 | Run the action |
 | `n` / `N` / `esc` | 取消，什么都不做 | Cancel and change nothing |
 
-说明 / Notes:
-
-- 确认框打开时其它按键不生效，点击也不会穿透到下面的表格。
-  While the dialog is open no other key does anything, and clicks cannot leak through to the
-  table underneath.
+说明 / Notes: 确认框打开时其它按键不生效，点击也不会穿透到下面的表格。
 
 ## 详情 / 日志 / Detail / log
 
@@ -303,8 +242,6 @@ Shown before every destructive or side-effecting action.
 | `q` / `esc` / `enter` / `l` | 关闭，回到主界面 | Close and go back |
 
 失败原因与原始 ssh stderr 在这里完整保留；表格的「最后错误」列只放归类短句。
-The classified failure reason and the raw ssh stderr are kept here in full; the table's
-"Last error" column only carries the short classified phrase.
 
 ## 过滤输入 / Main filter
 
@@ -317,20 +254,9 @@ The classified failure reason and the raw ssh stderr are kept here in full; the 
 | `enter` | 保留过滤并关闭输入 | Keep the filter and close the input |
 | `esc` | 清除过滤并关闭输入 | Clear the filter and close the input |
 
-三种约定 / Three conventions:
-
-- **中文在前、英文在后**（`中文 English`）是界面所有文案的统一形式，窄列放不下时用
-  `text::fit` 退化为纯中文。Chinese always comes first; narrow columns fall back to
-  Chinese-only via `text::fit`.
-- 并列可选的键写作 `a / b`。Parallel alternatives are written `a / b`.
-- 组合键用 `+` 连接，不分隔：`ctrl+s`、`shift+tab`。Modifiers use `+` and stay glued.
-
----
-
 ## 帮助浮层 / Help overlay
 
-按 `?` 打开的这份帮助。它按上下文分区，内容就是本文的数据来源。
-This help, opened with `?`. It is split by context and is the data source for this page.
+按 `?` 打开的这份帮助，按上下文分区。
 
 | 按键 / Key | 中文 | English |
 |---|---|---|
@@ -340,12 +266,10 @@ This help, opened with `?`. It is split by context and is the data source for th
 | `?` / `esc` / `q` / `enter` | 关闭帮助 | Close the help |
 
 说明 / Notes: 浮层每行是「键列 | 中文 | 英文」，键列宽度**实测**得出（目录里最宽的 binding +2，钳制 10~22 列且不超半行——写死 12 曾窄于 `g / G / home / end`（18）和 `J / K / shift+↓ / shift+↑`（25），于是绑定直接贴住说明）；放不下时中文先排、英文换到续行；超长组合键独占一行；note 行整行 prose。滚动上限按**折行后的实际行数**计算。渲染规则见 [tui.md](tui.md#浮层--overlays)。
-Notes: key cell width is measured, English wraps to continuation lines, over-long bindings take a row of their own, and the scroll limit counts wrapped lines. See [tui.md](tui.md#浮层--overlays).
 
 ## 鼠标 / Mouse
 
 鼠标捕获是 best-effort 开启的：终端拒绝捕获时只影响鼠标，键盘 UI 完整可用。
-Mouse capture is best-effort; if the terminal refuses, only the mouse is affected.
 
 | 位置 / Where | 中文 | English |
 |---|---|---|
@@ -361,10 +285,8 @@ Mouse capture is best-effort; if the terminal refuses, only the mouse is affecte
 | 多选动作条按钮 | 对应批量操作（**仍走确认闸**） | The batch operation, still behind the confirmation gate |
 | 列表上的滚轮 | 滚动（主表移动光标，导入表移动其光标） | Scroll (the main table moves the cursor, the import list its own) |
 
-- 点击落空**什么都不做**，不"透传"给下面的控件：按钮旁边的误点不该启动隧道。
-  A click on empty space does **nothing** and never falls through to the widget below.
-- 弹窗吞掉点击。确认框是在破坏性动作**之前**拦人的，一次本想点对话框的点击绝不能落到某行上。
-  Popups swallow clicks: the confirmation gate must never mark or start a row behind it.
+- 点击落空**什么都不做**，不"透传"给下面的控件：按钮旁边的误点不该启动隧道。A click on empty space does **nothing** and never falls through.
+- 弹窗吞掉点击。确认框是在破坏性动作**之前**拦人的，一次本想点对话框的点击绝不能落到某行上。Popups swallow clicks.
 
 ## 状态图例 / Status legend
 
@@ -378,31 +300,11 @@ Mouse capture is best-effort; if the terminal refuses, only the mouse is affecte
 
 ## 安全规则 / Safety rules
 
-- **先确认再动手**：删除、停用、重启、批量启停 / 重启 / 删除、保存编辑、放弃编辑、退出、
-  `ctrl+c` —— 全部先弹确认框，`y` / `enter` 执行，`n` / `esc` 取消。
-  Delete, stop, restart, batch start / stop / restart / delete, saving an edit, discarding
-  edits, quitting and `ctrl+c` all ask first: `y` / `enter` runs it, `n` / `esc` cancels.
+- **先确认再动手**：删除、停用、重启、批量启停 / 重启 / 删除、保存编辑、放弃编辑、退出、`ctrl+c` —— 全部先弹确认框，`y` / `enter` 执行，`n` / `esc` 取消。
 - **刻意不弹确认**（可逆、无副作用）：启动、新建、移动光标、过滤、帮助、详情。
-  Deliberately no dialog: starting, creating, moving the cursor, filtering, help, detail.
 - `NO_COLOR=1` 关闭全部颜色，状态仍由符号和文字表达。
-  `NO_COLOR=1` disables all colour; glyphs and words still carry the status.
-- 日志在 `~/.local/state/sshpf/logs/sshpf.log`；`SSHPF_LOG_DIR` / `SSHPF_LOG_LEVEL`
-  可改目录与级别，详见 [logging.md](logging.md)。
-  Logs live in `~/.local/state/sshpf/logs/sshpf.log`; `SSHPF_LOG_DIR` / `SSHPF_LOG_LEVEL`
-  change the directory and level — see [logging.md](logging.md).
-
----
+- 日志在 `~/.local/state/sshpf/logs/sshpf.log`；`SSHPF_LOG_DIR` / `SSHPF_LOG_LEVEL` 可改目录与级别，详见 [logging.md](logging.md)。
 
 ## 这张表怎么保证不遗漏 / How this list stays complete
 
-`tests/help_coverage.rs` 会解析 `src/keys.rs` 里每个 handler 真实 dispatch 的
-`KeyCode` 字面量，与帮助目录 `src/help.rs` **双向**比对，并检查这里是否覆盖了目录里的
-每一个 token。三种漂移都会让测试失败：
-
-1. 加了按键却忘了写帮助（**不得遗漏**）—— 用户的键做了事，帮助里却没有；
-2. 帮助里写了代码没有的键（**不得撒谎**）—— 用户按下去什么都不发生，然后不再相信帮助；
-3. 本文件落后于帮助目录 —— 界面上写对了，查手册却查不到。
-
-`tests/help_coverage.rs` parses the `KeyCode` literals each handler in `src/keys.rs`
-really dispatches, compares them **both ways** against `src/help.rs`, and checks that this
-page covers every token in the catalog. All three kinds of drift fail the test.
+`tests/help_coverage.rs` 解析 `src/keys.rs` 里每个 handler 真实 dispatch 的 `KeyCode` 字面量，与帮助目录 `src/help.rs` **双向**比对，并检查本文覆盖了目录里的每一个 token。三种漂移都会让测试失败：① 加了按键却忘了写帮助（**不得遗漏**）；② 帮助里写了代码没有的键（**不得撒谎**）；③ 本文件落后于帮助目录。

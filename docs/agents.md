@@ -16,55 +16,9 @@
 
 ## 一特性一 worktree / One worktree per change
 
-开发新特性、修复问题，**一律在独立 worktree 的独立分支里做**，不在仓库根（主 checkout）里直接改。要改代码就先开 worktree；纯文档改动同理，没有例外路径。
+开发新特性、修复问题，**一律在独立 worktree 的独立分支里做**，不在仓库根直接改；纯文档改动同理，没有例外。理由：共享 checkout 的未提交改动、git index、`target/` 都是共享的，任一方 `git checkout`/`git stash`/`cargo fmt --all` 就会打断另一方，且没有任何提示。
 
-理由是共享 checkout 的每样东西都是共享的：未提交改动、git index、`target/`。两个人（人 + agent，或两个 agent）在同一棵树里并行，任一方 `git checkout`、`git stash`、`cargo fmt --all` 就会打断另一方，且没有任何提示。
-
-**一条改动的完整生命周期：**
-
-```bash
-git fetch origin
-# 1) 开 worktree + 分支：目录 = 分支名，统一放 .agents/worktrees/（已 gitignore）
-git worktree add .agents/worktrees/feat/my-feature -b feat/my-feature origin/main
-cd .agents/worktrees/feat/my-feature
-
-# 2) 开发 → 自检（本文末）→ 提交 → push → PR
-git push -u origin feat/my-feature
-gh pr create --fill
-
-# 3) CI 全绿 + 评审通过 → 合并（merge commit，与既有 PR 一致）
-
-# 4) 合并后清理：worktree、本地分支、远端分支都不留（见下）
-```
-
-| 项 | 约定 |
-|---|---|
-| 分支名 | 前缀与提交前缀一致：`feat/…`、`fix/…`、`docs/…`、`refactor/…`、`release/…` |
-| worktree 路径 | `.agents/worktrees/<分支名>`，与分支同名；`.agents/` 在 `.gitignore` 里，不会被误提交 |
-| 基线 | 从刚 `fetch` 的 `origin/main` 开；落后就 `rebase` 到 `origin/main`，不要把 main merge 进分支 |
-| git 写操作 | 只在自己 worktree 里 `add`/`commit`/`push`；不要在主 checkout 切换分支或 stash |
-| 合并方式 | PR（不直接 push `main`）；`main` 上 CI 必须绿 |
-| 收尾 | 合并后**立即**删 worktree 和分支（见下），不留「僵尸分支」 |
-
-### 合并后清理 / Clean up after merge
-
-**PR 合并即这条线结束。** 残留的分支和 worktree 会让后来者（尤其是 agent）以为任务还在进行——`git worktree list` 和 `git branch` 是它们判断「谁在做什么」的唯一线索。
-
-```bash
-# 回到主 checkout 执行（在将被删除的 worktree 里执行会失败）
-git worktree remove .agents/worktrees/<分支名>   # 有未提交改动会拒绝删除；别用 --force 掩盖
-git branch -d <分支名>                           # -d 校验已合并；报「未合并」说明合并没到位
-git push origin --delete <分支名>
-git fetch --prune
-```
-
-| 检查 | 期望 |
-|---|---|
-| `git worktree list` | 只剩主 checkout（和别的**进行中**的线） |
-| `git branch --merged origin/main` | 不含刚删的分支 |
-| `gh pr view --json state` | `MERGED`，且远端分支已消失 |
-
-例外只有一个：`release/vX.Y.Z` 由发版流程保留，不随合并删除；`main` 永不删除。
+完整生命周期（开 → 开发 → 自检 → PR → 合并 → 清理）与清理检查清单见根 [`AGENTS.md`](../AGENTS.md#一特性一-worktree--one-worktree-per-change)。agent 必须记住的三条：**目录 = 分支名**、放 `.agents/worktrees/`（已 gitignore）、**合并即清理**（worktree + 本地分支 + 远端分支都不留，残留会被当成"这条线还在进行中"）。
 
 ## 六条改码约定 / Six rules
 
@@ -99,8 +53,8 @@ git fetch --prune
 ③ docs/keymap.md            对应表加一行（token 必须写成反引号单元格）
 
 help 的分组：main.rs（主界面/多选）、form.rs（表单/下拉）、import.rs（导入/列筛选）、
-dialogs.rs（确认/详情/过滤/帮助）、notes.rs（鼠标/状态图例/安全）。SectionId 与文案在
-src/help.rs 汇总。
+ports.rs（对端端口）、dialogs.rs（确认/详情/过滤/帮助）、notes.rs（鼠标/状态图例/安全）。
+SectionId 与文案在 src/help.rs 汇总。
 ```
 
 书写规范（`tests/help_coverage.rs` 靠它切分 token，不是审美问题）：
@@ -112,9 +66,7 @@ src/help.rs 汇总。
 | 方向键用符号 | `↓ ↑ ← →`（不是 `down`） |
 | "任意字符"不写 keys | 用 `HelpItem::note`（note 不参与覆盖检查） |
 
-加完跑 `cargo test --test help_coverage`。若新 handler 是新函数，还要登记到测试里的 `HANDLERS` 表（`src/keys/` 下的 handler → `SectionId`）。
-
-跨 section 的刻意例外写进 `DOC_ONLY` 常量并注明理由——**不是**注释掉断言。
+加完跑 `cargo test --test help_coverage`。若新 handler 是新函数，还要登记到测试里的 `HANDLERS` 表（`src/keys/` 下的 handler → `SectionId`）。跨 section 的刻意例外写进 `DOC_ONLY` 常量并注明理由——**不是**注释掉断言。
 
 ## 加界面面板 / Add an overlay
 
@@ -134,23 +86,12 @@ src/help.rs 汇总。
 ## 加日志事件 / Add a log event
 
 ```text
-① src/eventlog/<族>.rs   加一个函数（族：process / tunnel / ssh / user）
+① src/eventlog/<族>.rs   加一个函数（族：process / tunnel / ssh / server / user）
 ② docs/logging/events.md 加一行（事件名 | 级别 | 关键字段 | 含义）
 ③ 若有排查价值         docs/logging.md 的「排查配方」加一条
 ```
 
-**硬约束**：函数名、`event=` 字符串、级别、字段名与顺序**逐字不变**——`docs/logging/events.md` 与既有测试依赖它们。
-
-级别按"读的人要做什么"分，不按"严重程度"：
-
-| 级别 | 判断标准 |
-|---|---|
-| `ERROR` | 用户要做的事没做成，或隧道已死且不会自愈 |
-| `WARN` | 降级但自愈：安排了重连、学到新主机密钥、配置被修正、一帧超时 |
-| `INFO` | 预期内生命周期，足以在不看 UI 的情况下重建一次会话 |
-| `DEBUG` | 高频细节（每条转发行、每次 SOCKS5 失败），**先查级别再拼字符串** |
-
-用户动作/界面降级类归 `eventlog/user.rs`；隧道生命周期归 `tunnel.rs`；进程与配置归 `process.rs`；SSH 与主机密钥归 `ssh.rs`。
+**硬约束**：函数名、`event=` 字符串、级别、字段名与顺序**逐字不变**——`docs/logging/events.md` 与既有测试依赖它们。级别按"读的人要做什么"分而不是按"严重程度"，四档判据与分工见 [logging/events.md](logging/events.md#约定--conventions) 与 [logging.md](logging.md#级别策略)。
 
 ## 加失败分类 / Add a failure kind
 
@@ -168,7 +109,11 @@ src/help.rs 汇总。
 | 宽度 | 一律 `text::display_width`（CJK = 2 列），**绝不用** `str::len()` |
 | 帮助文案 | 改 `src/help.rs` 的数据；界面页脚复用同一批措辞，所以改一处两边都对 |
 
+细节见 [tui.md](tui.md#文本与折行--text)。
+
 ## 加文档 / Add a doc
+
+**先问：这是不是已经有一篇在讲同一件事？** 同一读者任务（例如"导入怎么工作"）追加到现有那篇的一节，而不是新开一篇——读者为回答一个问题要开五篇文件，是缺陷。
 
 ```text
 ① docs/<name>.md        开头 3–8 行：回答什么问题 / 不负责什么 / 相关代码路径
@@ -180,9 +125,10 @@ src/help.rs 汇总。
 |---|---|
 | 单篇行数 | ≤ 400（超过就按职责再拆） |
 | 结构 | 表格 + 短句；agent 靠标题和表格定位，**不写散文** |
-| 不重复 | 同一事实只详述一处，其余用相对链接（例如 `[依赖规则](architecture.md#依赖规则--dependency-rules)`） |
+| 不重复 | 同一事实只详述一处，其余用相对链接 |
+| 不重复模块注释 | 文件的 `//!` 已经写了"什么属于这里"，文档不要逐文件转录 |
 | 路径真实 | 文档链接与代码路径引用必须存在（见下方自检脚本） |
-| 文件名 | 被 `src/` 引用的不能改：`docs/design.md`、`docs/logging.md`、`docs/keymap.md` |
+| 文件名 | 被 `src/` 引用的不能改：`docs/design.md`、`docs/logging.md`、`docs/keymap.md`、`docs/architecture.md`、`docs/dedup.md` |
 
 ## 提交前自检 / Pre-flight checklist
 
@@ -230,9 +176,9 @@ print('checked; missing:', len(bad))
 EOF
 ```
 
-**唯一的已知良性命中**：`src/logging/panic.rs` 里有一个测试夹具故意写 `Some("src/x.rs:1:1")`
-当作"panic 位置"的假字符串。它不是文档引用，不该为了自检去改（那是别人的 write scope）。
-出现且**只有**这一条时视为通过。
+**唯一的已知良性命中**：`src/logging/panic.rs` 里有一个测试夹具故意写 `Some("src/x.rs:1:1")` 当作"panic 位置"的假字符串。它不是文档引用，不该为了自检去改（那是别人的 write scope）。出现且**只有**这一条时视为通过。
+
+**锚点也要校验**：上面的脚本只查文件存在性，不查 `#anchor`。改了标题就得同步所有引用它的链接；检查方法见本仓库 `docs/` 下任一文档的 `##` 层级，`grep -rn '](.*\.md#' docs README.md` 列出全部锚点引用。
 
 ## 汇报格式 / Reporting back
 

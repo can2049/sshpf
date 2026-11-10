@@ -1,7 +1,7 @@
 # 安全与健壮性 / Security & robustness
 
-> **这份文档回答**：为什么生产代码里不许 panic、`unsafe` 只在哪里、崩溃怎么被记录下来、文件权限与日志脱敏的边界、以及哪些测试在守这些规则。
-> **不负责**：日志格式与级别（见 [logging.md](logging.md)）、事件字段全表（见 [logging/events.md](logging/events.md)）、SSH 主机密钥策略的实现细节（见 `src/ssh/known_hosts.rs`、`src/ssh/hostkey_conf.rs`）。
+> **这份文档回答**：为什么生产代码里不许 panic、`unsafe` 只在哪里、崩溃怎么被记录下来、文件权限与日志脱敏的边界、主机密钥策略、哪些测试在守这些规则。
+> **不负责**：日志格式与级别（见 [logging.md](logging.md)）、事件字段全表（见 [logging/events.md](logging/events.md)）。
 > **相关代码路径**：`src/logging/crash.rs`（唯一 `unsafe`）、`src/logging/panic.rs`、`src/sys/`、`src/ssh/known_hosts.rs`、`src/ssh/hostkey_conf.rs`、`tests/safety_guards.rs`、`tests/panic_hardening.rs`。
 
 ## 政策 / Policy（全员硬约束）
@@ -14,9 +14,7 @@
 | 不许用 `#[allow(...)]` 压 clippy | 有警告就改代码 |
 | 失败路径必须可观测 | 返回 `Result`/`Option` → 调用方记日志 → 界面出**可读**状态条（`StatusMsg`），**不许静默** |
 
-这些不是评审口径，是**可执行断言**：`tests/safety_guards.rs` 逐文件扫描源码（注释与字符串字面量先涂空，`#[cfg(test)]` 区域先屏蔽），命中即失败并打印文件名 + 行号 + 构造。
-
-豁免只能写进该测试的 allowlist 常量并写明理由——**不是** `#[allow]`。
+这些不是评审口径，是**可执行断言**：`tests/safety_guards.rs` 逐文件扫描源码（注释与字符串字面量先涂空，`#[cfg(test)]` 区域先屏蔽），命中即失败并打印文件名 + 行号 + 构造。豁免只能写进该测试的 allowlist 常量并写明理由——**不是** `#[allow]`。
 
 ## 核心不变式 / The one invariant
 
@@ -39,9 +37,7 @@
 
 ### 第二层：只剩不变量可依赖的地方，降级而不是断言
 
-有些下标"逻辑上一定安全"，但这个"一定"依赖 ratatui 的 layout 契约或某个 `len()` 与常量保持同步——两者都可能在下一次依赖升级或重构里悄悄失效，代价是整帧 panic（终端停在 raw mode，界面全无）。
-
-改成 `get()` + 安全默认值：
+有些下标"逻辑上一定安全"，但这个"一定"依赖 ratatui 的 layout 契约或某个 `len()` 与常量保持同步——两者都可能在下一次依赖升级或重构里悄悄失效，代价是整帧 panic（终端停在 raw mode，界面全无）。改成 `get()` + 安全默认值：
 
 | 位置 | 降级行为 | 记录 |
 |---|---|---|
@@ -56,53 +52,33 @@
 
 ### 第三层：日志系统自己是最后防线
 
-前两层保证"别的地方不 panic"，但崩溃捕获机制本身也可能挂，而它挂了就什么都没了。三个约束：
-
-1. **panic hook 必须自安全**（见下节"重入"）。
-2. **信号处理器只做 async-signal-safe 调用**：不分配、不加锁、不用格式化机制。
-3. **线程 panic 不传染进程**：`catch_unwind` 把隧道线程 panic 转成 `Event::Exited{code:101}` + `tunnel.thread_panic`。
+前两层保证"别的地方不 panic"，但崩溃捕获机制本身也可能挂，而它挂了就什么都没了。三个约束：① **panic hook 必须自安全**（见下节"重入"）；② **信号处理器只做 async-signal-safe 调用**（不分配、不加锁、不用格式化机制）；③ **线程 panic 不传染进程**（`catch_unwind` 把隧道线程 panic 转成 `Event::Exited{code:101}` + `tunnel.thread_panic`）。
 
 这一层只保"记录得下来"，**不保"程序活着"**——进程该崩还是崩，退出码和 core dump 行为不变。把崩溃静默掉才是更坏的选择。
 
 ## 崩溃捕获 / Crash capture
 
-两条独立通路，覆盖不同的崩法。完整记录格式见 [logging.md](logging.md#崩溃记录--crash-records)。
+两条独立通路，覆盖不同的崩法。每条的记录格式见 [logging.md](logging.md#崩溃记录--crash-records)。
 
 ### panic
 
-`set_panic_hook` 链式调用上一个 hook（所以 `ratatui` 恢复终端的逻辑照常生效），写 `crash.panic` + `crash.panic.trace` 两条记录。
-
-- `thread` 字段是关键：每条隧道跑在自己的线程上（`sshpf-tunnel-<id>`），线程名能区分"UI 挂了"和"某条隧道挂了"——后者在状态列上看起来只是"没连上"。
-- 栈只保留前 25 帧：debug 构建的栈顶 30 帧几乎全是 `std::panicking` 的管道代码。
+`set_panic_hook` 链式调用上一个 hook（所以 `ratatui` 恢复终端的逻辑照常生效），写 `crash.panic` + `crash.panic.trace` 两条记录。`thread` 字段是关键：每条隧道跑在自己的线程上（`sshpf-tunnel-<id>`），线程名能区分"UI 挂了"和"某条隧道挂了"。栈只保留前 25 帧：debug 构建的栈顶 30 帧几乎全是 `std::panicking` 的管道代码。
 
 ### 致命信号（`SIGSEGV` / `SIGBUS` / `SIGABRT` / `SIGILL` / `SIGFPE`）
 
-`src/logging/crash.rs` 用 `sigaction` 装 handler，只做四件事：
+`src/logging/crash.rs` 用 `sigaction` 装 handler，只做四件事：① 若 TUI 持有终端，先写转义序列退出备用屏（否则用户卡在残留画面里）；② `write(2)` 一条**手工拼好**的记录到预先 `dup` 出来的 fd（整数逐位自己转十进制）；③ 往 stderr 写一行**启动时就拼好**的提示；④ 恢复默认处理器 → **解除内核对该信号的屏蔽** → `raise`。
 
-1. 若 TUI 持有终端，先写转义序列退出备用屏（否则用户卡在残留画面里，光标都看不见）；
-2. `write(2)` 一条**手工拼好**的记录到预先 `dup` 出来的 fd（整数逐位自己转十进制）；
-3. 往 stderr 写一行**启动时就拼好**的提示（handler 里不做格式化）；
-4. 恢复默认处理器 → **解除内核对该信号的屏蔽** → `raise`。
-
-第 4 步的解除屏蔽容易漏：内核在 handler 执行期间屏蔽该信号，不解除的话 `raise` 只是排队，随后 `_exit(139)` 抢先执行，进程就从"被 SIGSEGV 杀死"变成"以 139 退出"，**core dump 也不会产生**。测试 `a_fatal_signal_keeps_the_signal_exit_status` 钉住它。
-
-代价：这一条记录**没有格式化时间戳**，只有 `ts=<epoch 秒>`（`localtime_r` 首次调用会分配内存）。递归崩溃由 `SA_RESETHAND` 兜住（第二次触发走默认动作，不会死循环）。
+第 4 步的解除屏蔽容易漏：内核在 handler 执行期间屏蔽该信号，不解除的话 `raise` 只是排队，随后 `_exit(139)` 抢先执行，进程就从"被 SIGSEGV 杀死"变成"以 139 退出"，**core dump 也不会产生**。测试 `a_fatal_signal_keeps_the_signal_exit_status` 钉住它。代价：这一条记录**没有格式化时间戳**，只有 `ts=<epoch 秒>`。递归崩溃由 `SA_RESETHAND` 兜住（第二次触发走默认动作，不会死循环）。
 
 ### 重入：`crash.log_reentrant`
 
-panic hook 要写日志，写日志要拿锁。**如果 panic 恰好发生在持锁的写入过程中**，hook 再 `lock()` 就是自己等自己——进程永久僵住、日志 0 字节、终端停在备用屏，比崩溃更难查。
+panic hook 要写日志，写日志要拿锁。**如果 panic 恰好发生在持锁的写入过程中**，hook 再 `lock()` 就是自己等自己——进程永久僵住、日志 0 字节、终端停在备用屏，比崩溃更难查。所以不靠 `try_lock()`，而是**事先知道自己在不在临界区**：thread-local 哨兵（`CriticalSection::enter()`，RAII `Drop` 复位，panic 展开也会复位）。已在本线程临界区内就跳过这条常规记录，改用预 `dup` 的 fd 裸 `write(2)` 写一行 `crash.log_reentrant`，然后让原 panic 照常传播。
 
-所以不靠 `try_lock()`，而是**事先知道自己在不在临界区**：thread-local 哨兵（`CriticalSection::enter()`，RAII `Drop` 复位，panic 展开也会复位）。已在本线程临界区内就跳过这条常规记录，改用预 `dup` 的 fd 裸 `write(2)` 写一行 `crash.log_reentrant`，然后让原 panic 照常传播。
-
-**为什么不能用 `try_lock()`**：它区分不了"拿不到锁（跨线程竞争）"和"自己在里面（重入）"，会把正常竞争误判成重入而丢记录。标记法只识别真正的重入。
-
-**宁可少一条记录，不能不死。**
+**为什么不能用 `try_lock()`**：它区分不了"拿不到锁（跨线程竞争）"和"自己在里面（重入）"，会把正常竞争误判成重入而丢记录。标记法只识别真正的重入。**宁可少一条记录，不能不死。**
 
 ### `unsafe` 的 SAFETY CONTRACT
 
-`src/logging/crash.rs` 是全仓唯一 `unsafe` 文件，文件头有 SAFETY CONTRACT 段：每个 `unsafe` 块一句话理由、只允许 async-signal-safe 调用、不得分配/加锁。
-
-`src/logging/crash.rs` 的单元测试就是这些 `unsafe` 的**看护证据**：`build_signal_record` 的格式/截断/边界（`i32::MIN`）、`push_int` 边界、`signal_name` 全覆盖。
+`src/logging/crash.rs` 是全仓唯一 `unsafe` 文件，文件头有 SAFETY CONTRACT 段：每个 `unsafe` 块一句话理由、只允许 async-signal-safe 调用、不得分配/加锁。它的单元测试就是这些 `unsafe` 的**看护证据**：`build_signal_record` 的格式/截断/边界（`i32::MIN`）、`push_int` 边界、`signal_name` 全覆盖。
 
 `src/sys/mod.rs` 提供 `pub fn signal_name(sig: i32) -> String`；`logging::crash` 里给 handler 用的 `fn signal_name(..) -> &'static str` 保留，注释说明**为什么不能复用**（handler 内禁止分配）。
 
@@ -127,7 +103,7 @@ panic hook 要写日志，写日志要拿锁。**如果 panic 恰好发生在持
 | 栈（背压截断到 25 帧） | 任何从 agent 读出的密钥材料 |
 
 - 认证只走 `~/.ssh/config` 的 `IdentityFile` 或 ssh-agent，**不存任何密码或口令**。
-- `SSHPF_LOG_LEVEL=off` 只关常规记录，**崩溃记录无条件写**——想把日志关掉的人，往往正是最需要那一行崩溃信息的人。
+- `SSHPF_LOG_LEVEL=off` 只关常规记录，**崩溃记录无条件写**。
 - 主机名和用户名仍属敏感信息：报 bug 前可先 `sed -E 's/(host|name)=[^ ]*/\1=REDACTED/g'`。
 
 ## 主机密钥 / Host keys
@@ -141,9 +117,9 @@ panic hook 要写日志，写日志要拿锁。**如果 panic 恰好发生在持
 | `ask` | 接受（当前实现） | 拒绝 | 拒绝 |
 | `ignore`（`--ignore-host-key-changes`） | 接受，**不写入** `known_hosts`（故不记 `knownhosts.learned`） | **接受**，记 `knownhosts.ignored_changed`（WARN，含 SHA256 指纹） | **拒绝** |
 
-密钥被拒时界面明确显示"已改变"还是"已吊销"，并指向 `known_hosts` 的行号；日志记 `knownhosts.rejected`（ERROR，含 `policy`）。`ignore` 下接受变更时状态条会出现一条「警告: … 的主机密钥已改变（已按忽略策略接受，未写入 known_hosts）」。
+密钥被拒时界面明确显示"已改变"还是"已吊销"，并指向 `known_hosts` 的行号；日志记 `knownhosts.rejected`（ERROR，含 `policy`）。
 
-**条目按「主机 + 算法」匹配，与 OpenSSH 一致。** 一台主机通常同时提供 `ssh-ed25519`、`ecdsa-sha2-nistp256`、`ssh-rsa` 几种密钥，而 `known_hosts` 里可能只记了其中一种；协商到另一种**不算变更**，只是该算法尚未记录（按未知处理：`accept-new` 学到并追加一行，`strict` 拒绝）。只有**同一算法下出现不同密钥**才是 `Changed`。这条区分是 v0.4.0 修的缺陷：此前任何不匹配的条目都被记为「已改变」，于是"服务器提供多算法、known_hosts 只记了一种"这种极常见的情况会被误报成「可能存在中间人攻击」——实测同一台主机 OpenSSH 在 `StrictHostKeyChecking=yes` 下能连，sshpf 却拒绝。
+**条目按「主机 + 算法」匹配，与 OpenSSH 一致。** 一台主机通常同时提供 `ssh-ed25519`、`ecdsa-sha2-nistp256`、`ssh-rsa` 几种密钥，而 `known_hosts` 里可能只记了其中一种；协商到另一种**不算变更**，只是该算法尚未记录（按未知处理：`accept-new` 学到并追加一行，`strict` 拒绝）。只有**同一算法下出现不同密钥**才是 `Changed`。这条区分修的是一个极常见的误报：此前任何不匹配的条目都被记为「已改变」，于是"服务器提供多算法、`known_hosts` 只记了一种"会被误报成「可能存在中间人攻击」。
 
 ### 忽略密钥变更 / Ignoring key changes
 
