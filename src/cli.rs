@@ -9,10 +9,18 @@
 //!
 //! * **`USAGE` is the single source of truth** for the help text. It is bilingual
 //!   and its wording is load-bearing (users grep it, `docs/keymap.md` mirrors it),
-//!   so it lives in one const and is never assembled from pieces.
+//!   so it lives in one const and is never assembled from pieces. **clap does not
+//!   render it** — the flags are declared in [`args`], but the manual is here.
 //! * **A broken pipe is not an error worth a panic.** `--help | head -1` and
 //!   `> /dev/full` are legal; every write here goes through [`write_stdout`] and
 //!   reports failure instead of unwrapping.
+//!
+//! What lives where:
+//!
+//! * **[`args`]** — the flag declarations (`clap` derive) and the mapping from
+//!   clap errors back to this program's two usage sentences.
+//! * **this file** — `USAGE`, the mode entry points (`list_hosts`, `check_config`),
+//!   and [`paths_for`].
 //!
 //! The three modes are mutually exclusive in intent but not in parsing: `--check`
 //! and `--list-hosts` can both be given, and `main` decides which to run (in the
@@ -138,31 +146,7 @@ SSH connection parameters (ProxyJump, IdentityFile, ssh-agent, …) stay in
 ~/.ssh/config, which this tool reads but never rewrites.
 ";
 
-/// What the command line asked for.
-///
-/// Public so `main` can read the fields without a getter per flag; the struct is
-/// inert data.
-#[derive(Debug, Default)]
-pub struct Args {
-    /// Kept as an `OsString`: a config path need not be valid UTF-8.
-    pub config: Option<std::ffi::OsString>,
-    pub no_restore: bool,
-    pub list_hosts: bool,
-    pub check: bool,
-    /// Accept a changed *host* key from any server instead of refusing the connection.
-    pub ignore_host_key_changes: bool,
-}
-
-impl Args {
-    /// Process-wide host-key policy implied by the command line.
-    pub fn host_key_policy(&self) -> crate::ssh::known_hosts::HostKeyPolicy {
-        if self.ignore_host_key_changes {
-            crate::ssh::known_hosts::HostKeyPolicy::Ignore
-        } else {
-            crate::ssh::known_hosts::HostKeyPolicy::default()
-        }
-    }
-}
+pub use args::Args;
 
 /// The config/state paths implied by `--config` (or the platform defaults).
 pub fn paths_for(args: &Args) -> Paths {
@@ -180,14 +164,8 @@ pub fn paths_for(args: &Args) -> Paths {
 ///
 /// Reads `args_os`, not `args`: `std::env::args()` **panics** on an argument that
 /// is not valid UTF-8, and a filename in a non-UTF-8 locale is a perfectly legal
-/// thing to pass. Non-UTF-8 arguments are handled two ways, whichever is
-/// truthful: as a path they are kept byte-for-byte (the OS API is `OsStr`), as an
-/// option name they are rejected with a normal usage error.
-///
-/// Help and version output is written through `write!` rather than `print!` /
-/// `println!`, which panic on a broken pipe or a full disk (`sshpf --help | head
-/// -1`, `> /dev/full`). A help text that cannot be delivered is not an error
-/// worth a panic; the exit code still says what happened.
+/// thing to pass. The rules for how a non-UTF-8 value is treated now live with
+/// the flag declarations in [`args`].
 pub fn parse_args() -> Result<Option<Args>, String> {
     parse_args_from(std::env::args_os().skip(1))
 }
@@ -196,37 +174,7 @@ fn parse_args_from<I>(args: I) -> Result<Option<Args>, String>
 where
     I: IntoIterator<Item = std::ffi::OsString>,
 {
-    let mut parsed =
-        Args { config: None, no_restore: false, list_hosts: false, check: false, ignore_host_key_changes: false };
-    let mut it = args.into_iter();
-    while let Some(arg) = it.next() {
-        // Lossy only for the *match*; a path is stored untouched below.
-        let flag = arg.to_string_lossy().into_owned();
-        match flag.as_str() {
-            "-h" | "--help" => {
-                let _ = write_stdout(USAGE);
-                return Ok(None);
-            }
-            "-V" | "--version" => {
-                let _ = writeln!(std::io::stdout(), "sshpf {}", env!("CARGO_PKG_VERSION"));
-                return Ok(None);
-            }
-            "-c" | "--config" => match it.next() {
-                Some(p) => parsed.config = Some(p),
-                None => {
-                    return Err("--config 需要一个路径参数 / --config needs a path argument".to_string());
-                }
-            },
-            "--no-restore" => parsed.no_restore = true,
-            "--list-hosts" => parsed.list_hosts = true,
-            "--check" => parsed.check = true,
-            "--ignore-host-key-changes" => parsed.ignore_host_key_changes = true,
-            other => {
-                return Err(format!("未知参数 / Unknown option: {other}\n\n{USAGE}"));
-            }
-        }
-    }
-    Ok(Some(parsed))
+    self::args::parse(args)
 }
 
 /// Best-effort stdout write: returns whether it landed, never panics.
@@ -302,6 +250,8 @@ pub fn check_config(paths: &Paths) -> ExitCode {
         }
     }
 }
+
+mod args;
 
 #[cfg(test)]
 mod tests;

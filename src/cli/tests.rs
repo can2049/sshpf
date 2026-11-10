@@ -36,6 +36,50 @@ fn config_takes_the_next_argument_verbatim() {
     assert_eq!(args.config.as_deref(), Some(std::ffi::OsStr::new("rel/config.toml")));
 }
 
+/// The old hand-written loop simply set the bool again, so a repeated flag was
+/// legal. clap rejects a second occurrence by default; `overrides_with` on every
+/// flag is what keeps this from becoming a usage error. Pinned because it is the
+/// kind of difference that only shows up in a shell script nobody re-ran.
+#[test]
+fn a_repeated_flag_is_accepted_not_a_usage_error() {
+    for flag in ["--check", "--list-hosts", "--no-restore", "--ignore-host-key-changes"] {
+        let args = parse(&[flag, flag]).unwrap().unwrap();
+        assert!(
+            args.check || args.list_hosts || args.no_restore || args.ignore_host_key_changes,
+            "{flag} did not stick"
+        );
+    }
+    // Two `-c` are legal too; the last one wins (same as the old loop reading them in order).
+    let args = parse(&["-c", "/tmp/a.toml", "-c", "/tmp/b.toml"]).unwrap().unwrap();
+    assert_eq!(args.config.as_deref(), Some(std::ffi::OsStr::new("/tmp/b.toml")));
+}
+
+/// `--config` takes the next argument **verbatim**, even when it looks like a
+/// flag. `sshpf -c --help` naming a file called `--help` is odd but legal, and it
+/// is what the old parser did (`it.next()` with no inspection). clap would
+/// otherwise treat `--help` as the help flag, so `allow_hyphen_values` pins it.
+#[test]
+fn config_takes_a_flag_shaped_argument_as_its_value() {
+    let args = parse(&["--config", "--help"]).unwrap().unwrap();
+    assert_eq!(args.config.as_deref(), Some(std::ffi::OsStr::new("--help")));
+    assert!(!args.check, "the value must not also be interpreted as a flag");
+}
+
+/// **Deliberate behaviour change**: `--config=PATH` and `-cPATH` are now accepted.
+///
+/// The old loop compared the whole token against `"-c"`/`"--config"`, so an
+/// attached value fell through to "unknown option". clap implements the
+/// conventional GNU form, and reproducing the rejection would mean fighting the
+/// parser for no user benefit. Recorded here so the change is a decision rather
+/// than a surprise, and so the CHANGELOG entry has a test behind it.
+#[test]
+fn an_attached_config_value_is_accepted() {
+    let args = parse(&["--config=/tmp/x.toml"]).unwrap().unwrap();
+    assert_eq!(args.config.as_deref(), Some(std::ffi::OsStr::new("/tmp/x.toml")));
+    let args = parse(&["-c/tmp/x.toml"]).unwrap().unwrap();
+    assert_eq!(args.config.as_deref(), Some(std::ffi::OsStr::new("/tmp/x.toml")));
+}
+
 #[test]
 fn missing_config_value_is_a_usage_error_not_a_panic() {
     let err = parse_err(&["--config"]);

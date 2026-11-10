@@ -68,7 +68,7 @@
 
 | 目录 | 一句话 |
 |---|---|
-| `src/main.rs`、`src/cli.rs`、`src/lib.rs` | 事件循环 + 信号、参数解析 + `USAGE` 双语文本、`pub mod` 声明 |
+| `src/main.rs`、`src/cli.rs`、`src/cli/args.rs`、`src/lib.rs` | 事件循环 + 信号、`USAGE` 双语文本 + 非 UI 模式、clap flag 声明与错误映射、`pub mod` 声明 |
 | `src/app/` | 状态机：持有隧道、消费事件、确认闸、表单、多选 |
 | `src/keys/` | 按键分发，一个上下文一个 handler 文件 |
 | `src/ui/` | 纯渲染（ratatui），每帧重建命中图 |
