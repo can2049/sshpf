@@ -8,7 +8,7 @@
 > 已并入 [docs/import.md](docs/import.md)）在旧条目里保留原名，**不要**为它们补建文件。
 > 当前事实一律以 [docs/index.md](docs/index.md) 指向的文档为准。
 
-## [Unreleased]
+## [0.9.0] - 2026-11-10
 
 ### 行为变更（clap 语义）
 
@@ -57,37 +57,19 @@
 
 ### 修复
 
-- **修复「`sshpf` 启动报 `连接 sshpf 服务端失败：connection timed out` 并直接退出（exit 1），
-  但其实根本没有服务端在跑」。** 触发条件是**服务端上次被强杀**（任务管理器结束进程、关窗、
-  休眠异常）留下的僵尸端点文件：`.port` / `.token` 还在，端口上没人监听，而强杀跳过了正常关闭，
-  所以 `remove_files` 没跑。客户端随后按端口文件去拨号——本机在装有网络过滤驱动时，**一次回环
-  拒绝要 ~2 秒才返回**，超过 `CONNECT_TIMEOUT`（500 ms），于是错误类型是 `TimedOut` 而非
-  `ConnectionRefused`。而 `classify` 只认 `NotFound | ConnectionRefused` 为「没有服务端」，
-  `TimedOut` 落进 `AttachError::Io`，其 `may_spawn()` 为 `false`——**恰好在最该拉起服务端的
-  时候把它跳过了**。现在「有没有服务端」不再由错误码猜，改为问单例锁
-  （新增 `ipc::no_live_server`，`docs/research/client-server/lifecycle.md` §2 一直如此设计，
-  代码此前没有实现）：能拿到锁就证明没人服务，超时也算「没有服务端」，照常拉起。
-- **修复「服务端正在启动时客户端立刻放弃」。** 上一半修好后暴露出的第二层：子进程一旦选举成功
-  就持锁，但还没 `bind`，这个窗口里的拨号同样是 `TimedOut` → `Io`；而 `wait_within` 把
-  `Io` 当致命错误立刻返回，于是用户看到超时而不是已经开始启动的服务端。现在新增
-  `AttachError::worth_waiting_out()`，把「是否值得继续等」与「是否该拉起服务端」分开：
-  `Io` 可以等（`may_spawn` 仍为 `false`），只有**对端真的应答并拒绝**（令牌/协议不符）才是终局。
-- **修复「sshpf 启动后界面上的转发一直显示连接中，但在同一终端里 `ssh <host>` 却是通的」。**
-  这是 0.8.0 client-server 的一个缺陷：服务端的广播泵只在 `revision` 变化时才下发快照，而
-  `revision` 只在**客户端命令**被应用时自增。隧道的 `Ready`、安排重试、进度行都来自隧道线程、
-  不经过命令，于是泵认为「没有变化」、什么都不发——转发其实早已在监听（`netstat` 能看到端口），
-  但每个窗口都停在 `◐ 连接中`。
-  现在泵按**客户端会看到的内容**判断是否下发（新增 `src/server/signature.rs`），`revision`
-  仍是独立触发条件。快照里的时钟戳不入签名，否则「无变化」永不成立、会退化成每 200 ms 全量广播。
-- **服务端现在真的执行 `restore_on_start`。** 同一个 bug 的另一半：`App::restore_enabled`
-  只在 `main::prepare_app` 里被调用，而 `--server` 走的是 `server::start`，从不经过那里——
-  于是 `config.toml` 里写着 `restore_on_start = true`、单进程版也照做，**只有 client-server
-  路径静默不恢复**：服务端启动后每条转发都是 `Stopped`，直到用户按 `a`。
-  （`src/client.rs` 的注释一直声称「启动 server 会跑 `restore_enabled`」，代码里从来没有。）
-- **`--no-restore` 现在会传到服务端。** 补上一半的必然结果：恢复是服务端做的，而这个 flag
-  此前根本没进 `--server` 的启动参数，于是「我要跳过自动恢复」在 client-server 模式下被忽略。
-- **`tests/client_server.rs` 接进 CI。** 这套跨进程测试从 client-server 落地起就没进过 CI，
-  所以上面两个缺陷没有任何 job 能抓到。
+- **修复「界面上的转发一直显示连接中，但同一终端里 `ssh <host>` 是通的」。** 这是 0.8.0
+  client-server 形态的缺陷，触发条件是多窗口共享状态时，隧道线程产生的状态（`Ready`、重试、
+  进度行）不经过客户端命令，广播泵因此认为「没有变化」而不下发，每个窗口都停在 `◐ 连接中`。
+  **随单进程回归一并消失**：进程内直接持有隧道，没有跨进程同步这一层。
+- **修复「`restore_on_start` 在部分启动路径上被静默忽略」。** 同一个缺陷的另一半：
+  `App::restore_enabled` 只在 `main::prepare_app` 里调用，而服务端启动路径不经过那里。
+  单进程回归后只有一条启动路径，恢复行为不再取决于走的是哪条分支。
+- **`--no-restore` 不再有被吞掉的可能。** 该 flag 此前只在部分路径上生效。现在它是本地
+  一个开关，直接决定本进程是否恢复。
+
+> 0.8.0 里针对 client-server 的另外几处修复（僵尸端点文件、服务端启动窗口、广播签名、
+> `tests/client_server.rs` 接 CI）针对的代码已在本次整体删除，故不在此重复；它们的结论
+> 保留在 git 历史与 `docs/research/` 中。
 
 ## [0.8.0] - 2026-11-10
 
