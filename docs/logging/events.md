@@ -55,7 +55,7 @@
 
 ## 隧道生命周期 / Tunnel lifecycle
 
-`kind` 字段是 ASCII 稳定值，旁边配一个 `short` 放界面上的中文短句——前者给 `grep`，后者给人读。**`kind()` 值是日志契约，不许改。**
+`kind` 字段是 ASCII 稳定值，旁边配一个 `short` 放界面上的中文短句——前者给 `grep`，后者给人读。**`name()` 值是日志契约，不许改。**
 
 | `kind` 稳定值 | 界面短句 | 可重试 |
 |---|---|---|
@@ -85,7 +85,6 @@
 | `tunnel.health_failed` | WARN | 隧道字段 + `cause` `detail` `interval_ms` | 探活判定 SSH 会话已失效，本次运行随即以 `stale_connection` 结束。`cause` 是稳定 ASCII 值：`ping_timeout` / `ping_error` / `session_closed`。**探活成功不记日志**，所以没有这条事件不代表探活没跑 |
 | `tunnel.exit` | WARN / ERROR / INFO | 隧道字段 + `was_up` `code` `kind` `short` `msg`；干净退出是 `clean=true` | 会话结束；`was_up=true` 是掉线（WARN），否则 ERROR；用户主动停是 INFO + `clean=true` |
 | `tunnel.retry_scheduled` | WARN | 隧道字段 + `attempt` `delay_ms` `kind` `short` | 安排了退避重连 |
-| `tunnel.retry` | INFO | 隧道字段 + `attempt` | 重连到点，开始重试 |
 | `tunnel.failed` | ERROR | 隧道字段 + `kind` `short` `retryable` `msg` | 终态失败；`retryable` 说明等待是否有用 |
 | `tunnel.retry_abandoned` | WARN | 隧道字段 + `attempt` `stage` `kind` `short` | **重试链放弃**：在 `stage`（`validate`/`preflight_bind`/`resolve_endpoint`/`spawn`）被拒且重试也修不好，退避到此为止 |
 | `tunnel.thread_panic` | ERROR | `tunnel` `msg` | 隧道线程 panic 已被兜住并转为失败退出；栈另见同时写出的 `crash.panic` |

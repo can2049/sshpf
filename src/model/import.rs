@@ -62,15 +62,6 @@ impl SshForward {
         }
     }
 
-    /// `LocalForward` / `RemoteForward` / `DynamicForward`.
-    pub fn directive(&self) -> &'static str {
-        match self.kind {
-            ForwardKind::Local => "LocalForward",
-            ForwardKind::Remote => "RemoteForward",
-            ForwardKind::Dynamic => "DynamicForward",
-        }
-    }
-
     /// `listen` or `listen → target`, for the 目标 column.
     pub fn target_display(&self) -> String {
         match self.kind {

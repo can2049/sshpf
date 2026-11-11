@@ -35,6 +35,7 @@
 
 mod batch;
 mod dedup;
+mod event;
 mod failure;
 mod form;
 mod import;
@@ -55,6 +56,7 @@ pub type TunnelId = u64;
 // these are the stable surface.
 pub use batch::{BatchAction, MultiSelect};
 pub use dedup::{Folded, fold_duplicates};
+pub use event::TunnelEvent;
 pub use failure::{FailureInfo, FailureKind};
 pub use form::{FormField, FormMode, InputBuf};
 pub use import::{

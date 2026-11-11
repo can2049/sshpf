@@ -109,7 +109,7 @@ SectionId 与文案在 src/help.rs 汇总。
 ## 加日志事件 / Add a log event
 
 ```text
-① src/eventlog/<族>.rs   加一个函数（族：process / server / tunnel / ssh / user）
+① src/eventlog/<族>.rs   加一个函数（族：process / tunnel / ssh / user）
 ② docs/logging/events.md 加一行（事件名 | 级别 | 关键字段 | 含义）
 ③ 若有排查价值         docs/logging.md 的「排查配方」加一条
 ```
@@ -118,7 +118,7 @@ SectionId 与文案在 src/help.rs 汇总。
 
 ## 加失败分类 / Add a failure kind
 
-`src/model/failure.rs` 里 `FailureKind` 有**四个**必须同步的地方：`kind()`（ASCII 稳定值，给 grep）、`short()`（中文短句，给表格）、`displays()` 的中英双语、以及 `retryable()` 归类（配置类 vs 网络类）。然后 `docs/logging/events.md` 的 `kind` 稳定值列表加一项。**`kind()` 值是日志契约，不许改。**
+`src/model/failure.rs` 里 `FailureKind` 有**四个**必须同步的地方：`name()`（ASCII 稳定值，给 grep）、`short()`（中文短句，给表格）、`short_en()`（同一行的英文半边）、以及 `is_retryable()` 归类（配置类 vs 网络类）。然后 `docs/logging/events.md` 的 `kind` 稳定值列表加一项。**`name()` 值是日志契约，不许改。**
 
 ## 改文案 / Change user-facing text
 
@@ -149,7 +149,7 @@ SectionId 与文案在 src/help.rs 汇总。
 | 不重复 | 同一事实只详述一处，其余用相对链接 |
 | 不重复模块注释 | 文件的 `//!` 已经写了"什么属于这里"，文档不要逐文件转录 |
 | 路径真实 | 文档链接、代码路径引用、**锚点**都必须存在 |
-| 文件名 | 被 `src/` 引用的不能改：`docs/design.md`、`docs/logging.md`、`docs/keymap.md`、`docs/architecture.md`、`docs/dedup.md` |
+| 文件名 | 被 `src/` 引用的不能改：`docs/design.md`、`docs/logging.md`、`docs/keymap.md`、`docs/dedup.md` |
 
 ## 提交前自检 / Pre-flight checklist
 
@@ -167,13 +167,14 @@ cargo test --test help_coverage        # 动了 help/keys/keymap 必跑
 cargo test --test safety_guards        # 动了 src 结构必跑
 
 # 4) 测试数量守恒（迁移/拆分时）
-cargo test --lib -- --list | wc -l
+cargo test --lib -- --list | grep -c ': test'   # 只数测试行，不含末尾统计行
 ```
 
-文档改动额外跑（每个 md ≤ 400 行 + 全仓路径校验）：
+文档改动额外跑（每个 md ≤ 400 行 + 全仓路径校验）。**CHANGELOG 不在 400 行规则内**——它是只增不改的历史，硬拆会毁掉条目连续性：
 
 ```bash
-wc -l README.md CHANGELOG.md docs/*.md docs/**/*.md
+# bash 默认不开 globstar，所以 `docs/**` 只等于 `docs/*/*`；三层目录要写全
+wc -l README.md docs/*.md docs/*/*.md docs/*/*/*.md
 
 # 全仓路径校验：src/tests/docs/README 里的 md/rs 路径引用必须存在。
 # docs/research/ 被排除：那是历史调研，引用的是 v1 源码与上游 crate 内部路径，
@@ -196,9 +197,9 @@ print('checked; missing:', len(bad))
 EOF
 ```
 
-**唯一的已知良性命中**：`src/logging/panic.rs` 里有个测试夹具故意写 `Some("src/x.rs:1:1")` 当作"panic 位置"的假字符串。它不是文档引用，不该为了自检去改。出现且**只有**这一条时视为通过。
+**已知的良性命中（两条，都在上面出现过）**：`src/logging/panic.rs` 里有个测试夹具故意写 `Some("src/x.rs:1:1")` 当作"panic 位置"的假字符串；以及本文下面那行 Python 注释里的字面 `src/x.rs`。它们不是文档引用，不该为了自检去改。出现且**只有**这两条时视为通过。
 
-**上面的脚本不查锚点**。改了标题就得同步所有 `](foo.md#anchor)` 引用：`grep -rn '](.*\.md#' docs README.md` 列出全部锚点引用，逐个核对目标文件里是否有对应 `##` 标题。
+**上面的脚本不查锚点**。改了标题就得同步所有 `](<目标>.md#<锚点>)` 形式的引用：`grep -rn '](.*\.md#' docs README.md` 列出全部锚点引用，逐个核对目标文件里是否有对应 `##` 标题。
 
 ## 汇报格式 / Reporting back
 

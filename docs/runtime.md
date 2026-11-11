@@ -83,7 +83,7 @@ main 线程（同步）                        每条隧道一个后台线程
 
 ## 事件泵 / Event pump
 
-每帧的顺序（`src/app/events.rs` 头注释）：① 排空 channel（`MAX_EVENTS_PER_FRAME` 上限）② 回收 stderr EOF 与 exit 竞态的子进程 ③ 分类宽限期已过的延迟退出 ④ 触发到期重试 ⑤ 让临时状态消息过期。②–④ 各自还会产生状态变化，所以放在排空之后，不与排空交错。
+每帧的顺序（`src/app/events.rs` 头注释）：① 排空 channel（`MAX_EVENTS_PER_FRAME` 上限）② 回收已退出的隧道线程条目 ③ 分类宽限期已过的延迟退出 ④ 触发到期重试 ⑤ 让临时状态消息过期。②–④ 各自还会产生状态变化，所以放在排空之后，不与排空交错。
 
 `TunnelEvent`（`src/tunnel.rs`）只有 5 个变体——这是 app 与隧道线程之间的全部契约：
 
@@ -130,7 +130,7 @@ Stopped ──start──▶ Starting ──Ready──▶ Up ──Exited(was_u
 | 就绪 | `tunnel.ready`（含 `elapsed_ms`） |
 | 运行 | `tunnel.line`（DEBUG）、`forward.target_failed`、`socks5.rejected` |
 | 探活 | `tunnel.health_failed`（WARN，失败的探活才记） |
-| 结束 | `tunnel.exit`、`tunnel.failed`、`tunnel.retry_scheduled`、`tunnel.retry`、`tunnel.retry_abandoned` |
+| 结束 | `tunnel.exit`、`tunnel.failed`、`tunnel.retry_scheduled`、`tunnel.retry_abandoned`（重试到点本身记 `tunnel.start` + `trigger=retry`） |
 | 停止 | `tunnel.stop`、`tunnel.stop_timeout` |
 | 异常 | `tunnel.thread_panic` |
 

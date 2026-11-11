@@ -17,7 +17,7 @@
 | 行 | 高度 | 内容 | 渲染器 |
 |---|---|---|---|
 | 0 | 1 | 标题：版本、ssh-config 主机数、配置路径、时钟 | `ui::header::draw_title` |
-| 1 | 1 | 计数器：`● 2 up ◐ 0 starting ◌ 0 retrying ✗ 1 failed ○ 1 off` | `draw_counters` |
+| 1 | 1 | 计数器：`● 2 已连通/Up ◐ 0 连接中/Starting ◌ 0 重试/Retrying ✗ 1 失败/Failed ○ 1 未启用/Off`（宽度 < 96 列时退化成 `●2 ◐0 ◌0 ✗1 ○1`） | `draw_counters` |
 | 2 | `Min(1)` | 转发表格 | `ui::table::draw_table` |
 | 3 | 1 | 消息条（`StatusMsg`） | `draw_message` |
 | 4 | `select_mode` | 多选动作条（仅多选模式） | `ui::selection::draw_selection_bar` |

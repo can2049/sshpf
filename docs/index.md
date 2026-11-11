@@ -18,7 +18,7 @@
 |---|---|---|
 | **要动代码（新特性 / 修 bug）** | [agents.md](agents.md#一特性一-worktree--one-worktree-per-change) — 先开 worktree，合并后清理 | `.agents/worktrees/` |
 | 了解整体分层、进程模型、有哪些目录 | [architecture.md](architecture.md) | `src/lib.rs` |
-| 决定「新功能该放哪」 | [architecture.md](architecture.md#新功能放哪--where-does-new-code-go) | `src/*/mod.rs` 头注释 |
+| 决定「新功能该放哪」 | [architecture.md](architecture.md#新功能放哪--where-does-new-code-go) | `src/<层>.rs` 头注释 |
 | 加一个按键 / 改键位 | [agents.md](agents.md#加按键--add-a-key) → [keymap.md](keymap.md) | `src/keys/`、`src/help.rs` |
 | 加一个界面面板 / 改渲染 | [tui.md](tui.md) | `src/ui/` |
 | 改鼠标点击行为 | [tui.md](tui.md#命中图--hit-map) | `src/ui/hit.rs`、`src/app/mouse.rs` |

@@ -144,7 +144,7 @@ impl TunnelConfig {
     ///
     /// This is a pure data identity: it does no I/O, never probes a port and only
     /// serialises fields. A *listen-port* conflict is a different question,
-    /// answered by `config::listen_endpoint`.
+    /// answered by [`TunnelConfig::listen_overlap`].
     pub fn forward_identity(&self) -> String {
         identity_of(self.kind, &self.ssh_host, &self.local_addr, self.local_port, &self.remote_host, self.remote_port)
     }
@@ -168,6 +168,32 @@ impl TunnelConfig {
             ForwardKind::Remote => self.remote_port,
         };
         listen_port <= 1023
+    }
+
+    /// The endpoint this forward *listens* on, per direction.
+    ///
+    /// `-L`/`-D` bind locally, `-R` binds on the server. Both the pre-flight
+    /// bind check and the duplicate-listen guard ask this question, so the
+    /// answer lives next to the definition it reads.
+    pub fn listen_endpoint(&self) -> (&str, u16) {
+        match self.kind {
+            ForwardKind::Local | ForwardKind::Dynamic => (&self.local_addr, self.local_port),
+            ForwardKind::Remote => (&self.remote_host, self.remote_port),
+        }
+    }
+
+    /// Whether these two forwards contend for the same listening socket: the
+    /// same port, and either the same bind address or a wildcard (`0.0.0.0`)
+    /// on one side.
+    ///
+    /// Three call sites need this same answer — config validation, the form's
+    /// live "already in use" hint, and the importer's per-row check — so it is
+    /// defined once. A second spelling of the wildcard test is how one of them
+    /// silently starts disagreeing about `0.0.0.0`.
+    pub fn listen_overlap(&self, other: &TunnelConfig) -> bool {
+        let (aa, ap) = self.listen_endpoint();
+        let (ba, bp) = other.listen_endpoint();
+        ap == bp && (aa == ba || aa == "0.0.0.0" || ba == "0.0.0.0")
     }
 }
 
@@ -352,5 +378,48 @@ mod tests {
         assert!(dynamic.uses_privileged_port());
         dynamic.local_port = 1024;
         assert!(!dynamic.uses_privileged_port(), "1024 is the first unprivileged port");
+    }
+    #[test]
+    fn listen_endpoint_tracks_the_forward_direction() {
+        // -L and -D bind locally; -R binds on the server.
+        let mut local = sample(ForwardKind::Local);
+        local.local_addr = "127.0.0.1".into();
+        assert_eq!(local.listen_endpoint(), ("127.0.0.1", local.local_port));
+
+        let dynamic = sample(ForwardKind::Dynamic);
+        assert_eq!(dynamic.listen_endpoint(), (&*dynamic.local_addr, dynamic.local_port));
+
+        let mut remote = sample(ForwardKind::Remote);
+        remote.remote_host = "0.0.0.0".into();
+        remote.remote_port = 2222;
+        assert_eq!(remote.listen_endpoint(), ("0.0.0.0", 2222));
+    }
+
+    #[test]
+    fn listen_overlap_needs_the_same_port_and_a_shared_or_wildcard_address() {
+        let mut a = sample(ForwardKind::Local);
+        a.local_addr = "127.0.0.1".into();
+        a.local_port = 8080;
+
+        // Same address + same port contend.
+        let mut same = a.clone();
+        assert!(a.listen_overlap(&same));
+
+        // A different address on the same port does not.
+        same.local_addr = "127.0.0.1".into();
+        same.local_port = 8081;
+        assert!(!a.listen_overlap(&same));
+
+        // A wildcard on either side does, which is the case a naive
+        // `addr == addr` comparison gets wrong.
+        let mut wildcard = a.clone();
+        wildcard.local_addr = "0.0.0.0".into();
+        assert!(a.listen_overlap(&wildcard));
+        assert!(wildcard.listen_overlap(&a));
+
+        let mut other_wildcard = a.clone();
+        other_wildcard.local_port = 8081;
+        other_wildcard.local_addr = "0.0.0.0".into();
+        assert!(!a.listen_overlap(&other_wildcard), "a different port never contends");
     }
 }

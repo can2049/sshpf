@@ -1,12 +1,13 @@
 //! Classified ssh failures: a coarse `FailureKind` plus the raw text to show.
 //!
-//! One classification is shared by the supervisor (`tunnel`), the stderr
+//! One classification is shared by the supervisor (`tunnel`), the typed-error
 //! classifier (`ssh::client`) and the renderer, so the table column, the detail
 //! panel and the retry decision can never disagree about what went wrong.
 //!
 //! Belongs here: the failure vocabulary, its short/English/ASCII wording, and
 //! the retryability policy.
-//! Does not belong: matching stderr text (that is `ssh::client::classify`).
+//! Does not belong: mapping a `russh` error onto a kind (that is
+//! `ssh::client::classify`).
 
 /// Coarse failure classification, rendered as a short phrase in the table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,7 +131,8 @@ pub struct FailureInfo {
     pub kind: FailureKind,
     /// Human readable short reason, may be more specific than `kind.short()`.
     pub short: String,
-    /// Raw ssh stderr line(s) — shown verbatim in the detail panel.
+    /// The full error text (a `russh` error chain, or our own context string),
+    /// shown verbatim in the detail panel.
     pub detail: String,
 }
 

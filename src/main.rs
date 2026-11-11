@@ -23,7 +23,7 @@
 //! # Signals
 //!
 //! A signal only flips an atomic flag; the loop then exits *normally* so `Drop`
-//! handlers stop the child processes. `process::exit()` would skip them. Which
+//! handlers stop the tunnel threads. `process::exit()` would skip them. Which
 //! signals exist differs per platform, so [`sshpf::sys::quit_signals`] decides.
 //!
 //! Registration uses `signal-hook`'s safe API (`flag::register` /

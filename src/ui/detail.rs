@@ -1,9 +1,9 @@
 //! The detail/log overlay: everything about one tunnel, scrollable.
 //!
-//! Two things deliberately do not degrade here: the **raw stderr** of a failure
-//! is kept verbatim (a classified short phrase is what the table shows; this
-//! panel is where the unrestricted text lives), and the equivalent `ssh` command
-//! is printed in full so it can be copied. The log tail is the tunnel's own ring
+//! Two things deliberately do not degrade here: the **full failure text** is kept
+//! verbatim (a classified short phrase is what the table shows; this panel is
+//! where the unrestricted text lives), and the equivalent `ssh` command is
+//! printed in full so it can be copied. The log tail is the tunnel's own ring
 //! buffer, not the global log file.
 
 use ratatui::Frame;
@@ -106,7 +106,8 @@ fn field_lines(view: &TunnelView, id: TunnelId, p: Palette) -> Vec<Line<'static>
     lines
 }
 
-/// The failure section: the classified phrase, then the raw stderr **verbatim**.
+/// The failure section: the classified phrase, then the full error text
+/// **verbatim**.
 ///
 /// This is the one place the unrestricted text is shown — the table has room for
 /// a short phrase only — so it is never wrapped or truncated here.

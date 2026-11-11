@@ -2,7 +2,7 @@
 
 > **这份文档回答**：分几层、依赖方向是什么、进程模型是什么、**哪个目录负责什么**（粗粒度）、新代码该放哪。
 > **不负责**：逐文件说明——那个权威在**每个文件自己的 `//!` 头注释**里；具体业务流程见 [runtime.md](runtime.md)、[tui.md](tui.md)、[import.md](import.md)。
-> **相关代码路径**：`src/lib.rs`（模块声明）、`src/*/mod.rs`（各层地图）。
+> **相关代码路径**：`src/lib.rs`（模块声明）、`src/<层>.rs`（各层地图）。
 
 ## 分层 / Layers
 
@@ -28,9 +28,9 @@
 | 层 | 允许依赖 | 绝不允许 |
 |---|---|---|
 | `main`, `cli` | 任何层 | — |
-| `app`, `keys`, `ui` | `tunnel`、`config`、`ssh`、叶子层 | 互相依赖（`ui` 不调 `app`，`keys` 不画界面） |
+| `app`, `keys`, `ui` | `tunnel`、`config`、`ssh`、叶子层 | `ui` 调 `App` 的**变更**方法、`keys` 画界面、`ui`/`keys` 互相调用 |
 | `tunnel`, `config` | `ssh`、叶子层 | `app`、`ui`、`keys` |
-| `ssh` | `model`、`text`、`logging`、`eventlog`、`sys` | `app`、`ui`、`keys`、`tunnel` |
+| `ssh` | `model`、`text`、`logging`、`eventlog`、`sys` | `app`、`ui`、`keys`、`tunnel`（`TunnelEvent` 在 `model`，就是为了不用依赖 `tunnel`） |
 | 叶子层 | 彼此之间尽量少，且只向下 | 任何上层 |
 
 **这次重构修掉的三个违规**（保留作判例，避免回潮）：
@@ -82,7 +82,7 @@
 | `src/help/` | 双语帮助目录（数据，不是散文） |
 | `src/sys/` | 平台差异：文件权限（Unix mode bit / Windows 空实现）、退出信号（Unix 多 `SIGHUP`） |
 
-`src/*.rs` 与 `src/*/mod.rs` 是**模块根**：只做地图 + re-export + 入口函数，不堆实现。
+`src/<层>.rs` 是**模块根**：只做地图 + re-export + 入口函数，不堆实现。（全仓只有一个 `mod.rs` 例外：`src/sys/mod.rs`。）
 
 ### keys 键分发 / `src/keys`
 
@@ -114,7 +114,7 @@
 | 需求 | 放哪 | 还要动 |
 |---|---|---|
 | 新的隧道字段 | `src/model/tunnel.rs` + `src/config.rs`（serde 默认值） | `src/ui/import/row.rs` 若影响展示；`--check` 校验 |
-| 新的失败分类 | `src/model/failure.rs`（`kind()`/`short()`/`displays()` 三处） | [logging/events.md](logging/events.md) 的 `kind` 稳定值列表 |
+| 新的失败分类 | `src/model/failure.rs`（`name()`/`short()`/`short_en()`/`is_retryable()` 四处） | [logging/events.md](logging/events.md) 的 `kind` 稳定值列表 |
 | 新的确认闸动作 | `src/app/confirm.rs` 的 `ConfirmAction` + 文案 | `src/keys/` 触发点；`help` 的 Safety section |
 | 新的批量动作 | `src/model/batch.rs` 的 `BatchAction` | `src/app/select.rs`、`src/ui/selection.rs`、[keymap.md](keymap.md#多选模式--selection-mode) |
 | 新的界面面板（浮层） | `src/app.rs` 的 `Overlay` 变体 + `src/ui/<name>.rs` + `src/keys/<name>.rs` | `HitTarget` 变体 + help section + keymap（清单见 [tui.md](tui.md#加一个可点控件--add-a-clickable-control)） |

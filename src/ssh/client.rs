@@ -34,16 +34,17 @@
 //!
 //! Every tunnel owns one background thread with a `current_thread` tokio
 //! runtime (see [`crate::tunnel`]). The UI thread stays synchronous and receives
-//! [`TunnelEvent`]s over a `std::sync::mpsc`
-//! channel, exactly as it did with child processes.
+//! [`TunnelEvent`](crate::model::TunnelEvent)s over a `std::sync::mpsc` channel.
+//! That enum lives in `model` precisely so this layer does not have to depend on
+//! `tunnel`, which sits above it.
 
 use std::sync::mpsc::Sender;
 
 use anyhow::Result;
 
+use crate::model::TunnelEvent;
 use crate::model::{ForwardKind, TunnelConfig, TunnelId};
 use crate::ssh::config;
-use crate::tunnel::TunnelEvent;
 
 mod auth;
 mod classify;

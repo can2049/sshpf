@@ -17,7 +17,7 @@
 //! | `kill(-pgid, SIGTERM→SIGKILL)` | `task::abort()` + `disconnect()` |
 //! | `PR_SET_PDEATHSIG` orphan guard | unnecessary — no child process exists |
 //! | Windows Job Object | unnecessary — ditto |
-//! | stderr reader thread → `Line` | the driver sends `Line` for milestones |
+//! | reader thread per tunnel → `Line` | the driver's runtime sends `Line` for milestones |
 //! | `try_wait()` polling | thread completion is reported once |
 //!
 //! A hard `SIGKILL` of sshpf still leaves nothing behind: the OS closes the
@@ -28,6 +28,7 @@ use std::sync::mpsc::Sender;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+pub use crate::model::TunnelEvent;
 use crate::model::TunnelId;
 
 /// A tunnel that has been started and not yet observed to finish.
@@ -35,27 +36,6 @@ struct Running {
     /// Requested shutdown. The thread checks this between driver steps.
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     handle: JoinHandle<()>,
-}
-
-/// Events produced by supervised tunnels.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TunnelEvent {
-    /// The forward is genuinely established (the local `bind` succeeded, or the
-    /// server accepted `tcpip-forward`). This replaces every stderr heuristic.
-    Ready { id: TunnelId },
-    /// One progress/diagnostic line for the tunnel log.
-    Line { id: TunnelId, line: String },
-    /// The session ended.
-    ///
-    /// `reason` carries the failure the driver already classified — unlike the
-    /// subprocess era, there is nothing left to infer from a log tail, so the
-    /// precise cause travels with the event. `None` means a clean shutdown.
-    Exited { id: TunnelId, code: Option<i32>, reason: Option<crate::model::FailureInfo> },
-    /// Every line for this run has been delivered, so the consumer may now
-    /// classify the failure using the complete log.
-    StderrClosed { id: TunnelId },
-    /// The tunnel could not even be started.
-    SpawnFailed { id: TunnelId, error: String },
 }
 
 /// Owns every live tunnel thread. Dropping it stops them all.
@@ -94,24 +74,24 @@ impl Supervisor {
         Ok(())
     }
 
-    /// True when the tunnel thread is still supervised.
-    pub fn is_running(&self, id: TunnelId) -> bool {
-        self.running.contains_key(&id)
-    }
-
     pub fn running_count(&self) -> usize {
         self.running.len()
     }
 
-    /// Non-blocking reap. Returns `Some(exit_code)` when the tunnel has just
-    /// finished (and forgets it); `None` while it is still alive.
-    pub fn poll(&mut self, id: TunnelId) -> Option<Option<i32>> {
+    /// Non-blocking reap: when the tunnel thread has finished, forget it and
+    /// return `Some(())`; while it is still alive, return `None`.
+    ///
+    /// The exit code is deliberately not returned: a russh driver reports its
+    /// outcome as `Exited { code, reason }` on the channel, which arrives in
+    /// the same frame as the thread finishing, so re-deriving a code here would
+    /// only be a second, invented source of truth.
+    pub fn poll(&mut self, id: TunnelId) -> Option<()> {
         let running = self.running.get(&id)?;
         if !running.handle.is_finished() {
             return None;
         }
         self.running.remove(&id);
-        Some(Some(0))
+        Some(())
     }
 
     /// Ask one tunnel to stop and wait for its thread to finish.

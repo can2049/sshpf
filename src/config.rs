@@ -212,27 +212,13 @@ impl ConfigFile {
                 if !b.enabled {
                     continue;
                 }
-                if same_listen_endpoint(a, b) {
+                if a.listen_overlap(b) {
                     problems.push(format!("{} 与 {} 监听同一地址 {}", a.name, b.name, a.local_display()));
                 }
             }
         }
         problems
     }
-}
-
-/// Address a tunnel listens on: local for `-L`/`-D`, remote for `-R`.
-pub fn listen_endpoint(cfg: &TunnelConfig) -> (&str, u16) {
-    match cfg.kind {
-        ForwardKind::Local | ForwardKind::Dynamic => (&cfg.local_addr, cfg.local_port),
-        ForwardKind::Remote => (&cfg.remote_host, cfg.remote_port),
-    }
-}
-
-fn same_listen_endpoint(a: &TunnelConfig, b: &TunnelConfig) -> bool {
-    let (aa, ap) = listen_endpoint(a);
-    let (ba, bp) = listen_endpoint(b);
-    ap == bp && (aa == ba || aa == "0.0.0.0" || ba == "0.0.0.0")
 }
 
 /// Field-level validation used by the form and by `load`.
@@ -349,7 +335,7 @@ pub fn load_with_report(path: &Path) -> Result<(ConfigFile, Vec<crate::model::Fo
     if repaired > 0 {
         // Silent repair is a trap: the user's ids are not what they wrote, and
         // any id mentioned in a bug report would otherwise look wrong.
-        crate::logging::warn("config.repaired", &[("path", &path.display().to_string()), ("entries", &repaired)]);
+        crate::eventlog::config_repaired(&path.display().to_string(), repaired);
     }
     // Entries that describe the *same forward* fold into one. Done here, on the
     // parsed list, because this is the layer that owns `config.toml`: the table the

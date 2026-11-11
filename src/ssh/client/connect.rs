@@ -22,10 +22,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use russh::client;
 use tokio::net::TcpStream;
 
+use crate::model::TunnelEvent;
 use crate::model::TunnelId;
 use crate::ssh::config::{self, Endpoint};
 use crate::ssh::known_hosts;
-use crate::tunnel::TunnelEvent;
 
 use super::auth;
 use super::classify::host_key_rejected;

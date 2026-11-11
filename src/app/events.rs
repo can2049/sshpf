@@ -2,7 +2,7 @@
 //!
 //! Split out of [`crate::app::runtime`] because it is the *read* side of the
 //! runtime: `runtime` starts/stops sessions, this file turns the resulting
-//! [`TunnelEvent`](crate::tunnel::TunnelEvent)s into state transitions, retries
+//! [`TunnelEvent`](crate::model::TunnelEvent)s into state transitions, retries
 //! and log lines. Keeping them apart is what makes the timing rules (deferred
 //! exit classification, per-frame event budget, backoff scheduling) readable in
 //! one place.
@@ -10,7 +10,7 @@
 //! The ordering inside one frame matters and is deliberate:
 //!
 //! 1. drain the channel, bounded by [`MAX_EVENTS_PER_FRAME`];
-//! 2. reap children whose stderr EOF raced their exit;
+//! 2. drop the supervisor's entry for a tunnel thread that has finished;
 //! 3. classify deferred exits whose grace window elapsed;
 //! 4. fire due retries;
 //! 5. expire the transient status message.
@@ -23,8 +23,7 @@ use std::time::{Duration, Instant};
 use crate::app::{App, MAX_EVENTS_PER_FRAME, RetryState, backoff, deadline_after};
 use crate::eventlog;
 use crate::help;
-use crate::model::{FailureInfo, FailureKind, LogLevel, StatusMsg, TunnelConfig, TunnelId, TunnelStatus};
-use crate::tunnel::TunnelEvent;
+use crate::model::{FailureInfo, FailureKind, LogLevel, StatusMsg, TunnelConfig, TunnelEvent, TunnelId, TunnelStatus};
 
 impl App {
     /// Drain supervisor events. Called once per UI frame — never blocks, and
@@ -65,11 +64,11 @@ impl App {
                 }
             }
         }
-        // Reap children whose stderr EOF raced ahead of the exit.
+        // Drop supervised entries whose thread has already finished. The exit
+        // itself always arrives as `Exited` + `StderrClosed` on the channel in
+        // that order, so this only reclaims bookkeeping — it never classifies.
         for id in self.supervisor.ids() {
-            if let Some(code) = self.supervisor.poll(id) {
-                self.pending_exit.entry(id).or_insert((code, Instant::now()));
-            }
+            self.supervisor.poll(id);
         }
         self.flush_pending_exits();
         self.tick_retries();
@@ -77,8 +76,8 @@ impl App {
         self.expire_status();
     }
 
-    /// Classify deferred exits once their stderr is complete (or they have
-    /// waited long enough that further lines are not coming).
+    /// Classify deferred exits once the last line for that run has arrived, or
+    /// the grace window has elapsed and no further line is coming.
     pub(crate) fn flush_pending_exits(&mut self) {
         const GRACE: Duration = Duration::from_millis(500);
         let ready: Vec<TunnelId> =
@@ -94,8 +93,8 @@ impl App {
     ///
     /// This is the *only* path to `TunnelStatus::Up`. Because it comes from the
     /// real `bind` / `tcpip_forward` result, none of the old false-ready cases
-    /// (ProxyJump's merged stderr, `-R`'s early "Entering interactive session.")
-    /// can trigger it.
+    /// (a log line echoed before the forward really existed, a merged ProxyJump
+    /// banner, `-R`'s early "Entering interactive session.") can trigger it.
     pub(crate) fn on_ready(&mut self, id: TunnelId) {
         let Some(view) = self.tunnels.iter().find(|t| t.cfg.id == id) else {
             return;
@@ -113,7 +112,6 @@ impl App {
         self.set_state(id, TunnelStatus::Up { since: Instant::now() });
         self.retry_state.remove(&id);
         self.pending_exit.remove(&id);
-        self.saw_listening.insert(id);
         if let Some(v) = self.tunnels.iter_mut().find(|t| t.cfg.id == id) {
             v.retries = 0;
         }
@@ -124,9 +122,8 @@ impl App {
     ///
     /// Readiness is **not** inferred here any more: the driver signals it from
     /// the actual `bind` / `tcpip_forward` result, so the old staged-readiness
-    /// state machine (`saw_listening`, `Entering interactive session.`,
-    /// `remote forward success for`) is gone along with the false-ready bugs it
-    /// worked around.
+    /// markers (`Entering interactive session.`, `remote forward success for`)
+    /// are gone along with the false-ready bugs they worked around.
     pub(crate) fn on_line(&mut self, id: TunnelId, line: String) {
         let warned = line.contains("失败") || line.contains("错误") || line.contains("警告");
         let level = if warned { LogLevel::Warn } else { LogLevel::Info };
@@ -145,13 +142,12 @@ impl App {
     /// Forget everything we know about a tunnel's *current* run.
     ///
     /// Called whenever a tunnel stops or restarts. Five call sites used to
-    /// hand-roll this cleanup and they had already drifted apart (some forgot
-    /// `saw_listening`), so it lives in one place now.
+    /// hand-roll this cleanup and they had already drifted apart, so it lives
+    /// in one place now.
     pub(crate) fn forget_runtime_state(&mut self, id: TunnelId) {
         self.retry_state.remove(&id);
         self.pending_exit.remove(&id);
         self.pending_reason.remove(&id);
-        self.saw_listening.remove(&id);
     }
 
     /// Classify a finished session and move the row to its next state.
@@ -358,7 +354,7 @@ mod tests {
         let (_d, mut app) = app_with(vec![tunnel(1, "chatty", 18003)]);
         let overflow = 500;
         for _ in 0..(MAX_EVENTS_PER_FRAME + overflow) {
-            app.event_tx.send(crate::tunnel::TunnelEvent::Line { id: 1, line: "debug1: x".into() }).unwrap();
+            app.event_tx.send(crate::model::TunnelEvent::Line { id: 1, line: "debug1: x".into() }).unwrap();
         }
         app.drain_events();
         let mut left = 0;
@@ -384,10 +380,10 @@ mod tests {
         // or create state for it.
         let (_d, mut app) = app_with(vec![]);
         for ev in [
-            crate::tunnel::TunnelEvent::Ready { id: 42 },
-            crate::tunnel::TunnelEvent::Line { id: 42, line: "x".into() },
-            crate::tunnel::TunnelEvent::SpawnFailed { id: 42, error: "boom".into() },
-            crate::tunnel::TunnelEvent::StderrClosed { id: 42 },
+            crate::model::TunnelEvent::Ready { id: 42 },
+            crate::model::TunnelEvent::Line { id: 42, line: "x".into() },
+            crate::model::TunnelEvent::SpawnFailed { id: 42, error: "boom".into() },
+            crate::model::TunnelEvent::StderrClosed { id: 42 },
         ] {
             app.event_tx.send(ev).unwrap();
         }

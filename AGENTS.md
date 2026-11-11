@@ -21,17 +21,7 @@ This repository is written for AI agents first and humans second. Everything bel
 
 ## 一特性一 worktree / One worktree per change
 
-**开发新特性、修复问题，先新开一个 worktree + 分支再动手**。不在共享 checkout 里改代码：未提交改动、git index、`target/` 都是共享的，几个人（agent 或人）在里面并行，谁 checkout 一下、谁 `cargo fmt --all` 一下，就把别人的工作打断了。
-
-```bash
-git worktree add .agents/worktrees/feat/my-feature -b feat/my-feature origin/main
-# …开发、自检、提交、push、PR、CI 绿、合并…
-# PR 合并后必须清理：worktree 和分支都不留
-git worktree remove .agents/worktrees/feat/my-feature
-git branch -d feat/my-feature && git push origin --delete feat/my-feature
-```
-
-残留的 worktree / 分支会被当成「这条线还在进行中」，所以**合并即清理**是硬要求，不是收尾礼貌。目录命名、完整生命周期与清理清单见 [`docs/agents.md`](docs/agents.md#一特性一-worktree--one-worktree-per-change)。
+**开发新特性、修复问题，先新开一个 worktree + 分支再动手，合并即清理**（残留 worktree/分支会被当成"这条线还在进行中"）。为什么、目录命名、完整生命周期与清理清单只有一处： [`docs/agents.md`](docs/agents.md#一特性一-worktree--one-worktree-per-change)。
 
 ## 六条硬约定 / Six hard rules
 
@@ -52,6 +42,8 @@ cargo clippy --all-targets -- -D warnings
 cargo test --lib                                   # 单元测试
 cargo test --test safety_guards                    # 安全/体量政策
 cargo test --test help_coverage                    # 帮助覆盖（机器校验）
+cargo test --test host_key_policy                  # 主机密钥策略矩阵（进程内）
+cargo test --test save_key_reachability            # ctrl+s 在所有子焦点下都到达表单
 cargo test --test logging -- --test-threads=1      # 崩溃路径（真二进制）
 cargo test --test panic_hardening -- --test-threads=1
 cargo test --test e2e -- --ignored --test-threads=1  # 需要 sshd

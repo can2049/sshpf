@@ -10,7 +10,7 @@
 //! Identity comes from [`TunnelConfig::forward_identity`] — a pure data
 //! comparison, not a socket check. A **listen-port conflict** (two forwards
 //! fighting over one bind address) is a different question with a different
-//! answer; it lives in `config::listen_endpoint` and is checked separately, so
+//! answer; it lives in `TunnelConfig::listen_endpoint` and is checked separately, so
 //! both keep working.
 //!
 //! # Why the local listen port is not part of `-L`'s identity
