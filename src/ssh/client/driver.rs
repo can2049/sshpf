@@ -33,9 +33,9 @@ use russh::client;
 use tokio::net::TcpListener;
 
 use crate::eventlog;
+use crate::model::TunnelEvent;
 use crate::model::{TunnelConfig, TunnelId};
 use crate::ssh::socks5;
-use crate::tunnel::TunnelEvent;
 
 use super::handler::Handler;
 use super::health;

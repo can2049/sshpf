@@ -254,7 +254,7 @@ impl App {
     ///    already have this" is what is going on; "the listen address collides"
     ///    only describes the symptom.
     /// 2. **Listen-endpoint conflict** — a different forward that wants the same
-    ///    bind address (see `config::listen_endpoint`).
+    ///    bind address (see `TunnelConfig::listen_endpoint`).
     ///
     /// The local listen port of an `-L` forward cannot take part in rule 1: it is
     /// the number `plan_local_port` may have rewritten *and persisted* on an

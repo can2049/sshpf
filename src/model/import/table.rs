@@ -131,10 +131,6 @@ impl ImportTable {
         self.visible().get(self.cursor).and_then(|i| self.rows.get(*i))
     }
 
-    pub fn cursor_forward(&self) -> Option<SshForward> {
-        self.cursor_row().map(|r| r.forward.clone())
-    }
-
     /// Keep `cursor` inside the filtered view. Called after any filter or row
     /// change, because a shrinking view must never leave a dangling cursor.
     pub fn clamp_cursor(&mut self) {

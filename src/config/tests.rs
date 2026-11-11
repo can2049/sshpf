@@ -304,24 +304,6 @@ fn perms_of_a_missing_file_are_not_reported_as_open() {
 }
 
 #[test]
-fn listen_endpoint_tracks_the_forward_direction() {
-    // -L and -D bind locally; -R binds on the server.
-    let mut l = tmp_cfg(1, "l", 8080);
-    l.local_addr = "127.0.0.1".into();
-    assert_eq!(listen_endpoint(&l), ("127.0.0.1", 8080));
-
-    let mut d = tmp_cfg(2, "d", 1080);
-    d.kind = ForwardKind::Dynamic;
-    assert_eq!(listen_endpoint(&d), ("127.0.0.1", 1080));
-
-    let mut r = tmp_cfg(3, "r", 8080);
-    r.kind = ForwardKind::Remote;
-    r.remote_host = "0.0.0.0".into();
-    r.remote_port = 2222;
-    assert_eq!(listen_endpoint(&r), ("0.0.0.0", 2222));
-}
-
-#[test]
 fn validate_tunnel_rejects_each_bad_field() {
     // Each case breaks exactly one field and must be rejected.
     type Break = fn(&mut TunnelConfig);

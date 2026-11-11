@@ -373,9 +373,7 @@ fn import_note(line: usize) -> String {
 
 /// Whether two configs would listen on the same endpoint.
 fn listen_collision(a: &TunnelConfig, b: &TunnelConfig) -> Option<String> {
-    let (aa, ap) = config::listen_endpoint(a);
-    let (ba, bp) = config::listen_endpoint(b);
-    if ap == bp && (aa == ba || aa == "0.0.0.0" || ba == "0.0.0.0") { Some(b.name.clone()) } else { None }
+    a.listen_overlap(b).then(|| b.name.clone())
 }
 
 #[cfg(test)]

@@ -8,6 +8,48 @@
 > 已并入 [docs/import.md](docs/import.md)）在旧条目里保留原名，**不要**为它们补建文件。
 > 当前事实一律以 [docs/index.md](docs/index.md) 指向的文档为准。
 
+## [Unreleased]
+
+### 重构（无行为变化）
+
+- **`TunnelEvent` 下移到 `model`，修掉 `ssh ↔ tunnel` 的循环依赖。** 它住在 `tunnel` 时，
+  `src/ssh/client/{driver,handler,connect,probe}.rs` 必须 `use crate::tunnel::TunnelEvent`，
+  而 `tunnel` 又驱动 `ssh` —— 正是 [docs/architecture.md](docs/architecture.md#分层--layers)
+  明令禁止的那条边，也是唯一没被 `tests/safety_guards.rs` 断言的硬约定。事件是纯数据，
+  现在归 `src/model/event.rs`；`ssh` 不再 import `tunnel`。
+- **删掉 `saw_listening`**（子进程时代的就绪追踪残留）：只有 insert / remove，从无读取。
+  就绪的唯一判据仍是 driver 报的 `Ready`。
+- **删掉 `Supervisor::poll` 的伪退出码**：它恒返回 `Some(Some(0))`，把"线程结束"伪装成
+  "退出码 0"，还可能给已归档的运行再插一条 `pending_exit`、多记一行 `tunnel.exit`。现在只
+  回收监督条目；真正的退出码由 `Exited { code, reason }` 携带。
+- **三处"监听冲突"判据合并为一个** `TunnelConfig::listen_overlap`（`config` 校验、表单实时
+  提示、导入面板逐行检查）。通配地址 `0.0.0.0` 的比较原先抄了三份，改一处就会静默漂移。
+  `listen_endpoint` 随之从 `config`/`ssh`（两份逐字相同的实现）移到 `TunnelConfig`。
+- **删掉死代码**：`SshForward::directive`、`ImportTable::cursor_forward`、
+  `Supervisor::is_running`、`ssh::listen_endpoint`、以及从未 emit 的 `tunnel.retry`
+  事件函数（重试到点本来就记 `tunnel.start` + `trigger=retry`）。
+- **`config.repaired` 改走 `eventlog`**（原先在 `config.rs` 里手写 `logging::warn`，绕过了
+  "事件词汇只在 eventlog 定义"这条规则；派生的 `config_repaired` 反而是死代码）。
+- **`classify` 用 `SHORT_MAX_WIDTH`** 而不是两处硬编码的 `34`。
+
+### 文档（订正与去重）
+
+- **修掉三处不存在的 API**：文档写 `FailureKind::kind()` / `displays()` / `retryable()`，
+  代码是 `name()` / `short()` / `short_en()` / `is_retryable()`；两篇文档还互相矛盾
+  （"三处" vs "四个"）。
+- **`src/*/mod.rs` 不存在**（全仓只有 `src/sys/mod.rs`）；三层文档都让 agent 去开这个文件。
+- **`//!` 模块地图的语法残留**：`ssh command construction + stderr parsing`、
+  `stderr-reader thread per tunnel`、`staged readiness`、`reap children`、
+  `stop the child processes` —— 都是 v1 子进程模型的描述，当前是 russh + 线程。
+- **数字漂移**：单测 570+ → 831；`safety_guards` 8 → 9；文档里那条 `grep -l '^#![cfg(test'`
+  只能数到 20（`src/logging/crash/tests.rs` 是 `#![cfg(all(test, unix))]`），应为 21。
+- **`tests/save_key_reachability.rs`（6 条）此前 CI 从不执行、文档从不提及**，它守的正是
+  `ctrl+s` 被下拉框/列筛选吞掉那个 bug。已加进 CI 的 `test` job，并在 docs/testing.md 立项。
+- **去重**：worktree 生命周期只留在 [docs/agents.md](docs/agents.md)（根 AGENTS.md 一句 +
+  链接）；D38 压回"1–2 句 + 链接"（它自己犯规写了 5 段）；三份"本地验证命令"清单合并为一份。
+- **`ssh_options` 说明改为事实**：该字段会保存并显示，但当前 russh 连接路径不套用它
+  （README 原写作"额外 ssh -o 选项"，读了会以为生效）。
+
 ## [0.9.0] - 2026-11-10
 
 ### 行为变更（clap 语义）

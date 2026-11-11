@@ -21,9 +21,9 @@ use russh::keys::PublicKeyOrCertificate;
 use tokio::net::TcpStream;
 
 use crate::eventlog;
+use crate::model::TunnelEvent;
 use crate::model::TunnelId;
 use crate::ssh::known_hosts;
-use crate::tunnel::TunnelEvent;
 
 /// Policy plus the last verdict, shared with the handler so we can explain a
 /// refusal after `connect_stream` (which does not hand the handler back).

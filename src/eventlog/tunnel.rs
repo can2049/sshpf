@@ -186,11 +186,6 @@ pub fn tunnel_retry_scheduled(cfg: &TunnelConfig, attempt: u32, delay_ms: u128, 
     );
 }
 
-/// A scheduled retry fired.
-pub fn tunnel_retry_fired(cfg: &TunnelConfig, attempt: u32) {
-    tunnel_event(Level::Info, "tunnel.retry", cfg, &[("attempt", attempt.to_string())]);
-}
-
 /// The tunnel settled into a terminal failure — no automatic retry will follow.
 pub fn tunnel_failed(cfg: &TunnelConfig, reason: &FailureInfo) {
     tunnel_failed_on(logging::logger(), cfg, reason);

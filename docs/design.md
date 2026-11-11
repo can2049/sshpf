@@ -4,7 +4,7 @@
 > **不负责**：任何展开叙述——每条只有 1–2 句结论 + 链接。**不要**在这里新增流程/规则说明。
 > **相关代码路径**：无（决策索引）；实现位置见每条末尾。
 >
-> 本文文件名 `docs/design.md` **不能改**：`src/text.rs`、`src/ui.rs`、`src/app.rs`、`src/ssh/config.rs`、`src/ssh/known_hosts.rs`、`src/sys/mod.rs` 的模块注释都引用它。证据来源：`docs/research/`（历史调研，见 [research/README.md](research/README.md)）。
+> 本文文件名 `docs/design.md` **不能改**：`src/text.rs`、`src/cli/args.rs` 的模块注释引用它。证据来源：`docs/research/`（历史调研，见 [research/README.md](research/README.md)）。
 
 ## D1 用 `russh` 而不是调系统 `ssh`
 调 `ssh` 子进程让两平台行为不一致、失败只能正则解析 stderr；纯 Rust 栈失败是结构化 `russh::Error`，三类实测误判 bug 从根上消失（见 D3）。代价：二进制 1.63→4.34 MB，运行时依赖归零。
@@ -162,13 +162,5 @@ panic 走 hook（链式调用上一个，所以 ratatui 恢复终端照常生效
 → `src/text.rs`、`Cargo.toml`（`unicode-width`）
 
 ## D38 参数解析交给 `clap`，帮助文本仍归自己
-原先 `cli.rs` 里是一段手写 `while let`（约 35 行）逐 token 匹配。它没有错，但**字段与规则是两份真相**：`Args` 的字段和 `match` 的分支靠人保证一致，加一个 flag 要改两处，漏一处编译器不吭声。
-现在 flag 只在 `src/cli/args.rs` 的 derive 结构上声明一次，`Args::try_parse_from` 负责解析。**帮助文本没有交给 clap**：`USAGE` 是 111 行双语手册，含快捷键表、鼠标表、日志段这些不挂任何 flag 的自由段落，任何 derive 属性都装不下；它的措辞还被 `docs/keymap.md` 与 README 镜像。让 clap 渲染等于把这份文案重写一遍，属硬约定 6 的「改可观察行为」。
-**这突破了 D37 立的规矩**（加直接依赖的唯一正当理由是「零新增包，只提升已有包」）：clap 新增 5 个包（`clap`、`clap_builder`、`clap_derive`、`clap_lex`、`anstyle`），故此处显式记账。用 `default-features = false` + `std/help/usage/error-context/derive` 把这 5 个压到最小；默认 features 会经 `anstream` 再拉进 7 个纯终端染色包。代价是二进制 +398 KiB（+6.0%）。
-**clap 的语义优先于旧的手写循环**：两者不一致的地方，按 clap 的规则来，不做兼容垫片。三处差异都写进了 `src/cli/tests.rs`：
-- **重复 flag 是错误**。`--check --check` 现在退出 2（旧循环只是把 bool 置两次）。文案映射成双语，不漏 clap 的英文 `error:`/`Usage:` 块。
-- **`--config` 的值不能是旗标形状**。`-c --help` 现在是「需要一个路径参数」退出 2（旧行为把 `--help` 当路径）。真要路径以 `--` 开头，写成 `--config=--help`。
-- **接受连写形式**。`--config=PATH` / `-cPATH` 可用（旧解析器只匹配精确 token）。
-
-仍有一条实现约束必须记住，写在 `src/cli/args.rs` 头注释里：**只能用 `try_parse_from`**，`Args::parse()` 走 `process::exit` 会跳过所有 `Drop`（隧道不停、终端不还）；官方示例的 `err.print().expect(..)` 也不行，`.expect` 是 panic，而 `--help > /dev/full` 不许 panic。
-→ [architecture.md](architecture.md#模块地图--module-map) · `src/cli/args.rs`、`src/cli.rs`
+flag 只在 `src/cli/args.rs` 的 derive 结构上声明一次——手写循环的"字段与规则两份真相"没了。**`USAGE` 仍归自己**，不让 clap 渲染（它被 `docs/keymap.md` 与 README 镜像，属硬约定 6）。语义以 clap 为准、不留兼容垫片；唯一可观察放宽是接受连写形式，三处差异全在 `src/cli/tests.rs`。突破 D37 的代价记账：+5 个依赖包、二进制 +398 KiB。
+→ `src/cli/args.rs`、`src/cli/tests.rs`、[CHANGELOG](../CHANGELOG.md) 0.9.0

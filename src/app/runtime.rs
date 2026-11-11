@@ -1,11 +1,12 @@
 //! Per-tunnel runtime orchestration: start, stop, restart, and the event pump.
 //!
 //! This is the layer that talks to the [`Supervisor`](crate::tunnel::Supervisor)
-//! and turns ssh's stderr
-//! into state transitions. It is deliberately separate from `App`'s own
-//! bookkeeping (selection, filters, overlays) so the tricky timing rules —
-//! staged readiness, deferred exit classification, retry backoff — sit together
-//! in one readable place.
+//! and turns the [`TunnelEvent`](crate::model::TunnelEvent)s it reports into
+//! state transitions — readiness comes from the driver's real `bind` /
+//! `tcpip_forward` result, never from a log line. It is deliberately separate
+//! from `App`'s own bookkeeping (selection, filters, overlays) so the tricky
+//! timing rules — deferred exit classification, retry backoff — sit together in
+//! one readable place.
 
 use std::time::Instant;
 
@@ -91,7 +92,6 @@ impl App {
         };
 
         self.log_connect_intent(id, &cfg, &endpoint);
-        self.saw_listening.remove(&id);
         self.set_state(id, TunnelStatus::Starting { since: Instant::now() });
         self.set_enabled(id, true);
         self.launch(&cfg, id);
@@ -163,7 +163,7 @@ impl App {
         if cfg.kind == ForwardKind::Remote {
             return Ok(());
         }
-        let (addr, port) = config::listen_endpoint(cfg);
+        let (addr, port) = cfg.listen_endpoint();
         if ssh::port_available(addr, port) {
             return Ok(());
         }

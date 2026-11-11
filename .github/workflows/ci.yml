@@ -101,6 +101,13 @@ jobs:
       - name: Host-key policy
         run: cargo test --test host_key_policy
 
+      # Save-key reachability: `ctrl+s` must reach the form from every sub-focus
+      # (host dropdown, import column filter) instead of being typed as the letter
+      # `s`. In-process and platform-independent (`App::new` spawns nothing), but
+      # also a `tests/*.rs` target — so without this line it would never run.
+      - name: Save-key reachability
+        run: cargo test --test save_key_reachability
+
       - name: Build (release)
         run: cargo build --release
 

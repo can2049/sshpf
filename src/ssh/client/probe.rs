@@ -19,8 +19,8 @@ use std::sync::mpsc;
 use anyhow::{Context, Result, bail};
 use russh::ChannelMsg;
 
+use crate::model::TunnelEvent;
 use crate::ssh::config::Endpoint;
-use crate::tunnel::TunnelEvent;
 
 use super::connect::{self, Options};
 

@@ -61,7 +61,7 @@ pub enum ConfirmAction {
     DiscardForm,
     /// Apply one operation to every marked tunnel in selection mode.
     Batch { action: BatchAction, count: usize },
-    /// Quit the program (kills all children).
+    /// Quit the program (stops every tunnel).
     Quit,
 }
 

@@ -40,8 +40,6 @@
 //! * `SSHPF_KNOWN_HOSTS` — use this known_hosts file instead of
 //!   `~/.ssh/known_hosts` (tests).
 
-use crate::model::ForwardKind;
-
 pub mod client;
 pub mod config;
 pub mod forwards;
@@ -168,14 +166,6 @@ fn listening_inodes(_port: u16) -> Vec<String> {
     Vec::new()
 }
 
-/// The endpoint a tunnel listens on, per forward direction.
-pub fn listen_endpoint(cfg: &crate::model::TunnelConfig) -> (&str, u16) {
-    match cfg.kind {
-        ForwardKind::Local | ForwardKind::Dynamic => (&cfg.local_addr, cfg.local_port),
-        ForwardKind::Remote => (&cfg.remote_host, cfg.remote_port),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,31 +208,5 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         drop(listener);
         assert!(port_owner("127.0.0.1", port).is_none());
-    }
-
-    #[test]
-    fn listen_endpoint_tracks_the_forward_direction() {
-        let mut cfg = crate::model::TunnelConfig {
-            id: 1,
-            name: "x".into(),
-            kind: ForwardKind::Local,
-            ssh_host: "h".into(),
-            local_addr: "127.0.0.1".into(),
-            local_port: 8080,
-            remote_host: "10.0.0.1".into(),
-            remote_port: 80,
-            enabled: false,
-            auto_restart: false,
-            ssh_options: vec![],
-            note: String::new(),
-            created_at: 0,
-        };
-        assert_eq!(listen_endpoint(&cfg), ("127.0.0.1", 8080));
-        cfg.kind = ForwardKind::Dynamic;
-        assert_eq!(listen_endpoint(&cfg), ("127.0.0.1", 8080));
-        cfg.kind = ForwardKind::Remote;
-        cfg.remote_host = "0.0.0.0".into();
-        cfg.remote_port = 2222;
-        assert_eq!(listen_endpoint(&cfg), ("0.0.0.0", 2222));
     }
 }

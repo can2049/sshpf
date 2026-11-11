@@ -4,8 +4,8 @@
 //!
 //! ```text
 //! model   shared data types, no I/O, no ratatui
-//! ssh     ~/.ssh/config discovery + ssh command construction + stderr parsing
-//! tunnel  process supervision: spawn / stop / classify / emit events
+//! ssh     ~/.ssh/config discovery + host keys + the russh client (bind/forward)
+//! tunnel  thread supervision: spawn / stop / classify / emit events
 //! config  persistence of tunnel definitions (TOML, 0600)
 //! app     state machine: owns tunnels, routes events, handles keys
 //! ui      pure rendering of app state (ratatui)

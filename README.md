@@ -10,8 +10,8 @@ SSH 端口转发管理器，命令行 TUI 表格界面，Linux 与 Windows 均�
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
-│  sshpf 0.5.0  ·  ssh-config: 12 hosts  ·  cfg: ~/.config/sshpf/config.toml          13:47:03    │
-│  ● 2 up   ◐ 0 starting   ◌ 0 retrying   ✗ 1 failed   ○ 1 off                                     │
+│ sshpf 0.9.0 · ssh-config: 12 hosts · 单进程/owner · cfg: ~/.config/sshpf/config.toml     13:47:03│
+│ ● 2 已连通/Up  ◐ 0 连接中/Starting  ◌ 0 重试/Retrying  ✗ 1 失败/Failed  ○ 1 未启用/Off           │
 ├──────────────────────────────────────────────────────────────────────────────────────────────────┤
 │   名称          T 本地             远端             SSH 主机    状态        最后错误             │
 │ ▶ web-ssh       L 127.0.0.1:19711  127.0.0.1:22    web-server  ● 已连通    —                    │
@@ -172,7 +172,7 @@ remote_host = "127.0.0.1"
 remote_port = 22
 enabled = true            # 上次是否在运行 → 启动时据此恢复
 auto_restart = true
-ssh_options = []          # 额外 ssh -o 选项，如 ["Compression=yes"]
+ssh_options = []          # 预留字段：保存与详情页展示，当前 russh 连接路径不套用它
 note = ""
 ```
 
@@ -241,11 +241,14 @@ grep 'event=knownhosts.rejected' ~/.local/state/sshpf/logs/sshpf.log   # Windows
 ## 开发 / Development
 
 ```bash
-cargo test                                     # 单元 + 集成（e2e 默认跳过）
+cargo test --lib                               # 单元测试
 cargo test --test help_coverage                # 帮助/键位机器校验
-cargo test --test e2e -- --ignored --test-threads=1   # 真实 sshd 端到端
-cargo clippy --all-targets                     # 零警告
-cargo fmt --check
+cargo test --test safety_guards                # 安全与体量政策
+cargo test --test host_key_policy              # 主机密钥策略矩阵
+cargo test --test save_key_reachability        # ctrl+s 入口可达性
+cargo test --test e2e -- --ignored --test-threads=1   # 真实 sshd 端到端（需 sshd）
+cargo clippy --all-targets -- -D warnings
+cargo fmt --all --check
 ```
 
 | 我想… | 读 |

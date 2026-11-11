@@ -3,8 +3,8 @@
 //!
 //! There is deliberately no `tokio` here. The UI thread polls
 //! `crossterm::event::poll(200ms)` and drains an `mpsc` channel fed by one
-//! stderr-reader thread per tunnel — the architecture validated in
-//! `docs/research/tech-options.md` §3.3.
+//! tunnel thread per forward (each owning a `current_thread` runtime) — the
+//! architecture validated in `docs/research/tech-options.md` §3.3.
 
 use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -14,12 +14,13 @@ use crate::config::{self, ConfigFile, Paths};
 use crate::eventlog;
 use crate::help;
 use crate::logging;
+use crate::model::TunnelEvent;
 use crate::model::{
     FailureInfo, FormMode, ForwardKind, HostPicker, MultiSelect, PortPick, StatusMsg, TunnelConfig, TunnelId,
     TunnelView,
 };
 use crate::ssh::SshHost;
-use crate::tunnel::{Supervisor, TunnelEvent};
+use crate::tunnel::Supervisor;
 
 pub mod confirm;
 pub mod duplicate;
@@ -119,9 +120,6 @@ pub struct App {
     /// The failure reason carried by a just-observed exit, waiting to be paired
     /// with its `Exited`/`StderrClosed` counterpart.
     pending_reason: HashMap<TunnelId, Option<FailureInfo>>,
-    /// Tunnels whose driver reported readiness. Retained for compatibility with
-    /// the stop/restart bookkeeping (`forget_runtime_state`).
-    saw_listening: std::collections::HashSet<TunnelId>,
     /// Multi-row selection on the main table (`v` enters selection mode).
     pub select_mode: MultiSelect,
     /// Semantic map of what was drawn last frame, for mouse hit-testing.
@@ -203,7 +201,6 @@ impl App {
             pending_form: None,
             pending_exit: HashMap::new(),
             pending_reason: HashMap::new(),
-            saw_listening: std::collections::HashSet::new(),
             select_mode: MultiSelect::new(),
             hits: crate::ui::hit::HitMap::new(),
             import_error: None,
@@ -290,14 +287,11 @@ impl App {
     }
 
     fn listen_conflict(&self, candidate: &TunnelConfig) -> Option<String> {
-        let (addr, port) = config::listen_endpoint(candidate);
         for t in &self.tunnels {
             if t.cfg.id == candidate.id {
                 continue;
             }
-            let (a, p) = config::listen_endpoint(&t.cfg);
-            let overlapping = p == port && (a == addr || a == "0.0.0.0" || addr == "0.0.0.0");
-            if overlapping {
+            if candidate.listen_overlap(&t.cfg) {
                 return Some(t.cfg.name.clone());
             }
         }

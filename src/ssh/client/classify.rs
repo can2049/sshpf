@@ -159,7 +159,8 @@ fn find_russh_error(err: &anyhow::Error) -> Option<&russh::Error> {
     None
 }
 
-/// A short (<= 34 display cells) phrase for the table's error column.
+/// A short (<= [`crate::ssh::SHORT_MAX_WIDTH`] display cells) phrase for the
+/// table's error column.
 fn short_reason(kind: FailureKind, text: &str) -> String {
     let s = match kind {
         FailureKind::PortInUse => "端口已被占用",
@@ -184,7 +185,7 @@ fn short_reason(kind: FailureKind, text: &str) -> String {
             t.push_str(": ");
             t.push_str(first);
         }
-        return crate::text::truncate_to_width(&t, 34);
+        return crate::text::truncate_to_width(&t, crate::ssh::SHORT_MAX_WIDTH);
     }
     s.to_string()
 }
@@ -290,7 +291,11 @@ mod tests {
     fn unknown_short_reason_is_truncated() {
         let long = "x".repeat(200);
         let info = classify(&err_with(&long));
-        assert!(crate::text::display_width(&info.short) <= 34, "short too wide: {:?}", info.short);
+        assert!(
+            crate::text::display_width(&info.short) <= crate::ssh::SHORT_MAX_WIDTH,
+            "short too wide: {:?}",
+            info.short
+        );
     }
 
     #[test]
