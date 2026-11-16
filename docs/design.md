@@ -166,5 +166,5 @@ flag 只在 `src/cli/args.rs` 的 derive 结构上声明一次——手写循环
 → `src/cli/args.rs`、`src/cli/tests.rs`、[CHANGELOG](../CHANGELOG.md) 0.9.0
 
 ## D39 分组 = 运行互斥单元，不是第二份进程/配置
-`active_group` 至多一个；只有它的 enabled 转发会运行。浏览与工作分离：`[`/`]` 只换表格，`w` 才切换工作分组（有运行中转发时先确认）。切换只停运行态、**保留 `enabled`**，否则切回来的分组会变成空的。旧版单层配置在载入时收进一个隐式工作分组，升级后仍恢复原来的转发。去重/监听冲突/端口推荐都按组隔离——不同分组可以故意重复同一转发。
+`active_group` 至多一个；只有它的 enabled 转发会运行。浏览与工作分离：`tab`/`shift+tab` 只换表格，`w` 才切换工作分组（有运行中转发时先确认）。切换只停运行态、**保留 `enabled`**，否则切回来的分组会变成空的。旧版单层配置在载入时收进一个隐式工作分组，升级后仍恢复原来的转发。去重/监听冲突/端口推荐都按组隔离——不同分组可以故意重复同一转发。
 → [runtime.md](runtime.md#分组--groups) · `src/app/group.rs`、`src/model/group.rs`、`src/config/group.rs`

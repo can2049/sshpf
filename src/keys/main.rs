@@ -44,8 +44,8 @@ pub(super) fn handle_main_key(app: &mut App, key: KeyEvent) {
         // is looking at; a mode that starts empty would need a second gesture
         // before anything can be marked.
         KeyCode::Char('v') | KeyCode::Char('V') => app.toggle_select_mode(),
-        KeyCode::Char('[') => app.browse_group(-1),
-        KeyCode::Char(']') => app.browse_group(1),
+        KeyCode::Tab => app.browse_group(1),
+        KeyCode::BackTab => app.browse_group(-1),
         KeyCode::Char('w') => app.request_toggle_work(),
         KeyCode::Char('N') => app.open_group_create(),
         KeyCode::Char('R') => app.open_group_rename(),
@@ -174,10 +174,10 @@ mod tests {
         app.active_group = Some(1);
         app.browsed_group = 1;
 
-        handle_key(&mut app, ch(']'));
-        assert_eq!(app.browsed_group, 2, "] browses forward");
-        handle_key(&mut app, ch('['));
-        assert_eq!(app.browsed_group, 1, "[ browses back");
+        handle_key(&mut app, key(KeyCode::Tab));
+        assert_eq!(app.browsed_group, 2, "tab browses forward");
+        handle_key(&mut app, key(KeyCode::BackTab));
+        assert_eq!(app.browsed_group, 1, "shift+tab browses back");
 
         handle_key(&mut app, ch('N'));
         assert!(matches!(app.overlay, Overlay::GroupName), "N opens the alias input");

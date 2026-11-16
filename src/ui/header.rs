@@ -172,8 +172,8 @@ pub(crate) fn draw_message(frame: &mut Frame, app: &App, area: Rect) {
         // Browsing never starts anything. Say so before the generic idle hint:
         // otherwise every row looks merely "off" and space appears broken.
         let idle = fit_pair_spaced(
-            "当前分组未工作 · w 开始转发 · [/] 浏览分组",
-            "This group is idle · w to work · [/] browse groups",
+            "当前分组未工作 · w 开始转发 · tab 浏览分组",
+            "This group is idle · w to work · tab to browse groups",
             area.width as usize,
         );
         Line::from(Span::styled(format!(" {idle}"), p.fg(p.pending)))

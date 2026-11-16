@@ -97,8 +97,9 @@ sshpf — SSH 端口转发 TUI 管理器 / SSH port-forward manager for the term
   x         全部停用（需确认）/ Stop all forwards (asks first)
   v / V     进入 / 退出多选模式（批量启停、重启、删除）
             Enter / leave selection mode (batch start, restart, delete)
-  [ / ]     浏览上一个 / 下一个分组（只切换列表，不启停）
-            Browse the previous / next group (browse only)
+  tab / shift+tab
+            浏览下一个 / 上一个分组（只切换列表，不启停）
+            Browse the next / previous group (browse only)
   w         让当前分组开始 / 停止工作（运行中先确认）
             Make this group work / stop working (asks first while running)
   N         新建分组 / Create a group

@@ -49,7 +49,7 @@ pub(crate) type Hint = (&'static str, &'static str, &'static str);
 const MAIN_HINTS: &[Hint] = &[
     ("j/k ↑↓", "移动", "Move"),
     ("g/G", "首尾", "First·Last"),
-    ("[/]", "换组", "Groups"),
+    ("tab ⇧tab", "换组", "Groups"),
     ("w", "分组工作", "Work"),
     ("N/R/D", "建/改/删组", "Group ops"),
     ("space", "启停", "Start·Stop"),

@@ -425,8 +425,6 @@ const NAMED_TOKENS: &[&str] = &[
     "shift+up",
     "?",
     "/",
-    "[",
-    "]",
 ];
 
 /// Letters are case-sensitive: `x` and `X`, `r` and `R`, `v` and `V`, `s` and `S`

@@ -33,7 +33,7 @@ pub(super) const MAIN: HelpSection = HelpSection {
         HelpItem::new("x", "全部停用（先确认）", "Disable all (asks first)"),
         HelpItem::new("?", "打开 / 关闭本帮助", "Open / close this help"),
         HelpItem::new("v / V", "进入 / 退出多选模式", "Enter / leave selection mode"),
-        HelpItem::new("[ / ]", "浏览上一个 / 下一个分组", "Browse the previous / next group"),
+        HelpItem::new("tab / shift+tab", "浏览下一个 / 上一个分组", "Browse the next / previous group"),
         HelpItem::new(
             "w",
             "让当前分组开始 / 停止工作（运行中先确认）",

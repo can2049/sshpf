@@ -133,7 +133,7 @@ impl App {
         None
     }
 
-    /// `[` / `]`: move the browse cursor, wrapping at the ends.
+    /// `tab` / `shift+tab`: move the browse cursor, wrapping at the ends.
     pub fn browse_group(&mut self, delta: isize) {
         let n = self.cfg.groups.len();
         if n == 0 {

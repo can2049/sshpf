@@ -53,7 +53,7 @@
 | `/` | 按名称或 SSH 主机过滤 | Filter by name or SSH host |
 | `a` / `x` | 全部启用 / 全部停用（均先确认） | Enable all / disable all (both ask first) |
 | `v` / `V` | 进入 / 退出多选模式（两个键同效） | Enter / leave selection mode (`v` and `V` are aliases) |
-| `[` / `]` | 浏览上一个 / 下一个分组（只切换表格，不启停） | Browse the previous / next group (browse only) |
+| `tab` / `shift+tab` | 浏览下一个 / 上一个分组（只切换表格，不启停） | Browse the next / previous group (browse only) |
 | `w` | 让当前分组开始 / 停止工作；运行中会先确认 | Make this group work / stop working; asks first if running |
 | `N` | 新建分组 | Create a group |
 | `R` | 重命名当前分组的别名（任何时候都可改） | Rename the current group (at any time) |
