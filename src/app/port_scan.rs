@@ -293,8 +293,8 @@ impl App {
             {
                 form.remote_host.set(host);
             }
-            form.revalidate();
         }
+        self.revalidate_form();
         self.refresh_local_port_suggestion();
         self.close_port_picker();
         self.set_status(StatusMsg::ok(help::bi(

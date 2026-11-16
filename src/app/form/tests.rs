@@ -198,6 +198,38 @@ fn a_form_with_an_empty_import_table_is_not_mistaken_for_a_batch() {
 }
 
 #[test]
+fn a_port_held_by_another_group_is_not_bumped_or_called_a_conflict() {
+    // Another group may be listening on this port right now. Groups never run
+    // together, so the form must keep the requested number instead of treating
+    // the live listener as a reason to shift the forward.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a local listener");
+    let port = listener.local_addr().expect("bound address").port();
+    let mut f = create_form();
+    f.remote_port.set(port.to_string());
+
+    f.suggest_local_port_with(&[], &[port]);
+    assert_eq!(f.local_port.value(), port.to_string(), "the requested port must survive");
+
+    f.revalidate_with(&[port]);
+    let hint = f.port_hint.clone().unwrap_or_default();
+    assert!(!hint.contains("占用"), "another group's listener is not a conflict: {hint}");
+    assert!(hint.contains("本分组可用"), "the hint must say the port works here: {hint}");
+}
+
+#[test]
+fn a_same_group_port_still_reads_as_occupied() {
+    // The allowance is cross-group only: a live listener that is *not* in the
+    // allowed set keeps the ordinary warning.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a local listener");
+    let port = listener.local_addr().expect("bound address").port();
+    let mut f = create_form();
+    f.local_port.set(port.to_string());
+    f.revalidate();
+    let hint = f.port_hint.clone().unwrap_or_default();
+    assert!(hint.contains("已被占用"), "a plain occupied port must still warn: {hint}");
+}
+
+#[test]
 fn input_buffers_survive_a_degenerate_cursor() {
     // `cursor` is a public field on `InputBuf`; a stale value past the end
     // must clamp rather than slice-panic.

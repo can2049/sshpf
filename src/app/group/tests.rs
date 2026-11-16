@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::config::{ConfigFile, Paths};
-use crate::model::{ForwardKind, GroupConfig, TunnelConfig, TunnelStatus};
+use crate::model::{ForwardKind, GroupConfig, SshForward, TunnelConfig, TunnelStatus};
 use std::time::Instant;
 
 fn tunnel(id: crate::model::TunnelId, group: crate::model::GroupId, enabled: bool) -> TunnelConfig {
@@ -181,6 +181,39 @@ fn deleting_a_group_removes_its_tunnels_and_never_the_last_group() {
 
     app.request_delete_group();
     assert_eq!(app.cfg.groups.len(), 1, "the last group is never deleted");
+}
+
+#[test]
+fn foreign_group_ports_exclude_the_browsed_group() {
+    let (_d, mut app) = two_groups();
+    assert_eq!(app.foreign_group_local_ports(), vec![18002], "group 2's port is foreign while browsing 1");
+    app.browse_to(2);
+    assert_eq!(app.foreign_group_local_ports(), vec![18001], "and the other way around");
+}
+
+#[test]
+fn importing_into_a_group_can_reuse_a_port_held_by_another_group() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a local listener");
+    let port = listener.local_addr().expect("bound address").port();
+    let (_d, mut app) =
+        app_with(vec![GroupConfig::new(1, "work"), GroupConfig::new(2, "home")], Some(1), vec![tunnel(1, 1, true)]);
+    app.tunnels[0].cfg.local_port = port;
+    app.cfg.find_mut(1).unwrap().local_port = port;
+    app.browse_to(2);
+
+    let forward = SshForward {
+        kind: ForwardKind::Local,
+        listen_addr: String::new(),
+        listen_port: port,
+        target_host: "127.0.0.1".into(),
+        target_port: port,
+        host_alias: "h".into(),
+        line: 1,
+        raw: String::new(),
+    };
+    let cfg = app.config_from_forward(9, &forward, &[]);
+    assert_eq!(cfg.group, 2);
+    assert_eq!(cfg.local_port, port, "the other group's live port must not shift this import");
 }
 
 #[test]

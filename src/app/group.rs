@@ -87,12 +87,36 @@ impl App {
             .collect()
     }
 
+    /// Local ports claimed by **other** groups.
+    ///
+    /// Used only to suppress false "in use" answers. Another group never listens
+    /// at the same time, so its current listener must not push this group's
+    /// forward onto a different port. `-R` is excluded: its `local_port` is a
+    /// target, not a local listener.
+    pub fn foreign_group_local_ports(&self) -> Vec<u16> {
+        self.tunnels
+            .iter()
+            .filter(|t| t.cfg.group != self.browsed_group)
+            .filter(|t| t.cfg.kind != ForwardKind::Remote)
+            .map(|t| t.cfg.local_port)
+            .collect()
+    }
+
     /// Recompute the local-port suggestion for the open form.
     pub fn refresh_local_port_suggestion(&mut self) {
         let taken = self.taken_local_ports();
+        let foreign = self.foreign_group_local_ports();
         if let Some(form) = self.form.as_mut() {
-            form.suggest_local_port(&taken);
-            form.revalidate();
+            form.suggest_local_port_with(&taken, &foreign);
+            form.revalidate_with(&foreign);
+        }
+    }
+
+    /// Re-validate the open form while treating other groups' ports as free.
+    pub fn revalidate_form(&mut self) {
+        let foreign = self.foreign_group_local_ports();
+        if let Some(form) = self.form.as_mut() {
+            form.revalidate_with(&foreign);
         }
     }
 

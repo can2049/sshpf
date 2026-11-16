@@ -155,6 +155,7 @@ impl App {
         // port: a batch that collides with itself fails at bind time with an error
         // that points at the wrong row.
         let mut taken = self.taken_local_ports();
+        let allow_occupied = self.foreign_group_local_ports();
         let mut out: Vec<TunnelConfig> = Vec::with_capacity(ports.len());
         let mut skipped: Vec<String> = Vec::new();
         let mut errors: Vec<String> = Vec::new();
@@ -162,7 +163,7 @@ impl App {
         for (id, port) in (base_id..=last_id).zip(ports.iter().copied()) {
             let mut cfg = port_config(form, id, self.browsed_group, &ssh_host, &remote_host, port, &taken);
             cfg.name = unique_within(&cfg.name, out.iter().map(|c| c.name.clone()).collect());
-            cfg.local_port = plan_local(&cfg, &taken).unwrap_or(cfg.local_port);
+            cfg.local_port = plan_local(&cfg, &taken, &allow_occupied).unwrap_or(cfg.local_port);
             if let Some(existing) = self.duplicate_in_batch(&cfg, &out) {
                 eventlog::action_duplicate_skipped("port-scan", &cfg.name, &existing);
                 skipped.push(cfg.name);
@@ -290,10 +291,12 @@ fn port_config(
 
 /// The local port for one row of the batch: the same number when it is free,
 /// otherwise the next one up.
-fn plan_local(cfg: &TunnelConfig, taken: &[u16]) -> Option<u16> {
+fn plan_local(cfg: &TunnelConfig, taken: &[u16], allow_occupied: &[u16]) -> Option<u16> {
     let addr = if cfg.local_addr.is_empty() { "127.0.0.1" } else { cfg.local_addr.as_str() };
-    model::plan_local_port(cfg.remote_port, taken, |candidate| ssh::port_available(addr, candidate))
-        .map(|(port, _)| port)
+    model::plan_local_port(cfg.remote_port, taken, |candidate| {
+        allow_occupied.contains(&candidate) || ssh::port_available(addr, candidate)
+    })
+    .map(|(port, _)| port)
 }
 
 /// A name not already used by `siblings` (the rest of the batch).

@@ -46,7 +46,8 @@ impl App {
     /// drives the same upward scan the manual form uses — without it, enabling a
     /// batch would fail with "port in use" on a port `sshpf` itself holds.
     pub fn config_from_forward(&self, id: crate::model::TunnelId, forward: &SshForward, taken: &[u16]) -> TunnelConfig {
-        let ends = forward_ends(&self.cfg.defaults.bind, forward, taken);
+        let foreign = self.foreign_group_local_ports();
+        let ends = forward_ends(&self.cfg.defaults.bind, forward, taken, &foreign);
         TunnelConfig {
             id,
             group: self.browsed_group,
@@ -360,7 +361,7 @@ fn unique_within(base: &str, siblings: Vec<String>) -> String {
 /// added here is the *planning*: `-L`/`-D` bind locally, so only those need a
 /// collision-free port, and `taken` keeps two rows of one batch from being handed
 /// the same one.
-fn forward_ends(bind: &str, forward: &SshForward, taken: &[u16]) -> ForwardEnds {
+fn forward_ends(bind: &str, forward: &SshForward, taken: &[u16], allow_occupied: &[u16]) -> ForwardEnds {
     let mut ends = forward.ends(bind);
     // `-R` does not bind locally, so its port is passed through untouched.
     if forward.kind == ForwardKind::Remote {
@@ -369,7 +370,9 @@ fn forward_ends(bind: &str, forward: &SshForward, taken: &[u16]) -> ForwardEnds 
     // A privileged port is never scanned upwards from itself, which would spend
     // the whole budget inside the range that needs root.
     let addr = ends.local_addr.clone();
-    if let Some((port, _)) = model::plan_local_port(ends.local_port, taken, |c| ssh::port_available(&addr, c)) {
+    if let Some((port, _)) =
+        model::plan_local_port(ends.local_port, taken, |c| allow_occupied.contains(&c) || ssh::port_available(&addr, c))
+    {
         ends.local_port = port;
     }
     // Nothing usable found: keep the requested port so validation reports the real

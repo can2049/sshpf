@@ -133,8 +133,8 @@ fn handle_field_editing(app: &mut App, key: KeyEvent) {
 fn save_from_editing(app: &mut App) {
     if let Some(f) = app.form.as_mut() {
         f.end_edit();
-        f.revalidate();
     }
+    app.revalidate_form();
     app.submit_form();
 }
 
@@ -142,8 +142,8 @@ fn save_from_editing(app: &mut App) {
 fn end_editing(app: &mut App) {
     if let Some(f) = app.form.as_mut() {
         f.end_edit();
-        f.revalidate();
     }
+    app.revalidate_form();
 }
 
 /// Whether the cursor is on the SSH-host field (checked *before* the edit ends,
@@ -259,8 +259,8 @@ fn adjust_field(app: &mut App, field: FormField, key: KeyEvent) {
 fn move_field(app: &mut App, forward: bool) {
     if let Some(f) = app.form.as_mut() {
         f.field = if forward { f.field.next() } else { f.field.prev() };
-        f.revalidate();
     }
+    app.revalidate_form();
 }
 
 fn edit_field(app: &mut App, field: FormField, key: &KeyEvent) {
@@ -280,7 +280,7 @@ fn edit_field(app: &mut App, field: FormField, key: &KeyEvent) {
         KeyCode::End => buf.end(),
         _ => return,
     }
-    form.revalidate();
+    app.revalidate_form();
 }
 
 #[cfg(test)]
