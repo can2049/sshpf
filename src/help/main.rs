@@ -33,12 +33,38 @@ pub(super) const MAIN: HelpSection = HelpSection {
         HelpItem::new("x", "全部停用（先确认）", "Disable all (asks first)"),
         HelpItem::new("?", "打开 / 关闭本帮助", "Open / close this help"),
         HelpItem::new("v / V", "进入 / 退出多选模式", "Enter / leave selection mode"),
+        HelpItem::new("tab / shift+tab", "浏览下一个 / 上一个分组", "Browse the next / previous group"),
+        HelpItem::new(
+            "w",
+            "让当前分组开始 / 停止工作（运行中先确认）",
+            "Make this group work / stop working (asks if running)",
+        ),
+        HelpItem::new("N", "新建分组", "Create a group"),
+        HelpItem::new("R", "重命名当前分组的别名", "Rename the current group"),
+        HelpItem::new("D", "删除当前分组及其转发（先确认）", "Delete this group and its forwards (asks first)"),
         HelpItem::new("esc", "清除过滤", "Clear the filter"),
         HelpItem::new("q", "退出 sshpf（先确认）", "Quit sshpf (asks first)"),
         HelpItem::note(
             "没有未启用条目时 a 只给提示；没有运行中条目时 x 只给提示。",
             "With nothing off, a only reports it; with nothing running, x only reports it.",
         ),
+        HelpItem::note(
+            "同时只有一个分组处于工作状态；浏览其它分组不会启停任何转发。",
+            "Only one group works at a time; browsing another group never starts or stops anything.",
+        ),
+    ],
+};
+
+pub(super) const GROUP_NAME: HelpSection = HelpSection {
+    id: SectionId::GroupName,
+    title_zh: "分组别名",
+    title_en: "Group alias",
+    items: &[
+        HelpItem::new("enter", "保存别名", "Save the alias"),
+        HelpItem::new("esc", "取消并关闭", "Cancel and close"),
+        HelpItem::new("backspace / delete", "删除光标前 / 后一个字符", "Delete before / after the cursor"),
+        HelpItem::new("← / → / home / end", "移动光标", "Move the cursor"),
+        HelpItem::note("任意字符输入别名；留空时显示 #编号。", "Type an alias; an empty alias shows #id."),
     ],
 };
 

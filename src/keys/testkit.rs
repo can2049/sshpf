@@ -41,6 +41,7 @@ pub(super) fn ch(c: char) -> KeyEvent {
 pub(super) fn tunnel(id: u64, name: &str, port: u16) -> TunnelConfig {
     TunnelConfig {
         id,
+        group: 1,
         name: name.into(),
         kind: ForwardKind::Local,
         ssh_host: "testhost".into(),

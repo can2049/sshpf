@@ -15,7 +15,7 @@
 //!
 //! | file | sections | add a row when… |
 //! |---|---|---|
-//! | [`main`] | `Main`, `Selection` | the key works on the dashboard or in `v` mode |
+//! | [`main`] | `Main`, `Selection`, `GroupName` | the key works on the dashboard, in `v` mode, or in the group-alias input |
 //! | [`form`] | `Form`, `FormEditing`, `HostPicker` | the key works in the create/edit form or its host dropdown |
 //! | [`import`] | `ImportPane`, `ImportFilter` | the key works in the `~/.ssh/config` import pane |
 //! | [`ports`] | `PortPicker` | the key works in the peer's listening-port list (`p`) |
@@ -76,6 +76,8 @@ pub enum SectionId {
     FilterBar,
     /// This overlay's own navigation.
     HelpOverlay,
+    /// Group-alias input (`N` new group / `R` rename).
+    GroupName,
     /// Mouse gestures (click / shift-click / wheel).
     Mouse,
     /// What the status glyphs and words mean.
@@ -86,7 +88,7 @@ pub enum SectionId {
 
 impl SectionId {
     /// Sections in display order inside the overlay.
-    pub const ALL: [SectionId; 15] = [
+    pub const ALL: [SectionId; 16] = [
         SectionId::Main,
         SectionId::Selection,
         SectionId::Form,
@@ -99,6 +101,7 @@ impl SectionId {
         SectionId::Detail,
         SectionId::FilterBar,
         SectionId::HelpOverlay,
+        SectionId::GroupName,
         SectionId::Mouse,
         SectionId::Status,
         SectionId::Safety,
@@ -119,6 +122,7 @@ impl SectionId {
             SectionId::Detail => "detail",
             SectionId::FilterBar => "filter_bar",
             SectionId::HelpOverlay => "help_overlay",
+            SectionId::GroupName => "group_name",
             SectionId::Mouse => "mouse",
             SectionId::Status => "status",
             SectionId::Safety => "safety",
@@ -183,6 +187,7 @@ pub const SECTIONS: &[HelpSection] = &[
     dialogs::DETAIL,
     dialogs::FILTER_BAR,
     dialogs::HELP_OVERLAY,
+    main::GROUP_NAME,
     notes::MOUSE,
     notes::STATUS,
     notes::SAFETY,
@@ -263,7 +268,7 @@ mod tests {
 
     /// The catalog's order *is* the overlay's order, and every id must be
     /// reachable exactly once. This is the assertion that lets [`section`] fall
-    /// back instead of panicking: with 15 unique ids and a 15-row table, the
+    /// back instead of panicking: with 16 unique ids and a 16-row table, the
     /// lookup can never miss.
     #[test]
     fn sections_are_listed_in_order_and_each_appears_once() {

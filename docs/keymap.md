@@ -25,6 +25,7 @@
 | [详情 / 日志](#详情--日志--detail--log) | 单条转发的完整诊断 |
 | [过滤输入](#过滤输入--main-filter) | `/` 打开的主表过滤 |
 | [帮助浮层](#帮助浮层--help-overlay) | `?` 打开的本帮助 |
+| [分组别名](#分组别名--group-alias) | `N` / `R` 打开的别名输入 |
 | [鼠标](#鼠标--mouse) | 点击、shift 点击、滚轮 |
 | [状态图例](#状态图例--status-legend) | 状态列符号的含义 |
 | [安全规则](#安全规则--safety-rules) | 哪些操作先确认 |
@@ -52,6 +53,11 @@
 | `/` | 按名称或 SSH 主机过滤 | Filter by name or SSH host |
 | `a` / `x` | 全部启用 / 全部停用（均先确认） | Enable all / disable all (both ask first) |
 | `v` / `V` | 进入 / 退出多选模式（两个键同效） | Enter / leave selection mode (`v` and `V` are aliases) |
+| `tab` / `shift+tab` | 浏览下一个 / 上一个分组（只切换表格，不启停） | Browse the next / previous group (browse only) |
+| `w` | 让当前分组开始 / 停止工作；运行中会先确认 | Make this group work / stop working; asks first if running |
+| `N` | 新建分组 | Create a group |
+| `R` | 重命名当前分组的别名（任何时候都可改） | Rename the current group (at any time) |
+| `D` | 删除当前分组及其全部转发（先确认） | Delete this group and its forwards (asks first) |
 | `esc` | 清除过滤（不清除列表内容） | Clear the filter (it never clears the list) |
 | `q` / `ctrl+c` | 退出 sshpf（先确认）；`ctrl+c` 等同 `q`，**不会**直接退出 | Quit sshpf (asks first); `ctrl+c` never quits outright |
 
@@ -59,6 +65,7 @@
 
 - `a` 在没有未启用条目时只给提示，`x` 在没有运行中条目时只给提示，都不弹确认框。
 - **启动**某条未启用的转发不弹确认（可逆）；停用它才需要确认。
+- 非工作分组里 `space` / `r` / `a` / 批量启动**只提示先按 `w`**，不会隐式切换分组；新建 / 导入 / 编辑只保存，不建连。
 
 ## 多选模式 / Selection mode
 
@@ -222,6 +229,20 @@
 | `enter` | 保留过滤并关闭输入 | Keep the filter and close the input |
 | `esc` | 清除过滤并关闭输入 | Clear the filter and close the input |
 
+## 分组别名 / Group alias
+
+`N`（新建分组）和 `R`（重命名当前分组）打开的输入框。
+
+| 按键 / Key | 中文 | English |
+|---|---|---|
+| 任意字符 | 输入别名；留空时显示 `#编号` | Type an alias; empty shows `#id` |
+| `backspace` / `delete` | 删除光标前 / 后一个字符 | Delete before / after the cursor |
+| `←` / `→` / `home` / `end` | 移动光标 | Move the cursor |
+| `enter` | 保存 | Save |
+| `esc` | 取消并关闭 | Cancel and close |
+
+说明 / Notes: 别名只用于显示与记忆，不参与转发身份；留空或重名会被自动处理（重名追加 `-2` 等后缀）。
+
 ## 帮助浮层 / Help overlay
 
 按 `?` 打开的这份帮助，按上下文分区。
@@ -239,6 +260,7 @@
 
 | 位置 / Where | 中文 | English |
 |---|---|---|
+| 分组栏 | 单击切换浏览的分组（不会让它开始工作） | Click a group bar chip to browse that group (it never makes it work) |
 | 表格行 | 单击移动光标；多选模式下同时切换该行标记 | Click moves the cursor; in selection mode it also toggles that row's mark |
 | 表格行 + `shift` | 从锚点扩选到该行 | Extend the marks from the anchor to that row |
 | 表格列表空白处 | 滚轮在该列表内滚动，不改变选择 | The wheel scrolls within the list; no selection change |
@@ -266,7 +288,7 @@
 
 ## 安全规则 / Safety rules
 
-- **先确认再动手**：删除、停用、重启、批量启停 / 重启 / 删除、保存编辑、放弃编辑、退出、`ctrl+c` —— 全部先弹确认框，`y` / `enter` 执行，`n` / `esc` 取消。
+- **先确认再动手**：删除、停用、重启、批量启停 / 重启 / 删除、保存编辑、放弃编辑、切换 / 停止工作中分组（仅当有运行中的转发时）、删除分组、退出、`ctrl+c` —— 全部先弹确认框，`y` / `enter` 执行，`n` / `esc` 取消。
 - **刻意不弹确认**（可逆、无副作用）：启动、新建、移动光标、过滤、帮助、详情。
 - `NO_COLOR=1` 关闭全部颜色，状态仍由符号和文字表达。
 - 日志在 Linux `~/.local/state/sshpf/logs/sshpf.log`、Windows `%LOCALAPPDATA%\sshpf\logs\sshpf.log`；`SSHPF_LOG_DIR` / `SSHPF_LOG_LEVEL` 可改目录与级别，详见 [logging.md](logging.md)。

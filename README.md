@@ -4,7 +4,7 @@
 [![Crates.io](https://img.shields.io/crates/v/sshpf.svg)](https://crates.io/crates/sshpf)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-SSH 端口转发管理器，命令行 TUI 表格界面，Linux 与 Windows 均支持。在不离开终端的情况下查看、新增、启停、删除端口转发，每条转发实时显示状态与失败原因；配置持久化，重启后自动恢复上次启用的条目。
+SSH 端口转发管理器，命令行 TUI 表格界面，Linux 与 Windows 均支持。在不离开终端的情况下查看、新增、启停、删除端口转发，每条转发实时显示状态与失败原因；配置持久化，重启后自动恢复上次工作的分组。转发可以按**分组**组织：每个分组是一套独立配置，同一时间最多只有一个分组处于工作状态，其余分组可随时浏览和编辑。
 
 > 本文是**用户视角**：装 / 用 / 风险 / 配置 / 排查。内部结构、设计理由、给 AI agent 的导航在 **[docs/index.md](docs/index.md)**。
 
@@ -63,7 +63,7 @@ cargo build --release && install -m755 target/release/sshpf ~/.local/bin/sshpf
 ## 使用 / Usage
 
 ```bash
-sshpf                       # 启动 TUI，自动恢复上次启用的转发
+sshpf                       # 启动 TUI，自动恢复上次工作的分组
 sshpf --no-restore          # 启动但不自动恢复
 sshpf -c /path/config.toml  # 使用指定配置
 sshpf --list-hosts          # 打印 ~/.ssh/config 里的主机后退出
@@ -75,13 +75,16 @@ sshpf --ignore-host-key-changes   # 接受已改变的主机密钥（全局降�
 
 ### 键位 / Keys
 
-界面里**任何时刻**按 `?` 都能看到当前上下文的按键说明，中英双语，且与文档一致。**完整键位参考（15 个上下文，含鼠标与状态图例）见 [docs/keymap.md](docs/keymap.md)。** 常见几个：
+界面里**任何时刻**按 `?` 都能看到当前上下文的按键说明，中英双语，且与文档一致。**完整键位参考（16 个上下文，含鼠标与状态图例）见 [docs/keymap.md](docs/keymap.md)。** 常见几个：
 
 | 键 | 作用 |
 |---|---|
 | `j` / `k`、`↓` / `↑`、`g` / `G` | 移动光标 / 跳首尾 |
 | `space` / `r` | 启用 / 停用、重启（运行中先确认） |
 | `n` / `e` / `d` | 新建 / 编辑 / 删除（删除需确认） |
+| `tab` / `shift+tab` | 浏览下一个 / 上一个分组（只换表格，不启停） |
+| `w` | 让当前分组开始 / 停止工作（运行中先确认） |
+| `N` / `R` / `D` | 新建 / 重命名 / 删除分组（删除需确认） |
 | `enter` / `l` | 详情 + 完整日志 |
 | `/` | 过滤（名称 / SSH 主机）；`esc` 清除 |
 | `a` / `x` | 全部启用 / 全部停用（均需确认） |
@@ -117,7 +120,7 @@ sshpf --ignore-host-key-changes   # 接受已改变的主机密钥（全局降�
 
 ### 不会重复创建 / No duplicate forwards
 
-新增转发时如果**已经有完全一样的**，新增的不生效：导入面板里那一行标成「已存在：<隧道名>」且**不可勾选**，手填路径在表单里报「已存在相同的转发「X」」。
+新增转发时如果**当前分组里已经有完全一样的**，新增的不生效：导入面板里那一行标成「已存在：<隧道名>」且**不可勾选**，手填路径在表单里报「已存在相同的转发「X」」。不同分组互不影响，同一个转发可以分别出现在多个分组里。
 
 "完全一样"比的是**意图**，不比端口：同一个 SSH 主机 + 同一个远端目标就是同一条 `-L` 转发，**即使本地监听端口不同**——本地端口是环境逼出来的（被占用就向上顺延，且顺延值会存进配置）。代价写在明处：`LocalForward 8080 host:80` 与 `LocalForward 9090 host:80` 被视为同一条，因为同一远端目标开两个本地监听是冗余的，而漏判会让你永远清不掉重复。
 
@@ -150,19 +153,32 @@ sshpf --ignore-host-key-changes   # 接受已改变的主机密钥（全局降�
 
 配置与状态分开，运行状态不污染用户编辑的配置。权限：Linux 上配置 `0600`、目录 `0700`；Windows 没有 mode bit，靠用户配置文件目录继承的 ACL（`SYSTEM` / `Administrators` / 本人）。
 
+**分组**：`[[groups]]` 定义一个分组，`[[tunnels]]` 的 `group` 字段指向它。`active_group` 是当前唯一处于工作状态的分组（省略表示没有分组在工作）。启动时只恢复 `active_group` 中 `enabled = true` 的转发；浏览其它分组不会启停它们。不同分组可以包含完全相同的转发，也可以使用同一个本地端口——去重、端口冲突和端口顺延判断都只在组内进行，其它分组正在监听的端口不会被当成占用。旧版单层配置（没有 `[[groups]]`）会自动收进一个隐式分组并置为工作分组，升级后行为不变。
+
 ```toml
-version = 1
+version = 2
 
 [defaults]
 bind = "127.0.0.1"        # 新转发的默认本地监听地址
-restore_on_start = true   # 启动时恢复 enabled = true 的条目
+restore_on_start = true   # 启动时恢复工作分组里 enabled = true 的条目
 auto_restart = true       # 网络类失败自动退避重连（2s→4s→…→30s）
 retry_initial_secs = 2
 retry_max_secs = 30
 health_check_secs = 30    # 每 30s 主动探活一次；0 = 关闭
 
+active_group = 1          # 当前工作分组；省略 = 没有分组在工作
+
+[[groups]]
+id = 1
+name = "工作"             # 别名，可留空（界面显示 #编号）
+
+[[groups]]
+id = 2
+name = "家庭"
+
 [[tunnels]]
 id = 1
+group = 1                 # 所属分组
 name = "cloud-pc-ssh"
 kind = "local"            # local(-L) | remote(-R) | dynamic(-D, SOCKS5)
 ssh_host = "cloud_pc"     # ~/.ssh/config 里的别名，或 user@host:port

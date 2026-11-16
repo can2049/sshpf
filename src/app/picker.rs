@@ -110,8 +110,8 @@ impl App {
             if form.name.value().trim().is_empty() {
                 form.name.set(host.alias.clone());
             }
-            form.revalidate();
         }
+        self.revalidate_form();
         self.close_host_picker();
     }
 }

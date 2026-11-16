@@ -27,7 +27,13 @@ impl App {
         if !self.cfg.defaults.restore_on_start {
             return;
         }
-        let ids: Vec<TunnelId> = self.tunnels.iter().filter(|t| t.cfg.enabled).map(|t| t.cfg.id).collect();
+        // Only the last working group is restored. Every other group is
+        // independent and must stay stopped until the user makes it work.
+        let Some(active) = self.active_group else {
+            return;
+        };
+        let ids: Vec<TunnelId> =
+            self.tunnels.iter().filter(|t| t.cfg.enabled && t.cfg.group == active).map(|t| t.cfg.id).collect();
         if ids.is_empty() {
             return;
         }
@@ -63,8 +69,19 @@ impl App {
         }
     }
 
-    /// Start (or restart) one tunnel.
+    /// Start one tunnel, but only while its group is the working one.
+    ///
+    /// A forward in a browsed-but-idle group is saved configuration, not a
+    /// runnable row: starting it would silently make that group work and drop
+    /// the current one. The user is told to press `w` instead.
     pub fn start_tunnel(&mut self, id: TunnelId) {
+        if self.group_of(id) != self.active_group {
+            self.set_status(StatusMsg::warn(help::bi(
+                "该分组未在工作：先按 w 让它开始工作",
+                "This group is idle: press w to make it work first",
+            )));
+            return;
+        }
         self.start_tunnel_with(id, "manual");
     }
 
@@ -268,6 +285,13 @@ impl App {
 
     /// Space: start immediately, but ask before dropping a live tunnel.
     pub fn toggle_selected(&mut self) {
+        if !self.browsed_group_is_active() {
+            self.set_status(StatusMsg::warn(help::bi(
+                "该分组未在工作：先按 w 让它开始工作",
+                "This group is idle: press w to make it work first",
+            )));
+            return;
+        }
         let Some(view) = self.selected_tunnel() else {
             return;
         };
@@ -282,6 +306,13 @@ impl App {
     /// `r`: ask before bouncing a live tunnel, so a stray keypress cannot drop
     /// someone's session. A stopped tunnel restarts silently (nothing to lose).
     pub fn restart_selected(&mut self) {
+        if !self.browsed_group_is_active() {
+            self.set_status(StatusMsg::warn(help::bi(
+                "该分组未在工作：先按 w 让它开始工作",
+                "This group is idle: press w to make it work first",
+            )));
+            return;
+        }
         let Some(view) = self.selected_tunnel() else {
             return;
         };
@@ -303,6 +334,7 @@ mod hardening_tests {
     fn tunnel(id: TunnelId, name: &str, port: u16) -> TunnelConfig {
         TunnelConfig {
             id,
+            group: 1,
             name: name.into(),
             kind: ForwardKind::Local,
             ssh_host: "testhost".into(),

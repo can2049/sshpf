@@ -22,6 +22,7 @@
 //! | `keys/ports.rs` | peer port list (`p` on 远端端口) | `form::handle_form_key` | it moves, ticks or accepts a scanned port |
 //! | `keys/dropdown.rs` | `SSH HOST` dropdown | `form::handle_form_key` | it drives the host list |
 //! | `keys/misc.rs` | help / detail / confirm / `/` filter | `handle_key` | it belongs to one small overlay |
+//! | `keys/group.rs` | group-alias input (`N` / `R`) | `handle_key` | it edits a group alias |
 //!
 //! # Adding a key is a three-file change
 //!
@@ -52,11 +53,13 @@ use crate::app::{App, Overlay};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use self::form::handle_form_key;
+use self::group::handle_group_name_key;
 use self::main::handle_main_key;
 use self::misc::{handle_confirm_key, handle_detail_key, handle_filter_key, handle_help_key};
 
 mod dropdown;
 mod form;
+mod group;
 mod import;
 mod main;
 mod misc;
@@ -109,6 +112,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         Overlay::Confirm { .. } => handle_confirm_key(app, key),
         Overlay::Detail(_) => handle_detail_key(app, key),
         Overlay::Filter => handle_filter_key(app, key),
+        Overlay::GroupName => handle_group_name_key(app, key),
     }
 }
 

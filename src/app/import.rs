@@ -46,9 +46,11 @@ impl App {
     /// drives the same upward scan the manual form uses — without it, enabling a
     /// batch would fail with "port in use" on a port `sshpf` itself holds.
     pub fn config_from_forward(&self, id: crate::model::TunnelId, forward: &SshForward, taken: &[u16]) -> TunnelConfig {
-        let ends = forward_ends(&self.cfg.defaults.bind, forward, taken);
+        let foreign = self.foreign_group_local_ports();
+        let ends = forward_ends(&self.cfg.defaults.bind, forward, taken, &foreign);
         TunnelConfig {
             id,
+            group: self.browsed_group,
             name: self.cfg.unique_name(&forward.suggested_name(), None),
             kind: forward.kind,
             ssh_host: forward.host_alias.clone(),
@@ -238,6 +240,7 @@ impl App {
         let n = configs.len();
         let first_id = configs.first().map(|c| c.id);
         let host = configs.first().map(|c| c.ssh_host.clone()).unwrap_or_default();
+        let working = self.browsed_group_is_active();
         crate::eventlog::import_committed(&host, n);
         for cfg in &configs {
             crate::eventlog::tunnel_created(cfg, "import");
@@ -246,8 +249,10 @@ impl App {
         }
         self.close_overlay();
         self.persist_quietly();
-        for cfg in &configs {
-            self.start_tunnel_with(cfg.id, "created");
+        if working {
+            for cfg in &configs {
+                self.start_tunnel_with(cfg.id, "created");
+            }
         }
         // Put the cursor on the first created tunnel so the user lands where the
         // work happened instead of on a row that may be far away.
@@ -258,7 +263,14 @@ impl App {
             }
         }
         self.clamp_selection();
-        self.set_status(StatusMsg::ok(import_batch_status(&configs, skipped.len())));
+        if working {
+            self.set_status(StatusMsg::ok(import_batch_status(&configs, skipped.len())));
+        } else {
+            self.set_status(StatusMsg::info(help::bi(
+                &format!("已在未工作的分组创建 {n} 条转发；按 w 启动"),
+                &format!("Created {n} forwards in an idle group; press w to start them"),
+            )));
+        }
     }
 
     /// Create-form submit when the import pane is in charge.
@@ -349,7 +361,7 @@ fn unique_within(base: &str, siblings: Vec<String>) -> String {
 /// added here is the *planning*: `-L`/`-D` bind locally, so only those need a
 /// collision-free port, and `taken` keeps two rows of one batch from being handed
 /// the same one.
-fn forward_ends(bind: &str, forward: &SshForward, taken: &[u16]) -> ForwardEnds {
+fn forward_ends(bind: &str, forward: &SshForward, taken: &[u16], allow_occupied: &[u16]) -> ForwardEnds {
     let mut ends = forward.ends(bind);
     // `-R` does not bind locally, so its port is passed through untouched.
     if forward.kind == ForwardKind::Remote {
@@ -358,7 +370,9 @@ fn forward_ends(bind: &str, forward: &SshForward, taken: &[u16]) -> ForwardEnds 
     // A privileged port is never scanned upwards from itself, which would spend
     // the whole budget inside the range that needs root.
     let addr = ends.local_addr.clone();
-    if let Some((port, _)) = model::plan_local_port(ends.local_port, taken, |c| ssh::port_available(&addr, c)) {
+    if let Some((port, _)) =
+        model::plan_local_port(ends.local_port, taken, |c| allow_occupied.contains(&c) || ssh::port_available(&addr, c))
+    {
         ends.local_port = port;
     }
     // Nothing usable found: keep the requested port so validation reports the real

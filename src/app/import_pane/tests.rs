@@ -56,6 +56,7 @@ fn show_to(listen_port: u16, target_port: u16) -> SshForward {
 fn saved(id: crate::model::TunnelId, name: &str, local_port: u16) -> TunnelConfig {
     TunnelConfig {
         id,
+        group: 1,
         name: name.into(),
         kind: ForwardKind::Local,
         ssh_host: "dev-box".into(),
@@ -318,6 +319,7 @@ fn editing_an_existing_tunnel_never_imports() {
     let (_d, mut app) = app_fresh();
     app.cfg.tunnels.push(TunnelConfig {
         id: 1,
+        group: 1,
         name: "existing".into(),
         kind: ForwardKind::Local,
         ssh_host: "dev-box".into(),

@@ -15,7 +15,7 @@
 
 use ratatui::layout::Rect;
 
-use crate::model::{BatchAction, ImportColumn, TunnelId};
+use crate::model::{BatchAction, GroupId, ImportColumn, TunnelId};
 
 /// A clickable/scrollable thing on screen.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +49,8 @@ pub enum HitTarget {
     BatchExit,
     /// `全选` inside selection mode.
     BatchSelectAll,
+    /// One chip of the group bar: click browses that group (it never activates it).
+    GroupTab(GroupId),
     /// The main filter input line (`/` overlay): click puts the cursor there.
     FilterBar,
     /// The 过滤 line's `清除` affordance.

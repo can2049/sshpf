@@ -12,6 +12,7 @@ use std::sync::mpsc;
 fn cfg(id: TunnelId, port: u16) -> TunnelConfig {
     TunnelConfig {
         id,
+        group: 1,
         name: format!("t{id}"),
         kind: ForwardKind::Local,
         // Nothing listens here; the connect attempt fails fast, which is

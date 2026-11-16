@@ -164,3 +164,7 @@ panic 走 hook（链式调用上一个，所以 ratatui 恢复终端照常生效
 ## D38 参数解析交给 `clap`，帮助文本仍归自己
 flag 只在 `src/cli/args.rs` 的 derive 结构上声明一次——手写循环的"字段与规则两份真相"没了。**`USAGE` 仍归自己**，不让 clap 渲染（它被 `docs/keymap.md` 与 README 镜像，属硬约定 6）。语义以 clap 为准、不留兼容垫片；唯一可观察放宽是接受连写形式，三处差异全在 `src/cli/tests.rs`。突破 D37 的代价记账：+5 个依赖包、二进制 +398 KiB。
 → `src/cli/args.rs`、`src/cli/tests.rs`、[CHANGELOG](../CHANGELOG.md) 0.9.0
+
+## D39 分组 = 运行互斥单元，不是第二份进程/配置
+`active_group` 至多一个；只有它的 enabled 转发会运行。浏览与工作分离：`tab`/`shift+tab` 只换表格，`w` 才切换工作分组（有运行中转发时先确认）。切换只停运行态、**保留 `enabled`**，否则切回来的分组会变成空的。旧版单层配置在载入时收进一个隐式工作分组，升级后仍恢复原来的转发。去重/监听冲突/端口推荐都按组隔离——不同分组可以故意重复同一转发。
+→ [runtime.md](runtime.md#分组--groups) · `src/app/group.rs`、`src/model/group.rs`、`src/config/group.rs`

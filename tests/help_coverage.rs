@@ -272,6 +272,7 @@ const KEYS_SRC: &str = concat!(
     include_str!("../src/keys/ports.rs"),
     include_str!("../src/keys/dropdown.rs"),
     include_str!("../src/keys/misc.rs"),
+    include_str!("../src/keys/group.rs"),
     // `testkit.rs` is test-only fixtures and binds no keys, so it is deliberately
     // absent: including it would add the tests' own `handle_key(...)` calls to the
     // scanned text for no benefit.
@@ -291,6 +292,7 @@ const KEY_HANDLER_FILES: &[&str] = &[
     "src/keys/ports.rs",
     "src/keys/dropdown.rs",
     "src/keys/misc.rs",
+    "src/keys/group.rs",
 ];
 
 /// The mouse hit-target enum: one variant per clickable thing.
@@ -362,6 +364,7 @@ const HANDLERS: &[(&str, SectionId)] = &[
     ("handle_detail_key", SectionId::Detail),
     ("handle_filter_key", SectionId::FilterBar),
     ("handle_help_key", SectionId::HelpOverlay),
+    ("handle_group_name_key", SectionId::GroupName),
 ];
 
 /// `(section, token)` pairs a section may **document** although its own handler
@@ -1105,6 +1108,7 @@ const HIT_TARGET_EVIDENCE: &[(&str, &[&str])] = &[
     ("BatchAction", &["批量操作", "batch operation"]),
     ("BatchExit", &["退出选择模式", "exit selection mode"]),
     ("BatchSelectAll", &["多选模式「全选」", "select all in selection mode"]),
+    ("GroupTab", &["分组栏", "group bar"]),
     ("FilterBar", &["过滤输入行", "filter line"]),
     ("FilterClear", &["「× 清除」", "clear affordance"]),
     ("Popup", &["弹窗吞掉点击", "popups swallow clicks"]),

@@ -1,4 +1,5 @@
-//! Persistence: tunnel definitions (user intent) and small runtime state.
+//! Persistence: group definitions, tunnel definitions (user intent) and small
+//! runtime state.
 //!
 //! Layout (override with `SSHPF_CONFIG`). The directories come from `dirs`, which
 //! resolves them per platform — `state_dir()` is `None` on Windows, so the
@@ -18,9 +19,17 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
-use crate::model::{ForwardKind, TunnelConfig, TunnelId, now_unix};
+use crate::model::{GroupConfig, GroupId, TunnelConfig, TunnelId, normalize_groups, now_unix};
 
-pub const CONFIG_VERSION: u32 = 1;
+mod group;
+pub use group::validate_tunnel;
+
+/// Bumped when the on-disk shape changes in a way older binaries cannot read.
+///
+/// Version 2 adds `[[groups]]` and `active_group`: an older binary would load the
+/// flat tunnel list but silently drop the grouping on its next save, so it must
+/// refuse the file instead.
+pub const CONFIG_VERSION: u32 = 2;
 
 /// Shortest `defaults.health_check_secs` that is actually useful.
 ///
@@ -112,6 +121,13 @@ pub struct ConfigFile {
     pub version: u32,
     #[serde(default)]
     pub defaults: Defaults,
+    /// Independent buckets of forwards. Always non-empty after loading.
+    #[serde(default)]
+    pub groups: Vec<GroupConfig>,
+    /// The group allowed to run forwards. `None` means no group is working; at
+    /// most one group is ever active.
+    #[serde(default)]
+    pub active_group: Option<GroupId>,
     #[serde(default, rename = "tunnels")]
     pub tunnels: Vec<TunnelConfig>,
 }
@@ -122,7 +138,16 @@ fn default_version() -> u32 {
 
 impl Default for ConfigFile {
     fn default() -> Self {
-        ConfigFile { version: CONFIG_VERSION, defaults: Defaults::default(), tunnels: Vec::new() }
+        ConfigFile {
+            version: CONFIG_VERSION,
+            defaults: Defaults::default(),
+            groups: vec![GroupConfig::new(1, "")],
+            // A fresh install starts with its (empty) default group working, so
+            // the first forward created there starts immediately. An explicit
+            // "no group works" is persisted as `active_group = None` and kept.
+            active_group: Some(1),
+            tunnels: Vec::new(),
+        }
     }
 }
 
@@ -194,60 +219,6 @@ impl ConfigFile {
         }
         1
     }
-
-    /// Validate cross-entry invariants. Returns human-readable problems.
-    pub fn validate(&self) -> Vec<String> {
-        let mut problems = Vec::new();
-        for t in &self.tunnels {
-            if let Err(e) = validate_tunnel(t) {
-                problems.push(format!("{}: {e}", t.name));
-            }
-        }
-        // Duplicate listening endpoints among enabled tunnels.
-        for (i, a) in self.tunnels.iter().enumerate() {
-            if !a.enabled {
-                continue;
-            }
-            for b in self.tunnels.iter().skip(i + 1) {
-                if !b.enabled {
-                    continue;
-                }
-                if a.listen_overlap(b) {
-                    problems.push(format!("{} 与 {} 监听同一地址 {}", a.name, b.name, a.local_display()));
-                }
-            }
-        }
-        problems
-    }
-}
-
-/// Field-level validation used by the form and by `load`.
-pub fn validate_tunnel(cfg: &TunnelConfig) -> Result<()> {
-    if cfg.name.trim().is_empty() {
-        bail!("名称不能为空");
-    }
-    if cfg.ssh_host.trim().is_empty() {
-        bail!("SSH 主机不能为空");
-    }
-    if cfg.ssh_host.chars().any(|c| c.is_whitespace()) {
-        bail!("SSH 主机不能包含空格");
-    }
-    if cfg.local_port == 0 {
-        bail!("本地端口不能为 0");
-    }
-    if cfg.kind != ForwardKind::Dynamic && cfg.remote_port == 0 {
-        bail!("远端端口不能为 0");
-    }
-    if cfg.kind != ForwardKind::Dynamic && cfg.remote_host.trim().is_empty() {
-        bail!("远端地址不能为空");
-    }
-    if cfg.kind != ForwardKind::Remote && cfg.local_addr.trim().is_empty() {
-        bail!("本地地址不能为空");
-    }
-    if cfg.kind == ForwardKind::Remote && cfg.remote_host.trim().is_empty() {
-        bail!("远端监听地址不能为空");
-    }
-    Ok(())
 }
 
 /// Resolved config/state file locations.
@@ -313,6 +284,9 @@ pub fn load_with_report(path: &Path) -> Result<(ConfigFile, Vec<crate::model::Fo
         bail!("配置版本 {} 高于本程序支持的 {}，请升级 sshpf", cfg.version, CONFIG_VERSION);
     }
     cfg.version = CONFIG_VERSION;
+    // Groups first: a config written before groups existed has no `[[groups]]`,
+    // and its tunnels must be adopted before id/duplicate repair looks at them.
+    let group_repair = normalize_groups(&mut cfg.groups, &mut cfg.tunnels, &mut cfg.active_group);
     // Repair ids/names that collide due to hand editing.
     let mut seen = Vec::new();
     let mut next = 1;
@@ -332,6 +306,7 @@ pub fn load_with_report(path: &Path) -> Result<(ConfigFile, Vec<crate::model::Fo
             repaired += 1;
         }
     }
+    let repaired = repaired.saturating_add(group_repair.total_repaired());
     if repaired > 0 {
         // Silent repair is a trap: the user's ids are not what they wrote, and
         // any id mentioned in a bug report would otherwise look wrong.

@@ -191,6 +191,16 @@ impl FormState {
     /// something else on the machine — we walk upwards to the next free port.
     /// The result is always a *suggestion*: the user can edit it freely.
     pub fn suggest_local_port(&mut self, taken: &[u16]) {
+        self.suggest_local_port_with(taken, &[]);
+    }
+
+    /// Like [`Self::suggest_local_port`], but ports in `allow_occupied` are
+    /// treated as available even if a socket is currently listening on them.
+    ///
+    /// That list is the **other groups'** local ports: groups never listen at the
+    /// same time, so a port another group is using right now is a legitimate
+    /// choice for this group and must not be bumped.
+    pub fn suggest_local_port_with(&mut self, taken: &[u16], allow_occupied: &[u16]) {
         if !self.local_port_auto || self.kind() == ForwardKind::Dynamic {
             return;
         }
@@ -206,7 +216,9 @@ impl FormState {
         // The rules live in `model::plan_local_port` because the ssh-config
         // importer needs exactly the same ones, and two copies of "which port
         // should this land on" had already started to diverge.
-        match model::plan_local_port(remote, taken, |c| ssh::port_available(probe_addr, c)) {
+        match model::plan_local_port(remote, taken, |c| {
+            allow_occupied.contains(&c) || ssh::port_available(probe_addr, c)
+        }) {
             Some((port, reason)) => {
                 self.local_port.set(port.to_string());
                 self.local_port_note = Some(match reason {
@@ -235,6 +247,15 @@ impl FormState {
 
     /// Recompute `errors` / `port_hint` after an edit.
     pub fn revalidate(&mut self) {
+        self.revalidate_with(&[]);
+    }
+
+    /// Like [`Self::revalidate`], treating `allow_occupied` as available.
+    ///
+    /// See [`Self::suggest_local_port_with`]: another group's live listener is
+    /// not a conflict here, and saying "in use" in red would make the user move a
+    /// perfectly valid port.
+    pub fn revalidate_with(&mut self, allow_occupied: &[u16]) {
         self.errors.clear();
         if self.ssh_host.value().trim().is_empty() {
             self.errors.push(help::bi("SSH 主机不能为空", "SSH host must not be empty"));
@@ -244,11 +265,16 @@ impl FormState {
             && port != 0
         {
             let addr = self.local_addr.value().trim();
-            if !addr.is_empty() && !ssh::port_available(addr, port) {
+            if !addr.is_empty() && !allow_occupied.contains(&port) && !ssh::port_available(addr, port) {
                 // `src/ui.rs` colours this line by `contains("占用")`, so the
                 // Chinese phrase must stay first and verbatim.
                 self.port_hint =
                     Some(help::bi(&format!("{addr}:{port} 已被占用"), &format!("{addr}:{port} is already in use")));
+            } else if allow_occupied.contains(&port) {
+                self.port_hint = Some(help::bi(
+                    &format!("{addr}:{port} 本分组可用（分组互不影响）"),
+                    &format!("{addr}:{port} available in this group (groups are independent)"),
+                ));
             } else {
                 self.port_hint = Some(help::bi(&format!("{addr}:{port} 可用"), &format!("{addr}:{port} is available")));
             }
@@ -331,6 +357,9 @@ impl FormState {
     fn assemble(&self, d: Draft, id: TunnelId, existing: Option<&TunnelConfig>) -> TunnelConfig {
         TunnelConfig {
             id,
+            // Filled by the caller that knows which group is being browsed; an
+            // edit carries its stored group over.
+            group: existing.map(|e| e.group).unwrap_or(0),
             name: d.name,
             kind: d.kind,
             ssh_host: d.ssh_host,

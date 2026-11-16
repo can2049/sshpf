@@ -17,11 +17,13 @@ use super::{App, Counts};
 use crate::model::TunnelStatus;
 
 impl App {
-    /// Indices into `tunnels` for rows matching the current filter, in order.
+    /// Indices into `tunnels` for rows of the browsed group matching the current
+    /// filter, in order.
     pub fn visible_indices(&self) -> Vec<usize> {
         self.tunnels
             .iter()
             .enumerate()
+            .filter(|(_, t)| t.cfg.group == self.browsed_group)
             .filter(|(_, t)| {
                 self.filter.is_empty()
                     || fuzzy_match(&self.filter, &t.cfg.name)
@@ -90,9 +92,10 @@ impl App {
         self.selected = self.visible_indices().len().saturating_sub(1);
     }
 
+    /// Counters for the browsed group, matching what the table shows.
     pub fn counts(&self) -> Counts {
         let mut c = Counts::default();
-        for t in &self.tunnels {
+        for t in self.tunnels.iter().filter(|t| t.cfg.group == self.browsed_group) {
             match &t.status {
                 TunnelStatus::Up { .. } => c.up += 1,
                 TunnelStatus::Starting { .. } => c.starting += 1,
@@ -101,7 +104,7 @@ impl App {
                 TunnelStatus::Stopped => c.off += 1,
             }
         }
-        c.total = self.tunnels.len();
+        c.total = self.tunnels.iter().filter(|t| t.cfg.group == self.browsed_group).count();
         c
     }
 

@@ -17,13 +17,14 @@
 | 行 | 高度 | 内容 | 渲染器 |
 |---|---|---|---|
 | 0 | 1 | 标题：版本、ssh-config 主机数、配置路径、时钟 | `ui::header::draw_title` |
-| 1 | 1 | 计数器：`● 2 已连通/Up ◐ 0 连接中/Starting ◌ 0 重试/Retrying ✗ 1 失败/Failed ○ 1 未启用/Off`（宽度 < 96 列时退化成 `●2 ◐0 ◌0 ✗1 ○1`） | `draw_counters` |
-| 2 | `Min(1)` | 转发表格 | `ui::table::draw_table` |
-| 3 | 1 | 消息条（`StatusMsg`） | `draw_message` |
-| 4 | `select_mode` | 多选动作条（仅多选模式） | `ui::selection::draw_selection_bar` |
-| 5 | 3 | 键提示 3 行（每条都双语） | `ui::hints::draw_keys` |
+| 1 | 1 | 计数器：`● 2 已连通/Up ◐ 0 连接中/Starting ◌ 0 重试/Retrying ✗ 1 失败/Failed ○ 1 未启用/Off`（宽度 < 96 列时退化成 `●2 ◐0 ◌0 ✗1 ○1`；**只统计被浏览的分组**） | `draw_counters` |
+| 2 | 1 | 分组栏：`分组/Groups ▶ 工作 ● 家庭`；`▶` = 被浏览，`●` = 工作中 | `ui::group::draw_group_bar` |
+| 3 | `Min(1)` | 转发表格（只显示被浏览的分组） | `ui::table::draw_table` |
+| 4 | 1 | 消息条（`StatusMsg`） | `draw_message` |
+| 5 | `select_mode` | 多选动作条（仅多选模式） | `ui::selection::draw_selection_bar` |
+| 6 | 3 | 键提示 3 行（每条都双语） | `ui::hints::draw_keys` |
 
-浮层按 `App.overlay` 画在最上层：`Help` / `Form` / `Confirm` / `Detail` / `Filter`。浮层用 `centered_pct`（帮助 78×84%、详情 88×86%）或 `centered`（表单固定 110 列宽、确认框按文案宽度），`clear_and_block` 先 `Clear` 再画边框——否则下面的表格会透出来。
+浮层按 `App.overlay` 画在最上层：`Help` / `Form` / `Confirm` / `Detail` / `Filter` / `GroupName`。`GroupName` 是 `N` / `R` 打开的别名输入，宽度 60 列、高度 5 行（`centered` 会按屏幕夹紧）。浮层用 `centered_pct`（帮助 78×84%、详情 88×86%）或 `centered`（表单固定 110 列宽、确认框按文案宽度），`clear_and_block` 先 `Clear` 再画边框——否则下面的表格会透出来。
 
 **分区块取不到时**：`band(rows, i, "what")` 用 `rows.get(i)`，`None` 就记 `ui.render_degraded reason=layout_band_missing` 并返回零矩形（这一块这一帧不画），**不 panic**。
 
@@ -88,10 +89,11 @@ TunnelRow(TunnelId)                // ← 而不是行号
 
 **"后画就遮蔽"有个前提**：命中图是一个**栈**，不是 z-index。弹窗画在表格之后，如果它不记录自己的矩形，表格的矩形仍在栈顶，点击就穿过弹窗落到表格行上——视觉上盖住了，行为上没有。所以 `draw_help` / `draw_confirm` / `draw_detail` 都先把 popup 矩形记成 `HitTarget::Popup`（吞掉点击、什么也不做）再画内容。
 
-鼠标处理器（`src/app/mouse.rs`）**从不计算几何**，只问"这个点是什么"然后调与键盘同一批 `App` 方法——所以鼠标免费继承键盘的安全规则（点批量删除按钮一样弹确认框）。
+鼠标处理器（`src/app/mouse.rs`）**从不计算几何**，只问"这个点是什么"然后调与键盘同一批 `App` 方法——所以鼠标免费继承键盘的安全规则（点批量删除按钮一样弹确认框，点分组栏只浏览、不切换工作状态）。
 
 | 位置 | `HitTarget` |
 |---|---|
+| 分组栏 chip | `GroupTab(id)`（单击只浏览，不会让它开始工作） |
 | 主表行 / 列表区 | `TunnelRow(id)` / `TunnelList` |
 | 导入行 / 复选框 / 列头 | `ImportRow(usize)` / `ImportCheckbox(usize)` / `ImportColumnHeader(Col)` |
 | 筛选 chip `×` | `ImportFilterChip(Col)` |

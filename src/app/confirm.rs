@@ -21,6 +21,9 @@ fn action_name(action: &ConfirmAction) -> String {
         ConfirmAction::ApplyEdit(_) => "apply_edit".to_string(),
         ConfirmAction::DiscardForm => "discard_form".to_string(),
         ConfirmAction::Batch { action, .. } => format!("batch_{}", action.name()),
+        ConfirmAction::ActivateGroup(_) => "activate_group".to_string(),
+        ConfirmAction::DeactivateGroup(_) => "deactivate_group".to_string(),
+        ConfirmAction::DeleteGroup(_) => "delete_group".to_string(),
         ConfirmAction::Quit => "quit".to_string(),
     }
 }
@@ -34,6 +37,9 @@ fn action_detail(app: &App, action: &ConfirmAction) -> String {
         | ConfirmAction::ApplyEdit(id) => app.tunnel(*id).map(|t| t.cfg.name.clone()).unwrap_or_default(),
         ConfirmAction::Batch { count, .. } => format!("{count}"),
         ConfirmAction::StopAll | ConfirmAction::StartAll => format!("{}", app.tunnels.len()),
+        ConfirmAction::ActivateGroup(id) | ConfirmAction::DeactivateGroup(id) | ConfirmAction::DeleteGroup(id) => {
+            app.cfg.group(*id).map(|g| g.alias()).unwrap_or_else(|| format!("#{id}"))
+        }
         _ => String::new(),
     }
 }
@@ -90,6 +96,9 @@ impl App {
             | ConfirmAction::Restart(id)
             | ConfirmAction::ApplyEdit(id) => self.named_prompt(action, id),
             ConfirmAction::StopAll | ConfirmAction::StartAll | ConfirmAction::Quit => self.count_prompt(action),
+            ConfirmAction::ActivateGroup(_) | ConfirmAction::DeactivateGroup(_) | ConfirmAction::DeleteGroup(_) => {
+                self.group_prompt(action)
+            }
             ConfirmAction::DiscardForm => help::bi(
                 "确认放弃未保存的修改？已输入的内容会丢失。",
                 "Discard the unsaved changes? What you typed will be lost.",
@@ -126,6 +135,43 @@ impl App {
         help::bi(&zh, &en)
     }
 
+    /// A sentence for a group-level action. The numbers describe the live
+    /// sessions that will drop or the definitions that will be lost.
+    fn group_prompt(&self, action: &ConfirmAction) -> String {
+        let (id, name) = match action {
+            ConfirmAction::ActivateGroup(id) | ConfirmAction::DeactivateGroup(id) | ConfirmAction::DeleteGroup(id) => {
+                (*id, self.cfg.group(*id).map(|g| g.alias()).unwrap_or_else(|| format!("#{id}")))
+            }
+            _ => return unknown_target_prompt(action),
+        };
+        match action {
+            ConfirmAction::ActivateGroup(_) => {
+                let running = self.active_group.map(|old| self.group_running_count(old)).unwrap_or(0);
+                help::bi(
+                    &format!("确认让分组「{name}」开始工作？当前分组的 {running} 条运行中转发将停止。"),
+                    &format!(
+                        "Make group \"{name}\" work? The {running} running forwards in the current group will stop."
+                    ),
+                )
+            }
+            ConfirmAction::DeactivateGroup(_) => {
+                let running = self.group_running_count(id);
+                help::bi(
+                    &format!("确认停止分组「{name}」？{running} 条运行中的转发会断开。"),
+                    &format!("Stop group \"{name}\"? {running} running forwards will be dropped."),
+                )
+            }
+            ConfirmAction::DeleteGroup(_) => {
+                let n = self.group_tunnel_count(id);
+                help::bi(
+                    &format!("确认删除分组「{name}」及其中的 {n} 条转发？此操作不可撤销。"),
+                    &format!("Delete group \"{name}\" and its {n} forwards? This cannot be undone."),
+                )
+            }
+            _ => unknown_target_prompt(action),
+        }
+    }
+
     /// A sentence built from the live counters (all-rows actions and quit).
     fn count_prompt(&self, action: &ConfirmAction) -> String {
         let counts = self.counts();
@@ -145,10 +191,20 @@ impl App {
                 )
             }
             ConfirmAction::Quit => {
-                // The count comes from the rendered state rather than from the
-                // supervisor: a row can be `Ready` while its session is being torn
-                // down, and the prompt must name what the user actually sees.
-                let running = counts.up + counts.starting + counts.retrying;
+                // Quit stops **every** group, not just the browsed one, so the
+                // prompt counts the whole process rather than the visible table.
+                let running = self
+                    .tunnels
+                    .iter()
+                    .filter(|t| {
+                        matches!(
+                            t.status,
+                            crate::model::TunnelStatus::Up { .. }
+                                | crate::model::TunnelStatus::Starting { .. }
+                                | crate::model::TunnelStatus::Retrying { .. }
+                        )
+                    })
+                    .count();
                 if running == 0 {
                     help::bi("确认退出 sshpf？", "Quit sshpf?")
                 } else {
@@ -230,6 +286,9 @@ impl App {
             }
             ConfirmAction::Quit => self.should_quit = true,
             ConfirmAction::Batch { action, .. } => self.apply_batch(action),
+            ConfirmAction::ActivateGroup(id) => self.activate_group(id),
+            ConfirmAction::DeactivateGroup(_) => self.deactivate_group(),
+            ConfirmAction::DeleteGroup(id) => self.delete_group(id),
         }
     }
 }
@@ -244,6 +303,7 @@ mod tests {
     fn tunnel(id: TunnelId, name: &str, port: u16) -> TunnelConfig {
         TunnelConfig {
             id,
+            group: 1,
             name: name.into(),
             kind: ForwardKind::Local,
             ssh_host: "h".into(),
@@ -279,6 +339,9 @@ mod tests {
             ConfirmAction::Stop(99),
             ConfirmAction::Restart(99),
             ConfirmAction::ApplyEdit(99),
+            ConfirmAction::ActivateGroup(99),
+            ConfirmAction::DeactivateGroup(99),
+            ConfirmAction::DeleteGroup(99),
         ] {
             app.ask_confirm(action.clone());
             match &app.overlay {
@@ -306,6 +369,9 @@ mod tests {
             ConfirmAction::ApplyEdit(1),
             ConfirmAction::DiscardForm,
             ConfirmAction::Batch { action: BatchAction::Delete, count: 2 },
+            ConfirmAction::ActivateGroup(1),
+            ConfirmAction::DeactivateGroup(1),
+            ConfirmAction::DeleteGroup(1),
             ConfirmAction::Quit,
         ];
         for action in actions {
@@ -339,6 +405,24 @@ mod tests {
         match &app.overlay {
             // 1 up + 0 starting + 0 retrying; the failed row is not running.
             Overlay::Confirm { prompt, .. } => assert!(prompt.contains('1'), "{prompt}"),
+            other => panic!("expected a confirmation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_quit_prompt_counts_running_tunnels_in_every_group() {
+        let (_d, mut app) = app_with(vec![tunnel(1, "a", 18001), tunnel(2, "b", 18002)]);
+        app.cfg.groups.push(crate::model::GroupConfig::new(2, "home"));
+        app.cfg.find_mut(2).unwrap().group = 2;
+        app.tunnels[1].cfg.group = 2;
+        app.active_group = Some(2);
+        app.browsed_group = 2;
+        app.set_state(1, TunnelStatus::Up { since: Instant::now() });
+        app.set_state(2, TunnelStatus::Up { since: Instant::now() });
+
+        app.ask_confirm(ConfirmAction::Quit);
+        match &app.overlay {
+            Overlay::Confirm { prompt, .. } => assert!(prompt.contains('2'), "quit must count both groups: {prompt}"),
             other => panic!("expected a confirmation, got {other:?}"),
         }
     }

@@ -13,6 +13,7 @@ use std::time::Instant;
 fn tunnel(id: crate::model::TunnelId, name: &str, port: u16) -> TunnelConfig {
     TunnelConfig {
         id,
+        group: 1,
         name: name.into(),
         kind: ForwardKind::Local,
         ssh_host: "h".into(),

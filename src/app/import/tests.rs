@@ -219,6 +219,7 @@ fn imported_names_do_not_collide_with_each_other_or_with_existing_ones() {
     let (_d, mut app) = app_with_import(vec![a, b]);
     app.cfg.tunnels.push(TunnelConfig {
         id: 99,
+        group: 1,
         name: "dev-box-L-18001".into(),
         kind: ForwardKind::Local,
         ssh_host: "other".into(),
@@ -277,6 +278,7 @@ fn ports_claimed_by_other_tunnels_are_also_avoided() {
     let (_d, mut app) = app_fresh();
     app.cfg.tunnels.push(TunnelConfig {
         id: 1,
+        group: 1,
         name: "other".into(),
         kind: ForwardKind::Local,
         ssh_host: "h".into(),
@@ -461,6 +463,7 @@ mod hardening_tests {
         let cfg = ConfigFile {
             tunnels: vec![TunnelConfig {
                 id,
+                group: 1,
                 name: "existing".into(),
                 kind: ForwardKind::Local,
                 ssh_host: "h".into(),
@@ -656,6 +659,7 @@ mod duplicate_tests {
     ) -> TunnelConfig {
         TunnelConfig {
             id,
+            group: 1,
             name: name.into(),
             kind: ForwardKind::Local,
             ssh_host: ssh_host.into(),

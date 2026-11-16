@@ -48,6 +48,7 @@ fn free_port() -> u16 {
 fn tunnel(id: u64, name: &str, port: u16, host: &str) -> TunnelConfig {
     TunnelConfig {
         id,
+        group: 1,
         name: name.into(),
         kind: ForwardKind::Local,
         ssh_host: host.into(),
