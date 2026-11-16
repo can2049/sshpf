@@ -10,6 +10,13 @@
 
 ## [Unreleased]
 
+### 变更
+
+- **去掉与 `package.repository` 重复的 `package.homepage`。** 两个字段原本都是
+  `https://github.com/can2049/sshpf`，crates.io 会把同一地址渲染成 Homepage 与 Repository
+  两个相同链接；现在只保留 Repository，cargo 的 `redundant_homepage` 告警随之消失，信息没有
+  任何损失（源码链接仍在）。已发布的 0.10.0 元数据无法回改，下次发布起生效。
+
 ## [0.10.0] - 2026-11-16
 
 ### 新增

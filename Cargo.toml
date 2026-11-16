@@ -6,7 +6,6 @@ rust-version = "1.89"
 description = "SSH port forward manager with a TUI dashboard (-L / -R / -D)"
 license = "MIT"
 repository = "https://github.com/can2049/sshpf"
-homepage = "https://github.com/can2049/sshpf"
 readme = "README.md"
 keywords = ["ssh", "port-forwarding", "tui", "tunnel", "cli"]
 categories = ["command-line-utilities"]
