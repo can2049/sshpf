@@ -156,14 +156,18 @@ pub struct TunnelView {
 }
 
 impl TunnelView {
+    /// Wrap a definition with idle live state.
+    ///
+    /// The view always starts [`TunnelStatus::Stopped`], **never** `Starting`
+    /// from `cfg.enabled`. `enabled` is persisted *intent* ("run when my group
+    /// works"), not a runtime fact: a forward created while its group is idle is
+    /// saved and shown as `○ 未启用` until something actually starts it. Inferring
+    /// `Starting` here made such a row look like it was connecting forever — no
+    /// thread was ever spawned, yet the elapsed timer ran and the header counted
+    /// it under `◐ 连接中`. Only `app::start_tunnel_with` may move a row out of
+    /// `Stopped`.
     pub fn new(cfg: TunnelConfig) -> Self {
-        let running = cfg.enabled;
-        TunnelView {
-            cfg,
-            status: if running { TunnelStatus::Starting { since: Instant::now() } } else { TunnelStatus::Stopped },
-            log: LogRing::new(1000),
-            retries: 0,
-        }
+        TunnelView { cfg, status: TunnelStatus::Stopped, log: LogRing::new(1000), retries: 0 }
     }
 
     /// Short reason shown in the LAST ERROR column, `None` when healthy.

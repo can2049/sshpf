@@ -14,20 +14,15 @@ use std::time::{Duration, Instant};
 
 use crate::config::ConfigFile;
 use crate::eventlog;
-use crate::model::{TunnelStatus, TunnelView};
+use crate::model::TunnelView;
 
 use super::{MAX_RETRY_SECS, MIN_RETRY_SECS};
 
+/// Every view starts idle; `restore_enabled` is what starts the working group's
+/// `enabled` forwards. `TunnelView::new` no longer infers `Starting` from the
+/// persisted flag, so there is nothing to override here.
 pub fn build_views(cfg: &ConfigFile) -> Vec<TunnelView> {
-    cfg.tunnels
-        .iter()
-        .map(|c| {
-            let mut v = TunnelView::new(c.clone());
-            // Nothing is running until `restore_enabled` says so.
-            v.status = TunnelStatus::Stopped;
-            v
-        })
-        .collect()
+    cfg.tunnels.iter().cloned().map(TunnelView::new).collect()
 }
 
 /// Coerce hand-edited numeric defaults into the range the app can operate in.

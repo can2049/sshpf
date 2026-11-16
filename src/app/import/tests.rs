@@ -47,7 +47,20 @@ fn show(port: u16) -> SshForward {
 
 /// Load a table into the open create form without touching the filesystem.
 fn app_with_import(rows: Vec<SshForward>) -> (tempfile::TempDir, App) {
-    let (dir, mut app) = app_fresh();
+    app_with_import_using(ConfigFile::default(), rows)
+}
+
+/// Same, but the saved config has no working group: the batch lands in a group
+/// that is browsed but idle, so it must be saved and not dialled.
+fn app_with_import_into_idle_group(rows: Vec<SshForward>) -> (tempfile::TempDir, App) {
+    app_with_import_using(ConfigFile { active_group: None, ..ConfigFile::default() }, rows)
+}
+
+fn app_with_import_using(cfg: ConfigFile, rows: Vec<SshForward>) -> (tempfile::TempDir, App) {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = Paths { config: dir.path().join("config.toml"), state: dir.path().join("state.toml") };
+    crate::config::save(&paths.config, &cfg).unwrap();
+    let mut app = App::new(paths);
     app.open_form_create();
     app.form.as_mut().unwrap().ssh_host.set("dev-box");
     let table = ImportTable::new(rows);
@@ -363,6 +376,24 @@ fn created_tunnels_are_not_immediately_failed_by_a_stale_status() {
         "creating should attempt to run the tunnel: {:?}",
         app.tunnels[0].status
     );
+}
+
+#[test]
+fn importing_into_an_idle_group_saves_without_pretending_to_connect() {
+    // The batch counterpart of the reported regression: no group is working, so
+    // the rows are saved (`enabled` keeps the intent for `w`) but nothing may be
+    // dialled. The status column is a runtime fact, so the rows must read
+    // `○ 未启用` instead of `◐ 连接中` with a timer that never ends.
+    let (_d, mut app) = app_with_import_into_idle_group(vec![show(free_port()), show(free_port())]);
+    app.submit_form();
+
+    assert_eq!(app.tunnels.len(), 2, "both ticked rows are saved");
+    assert!(app.tunnels.iter().all(|t| matches!(t.status, TunnelStatus::Stopped)), "saved, not started");
+    assert!(app.tunnels.iter().all(|t| t.cfg.enabled), "the intent to run when the group works is kept");
+    assert_eq!(app.group_running_count(app.browsed_group), 0, "the header must not count them as starting");
+    assert!(app.supervisor.ids().is_empty(), "no tunnel thread may be spawned");
+    let msg = app.status.as_ref().map(|s| s.text.clone()).unwrap_or_default();
+    assert!(msg.contains("未工作的分组") && msg.contains('w'), "the save must say how to run it: {msg}");
 }
 
 mod port_planning_tests {
