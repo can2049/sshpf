@@ -49,6 +49,9 @@ pub(crate) type Hint = (&'static str, &'static str, &'static str);
 const MAIN_HINTS: &[Hint] = &[
     ("j/k ↑↓", "移动", "Move"),
     ("g/G", "首尾", "First·Last"),
+    ("[/]", "换组", "Groups"),
+    ("w", "分组工作", "Work"),
+    ("N/R/D", "建/改/删组", "Group ops"),
     ("space", "启停", "Start·Stop"),
     ("r", "重启", "Restart"),
     ("n", "新建", "New"),
@@ -138,9 +141,10 @@ mod tests {
         // hints while it is active would advertise keys that do something else
         // or nothing at all.
         let mut app = app_with_tunnels(vec![sample(1, "api-dev", 8080), sample(2, "db", 8081)]);
-        let normal = render_to_text(&mut app, 140, 24);
+        let normal = render_to_text(&mut app, 160, 24);
         assert!(normal.contains("启停"), "normal hints must describe space:\n{normal}");
         assert!(normal.contains("重启"), "normal hints must mention r:\n{normal}");
+        assert!(normal.contains("换组"), "normal hints must mention group browsing:\n{normal}");
 
         app.selected = 0;
         app.toggle_select_mode();

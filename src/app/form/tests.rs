@@ -86,6 +86,7 @@ fn a_form_with_a_bogus_kind_still_validates_and_saves() {
 fn editing_a_forward_keeps_a_valid_kind_index() {
     let mut cfg = crate::model::TunnelConfig {
         id: 1,
+        group: 1,
         name: "x".into(),
         kind: ForwardKind::Dynamic,
         ssh_host: "h".into(),
@@ -113,6 +114,7 @@ fn a_tunnel_with_no_remote_target_does_not_break_the_edit_form() {
     // produce an index or parse panic, just a valid form.
     let cfg = crate::model::TunnelConfig {
         id: 4,
+        group: 1,
         name: "socks".into(),
         kind: ForwardKind::Dynamic,
         ssh_host: "h".into(),

@@ -228,6 +228,9 @@ impl App {
                 return None;
             }
         };
+        // The form is opened for the browsed group. An edit keeps its stored
+        // group; a create lands in the group the user is looking at.
+        cfg.group = existing.as_ref().map(|e| e.group).unwrap_or(self.browsed_group);
         if let Err(reason) = self.admit_form_config(&cfg) {
             if let Some(f) = self.form.as_mut() {
                 f.errors = vec![reason];
@@ -279,6 +282,8 @@ impl App {
 
     fn commit_form_create(&mut self, mut cfg: TunnelConfig) {
         cfg.enabled = true;
+        let working = self.is_group_active(cfg.group);
+        let group = cfg.group;
         eventlog::tunnel_created(&cfg, "form");
         self.cfg.tunnels.push(cfg.clone());
         // Remember where the row landed *before* pushing, rather than recovering
@@ -288,9 +293,18 @@ impl App {
         self.tunnels.push(TunnelView::new(cfg.clone()));
         let vis = self.visible_indices();
         self.selected = vis.iter().position(|i| *i == pos).unwrap_or(vis.len().saturating_sub(1));
-        self.start_tunnel_with(cfg.id, "created");
+        if working {
+            self.start_tunnel_with(cfg.id, "created");
+        }
         self.close_overlay();
         self.persist_quietly();
+        if !working {
+            let alias = self.cfg.group(group).map(|g| g.alias()).unwrap_or_else(|| format!("#{group}"));
+            self.set_status(StatusMsg::info(help::bi(
+                &format!("已保存到未工作的分组「{alias}」；按 w 启动"),
+                &format!("Saved to idle group \"{alias}\"; press w to start it"),
+            )));
+        }
     }
 
     /// Apply the pending edit that the user confirmed.
@@ -311,14 +325,26 @@ impl App {
             v.cfg.id = eid;
             v.cfg.enabled = enabled || v.cfg.enabled;
         }
+        let group = self.cfg.find(eid).map(|t| t.group).unwrap_or_default();
         if let Some(view) = self.tunnels.iter().find(|t| t.cfg.id == eid) {
             eventlog::tunnel_updated(&view.cfg);
         }
         self.supervisor.stop(eid);
         self.forget_runtime_state(eid);
-        self.start_tunnel_with(eid, "edited");
+        if self.is_group_active(group) {
+            self.start_tunnel_with(eid, "edited");
+        } else {
+            self.set_state(eid, crate::model::TunnelStatus::Stopped);
+        }
         self.close_overlay();
         self.persist_quietly();
+        if !self.is_group_active(group) {
+            let alias = self.cfg.group(group).map(|g| g.alias()).unwrap_or_else(|| format!("#{group}"));
+            self.set_status(StatusMsg::info(help::bi(
+                &format!("修改已保存到未工作的分组「{alias}」；按 w 启动"),
+                &format!("Changes saved in idle group \"{alias}\"; press w to start it"),
+            )));
+        }
     }
 
     /// Whether the open form has changes worth warning about when discarding.

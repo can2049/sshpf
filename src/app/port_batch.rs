@@ -160,7 +160,7 @@ impl App {
         let mut errors: Vec<String> = Vec::new();
 
         for (id, port) in (base_id..=last_id).zip(ports.iter().copied()) {
-            let mut cfg = port_config(form, id, &ssh_host, &remote_host, port, &taken);
+            let mut cfg = port_config(form, id, self.browsed_group, &ssh_host, &remote_host, port, &taken);
             cfg.name = unique_within(&cfg.name, out.iter().map(|c| c.name.clone()).collect());
             cfg.local_port = plan_local(&cfg, &taken).unwrap_or(cfg.local_port);
             if let Some(existing) = self.duplicate_in_batch(&cfg, &out) {
@@ -191,6 +191,7 @@ impl App {
     pub(crate) fn commit_port_batch_with_skipped(&mut self, configs: Vec<TunnelConfig>, skipped: Vec<String>) {
         let n = configs.len();
         let first_id = configs.first().map(|c| c.id);
+        let working = self.browsed_group_is_active();
         for cfg in &configs {
             eventlog::tunnel_created(cfg, "port-scan");
             self.cfg.tunnels.push(cfg.clone());
@@ -198,8 +199,10 @@ impl App {
         }
         self.close_overlay();
         self.persist_quietly();
-        for cfg in &configs {
-            self.start_tunnel_with(cfg.id, "created");
+        if working {
+            for cfg in &configs {
+                self.start_tunnel_with(cfg.id, "created");
+            }
         }
         self.focus_first_created(first_id);
         let ports: Vec<String> = configs.iter().map(|c| c.remote_port.to_string()).collect();
@@ -215,7 +218,14 @@ impl App {
                 &format!("{created}; skipped {} duplicate forward(s)", skipped.len()),
             )
         };
-        self.set_status(StatusMsg::ok(text));
+        if working {
+            self.set_status(StatusMsg::ok(text));
+        } else {
+            self.set_status(StatusMsg::info(help::bi(
+                &format!("已在未工作的分组创建 {n} 条转发；按 w 启动"),
+                &format!("Created {n} forwards in an idle group; press w to start them"),
+            )));
+        }
     }
 
     /// Put the cursor on the first created tunnel so the user lands on the work.
@@ -246,6 +256,7 @@ pub(crate) struct PortBatch {
 fn port_config(
     form: &crate::app::FormState,
     id: crate::model::TunnelId,
+    group: crate::model::GroupId,
     ssh_host: &str,
     remote_host: &str,
     port: u16,
@@ -255,6 +266,7 @@ fn port_config(
     let name = if base_name.is_empty() { format!("{ssh_host}-L-{port}") } else { format!("{base_name}-{port}") };
     TunnelConfig {
         id,
+        group,
         name,
         // A port scan only offers the `-L` direction: it lists what the peer can
         // reach, which is exactly what a local forward lands on.

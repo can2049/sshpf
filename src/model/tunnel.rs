@@ -7,7 +7,7 @@
 //! Belongs here: a field of the definition, a per-kind display/spec rule.
 //! Does not belong: anything that needs a socket, a clock or a renderer.
 
-use super::TunnelId;
+use super::{GroupId, TunnelId};
 
 /// Which OpenSSH forwarding flavour a tunnel uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -57,6 +57,11 @@ impl ForwardKind {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TunnelConfig {
     pub id: TunnelId,
+    /// The group that owns this forward. Definitions in different groups are
+    /// independent: they may repeat the same endpoints and are never dialled at
+    /// the same time.
+    #[serde(default)]
+    pub group: GroupId,
     pub name: String,
     #[serde(default)]
     pub kind: ForwardKind,
@@ -240,6 +245,7 @@ mod tests {
     fn forward_spec_local() {
         let cfg = TunnelConfig {
             id: 1,
+            group: 1,
             name: "x".into(),
             kind: ForwardKind::Local,
             ssh_host: "h".into(),

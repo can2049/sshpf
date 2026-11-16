@@ -168,6 +168,15 @@ pub(crate) fn draw_message(frame: &mut Frame, app: &App, area: Rect) {
         let tail = fit_pair_spaced("enter 查看详情", "enter details", area.width as usize);
         let text = format!(" ✗ {}   ({tail})", reason.detail);
         Line::from(Span::styled(truncate_to_width(&text, area.width as usize), p.fg(p.failed)))
+    } else if !app.browsed_group_is_active() {
+        // Browsing never starts anything. Say so before the generic idle hint:
+        // otherwise every row looks merely "off" and space appears broken.
+        let idle = fit_pair_spaced(
+            "当前分组未工作 · w 开始转发 · [/] 浏览分组",
+            "This group is idle · w to work · [/] browse groups",
+            area.width as usize,
+        );
+        Line::from(Span::styled(format!(" {idle}"), p.fg(p.pending)))
     } else {
         let idle = fit_pair_spaced(
             "就绪 · n 新建转发 · ? 帮助 · q 退出",

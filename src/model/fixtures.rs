@@ -15,6 +15,7 @@ use super::tunnel::{ForwardKind, TunnelConfig};
 pub(crate) fn sample(kind: ForwardKind) -> TunnelConfig {
     TunnelConfig {
         id: 1,
+        group: 1,
         name: "t".into(),
         kind,
         ssh_host: "h".into(),

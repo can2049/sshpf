@@ -36,6 +36,9 @@ pub enum Overlay {
     Detail(TunnelId),
     /// Inline filter editing on the main table.
     Filter,
+    /// Alias input for creating or renaming a group. The text buffer lives in
+    /// `App::group_prompt`, next to the form's state.
+    GroupName,
 }
 
 /// A destructive or otherwise consequential action awaiting confirmation.
@@ -61,6 +64,12 @@ pub enum ConfirmAction {
     DiscardForm,
     /// Apply one operation to every marked tunnel in selection mode.
     Batch { action: BatchAction, count: usize },
+    /// Make a group the only working one (drops the previous group's sessions).
+    ActivateGroup(crate::model::GroupId),
+    /// Stop the working group (drops its live sessions).
+    DeactivateGroup(crate::model::GroupId),
+    /// Delete a group and every forward inside it (loses definitions).
+    DeleteGroup(crate::model::GroupId),
     /// Quit the program (stops every tunnel).
     Quit,
 }
@@ -99,6 +108,7 @@ impl App {
     pub fn close_overlay(&mut self) {
         self.overlay = Overlay::None;
         self.form = None;
+        self.group_prompt = None;
         self.picker = None;
         // The port list belongs to the form: leaving it behind would let a later
         // form (for another host) show stale rows.

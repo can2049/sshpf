@@ -21,6 +21,7 @@ fn text(dir: &Path) -> String {
 fn sample() -> TunnelConfig {
     TunnelConfig {
         id: 7,
+        group: 1,
         name: "cloud-pc".into(),
         kind: crate::model::ForwardKind::Local,
         ssh_host: "cloud_pc".into(),

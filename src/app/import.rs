@@ -49,6 +49,7 @@ impl App {
         let ends = forward_ends(&self.cfg.defaults.bind, forward, taken);
         TunnelConfig {
             id,
+            group: self.browsed_group,
             name: self.cfg.unique_name(&forward.suggested_name(), None),
             kind: forward.kind,
             ssh_host: forward.host_alias.clone(),
@@ -238,6 +239,7 @@ impl App {
         let n = configs.len();
         let first_id = configs.first().map(|c| c.id);
         let host = configs.first().map(|c| c.ssh_host.clone()).unwrap_or_default();
+        let working = self.browsed_group_is_active();
         crate::eventlog::import_committed(&host, n);
         for cfg in &configs {
             crate::eventlog::tunnel_created(cfg, "import");
@@ -246,8 +248,10 @@ impl App {
         }
         self.close_overlay();
         self.persist_quietly();
-        for cfg in &configs {
-            self.start_tunnel_with(cfg.id, "created");
+        if working {
+            for cfg in &configs {
+                self.start_tunnel_with(cfg.id, "created");
+            }
         }
         // Put the cursor on the first created tunnel so the user lands where the
         // work happened instead of on a row that may be far away.
@@ -258,7 +262,14 @@ impl App {
             }
         }
         self.clamp_selection();
-        self.set_status(StatusMsg::ok(import_batch_status(&configs, skipped.len())));
+        if working {
+            self.set_status(StatusMsg::ok(import_batch_status(&configs, skipped.len())));
+        } else {
+            self.set_status(StatusMsg::info(help::bi(
+                &format!("已在未工作的分组创建 {n} 条转发；按 w 启动"),
+                &format!("Created {n} forwards in an idle group; press w to start them"),
+            )));
+        }
     }
 
     /// Create-form submit when the import pane is in charge.

@@ -331,6 +331,9 @@ impl FormState {
     fn assemble(&self, d: Draft, id: TunnelId, existing: Option<&TunnelConfig>) -> TunnelConfig {
         TunnelConfig {
             id,
+            // Filled by the caller that knows which group is being browsed; an
+            // edit carries its stored group over.
+            group: existing.map(|e| e.group).unwrap_or(0),
             name: d.name,
             kind: d.kind,
             ssh_host: d.ssh_host,

@@ -217,6 +217,7 @@ fn an_exhausted_id_space_is_reported_into_the_form() {
     let mut cfg = ConfigFile::default();
     cfg.tunnels.push(crate::model::TunnelConfig {
         id: u64::MAX,
+        group: 1,
         name: "huge".into(),
         kind: ForwardKind::Local,
         ssh_host: "h".into(),
@@ -273,6 +274,7 @@ fn a_new_tunnel_lands_on_the_row_it_was_added_at() {
 fn saved_tunnel(local_port: u16, remote_port: u16, ssh_host: &str) -> crate::model::TunnelConfig {
     crate::model::TunnelConfig {
         id: 1,
+        group: 1,
         name: "already-there".into(),
         kind: ForwardKind::Local,
         ssh_host: ssh_host.into(),

@@ -38,6 +38,7 @@ fn f10() -> KeyEvent {
 fn saved(id: u64, name: &str, local: u16, remote: u16, ssh_host: &str) -> TunnelConfig {
     TunnelConfig {
         id,
+        group: 1,
         name: name.into(),
         kind: ForwardKind::Local,
         ssh_host: ssh_host.into(),

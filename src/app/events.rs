@@ -291,6 +291,7 @@ mod tests {
     fn tunnel(id: TunnelId, name: &str, port: u16) -> TunnelConfig {
         TunnelConfig {
             id,
+            group: 1,
             name: name.into(),
             kind: ForwardKind::Local,
             ssh_host: "testhost".into(),

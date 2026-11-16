@@ -37,6 +37,7 @@
 //! * **No I/O, no logging.** Pure over the parsed list; the caller records what
 //!   changed.
 
+use super::GroupId;
 use super::tunnel::TunnelConfig;
 
 /// One folded group: the entry that survives and the ones that duplicated it.
@@ -75,15 +76,17 @@ pub struct Folded {
 /// a user can predict by looking at the list they already have.
 pub fn fold_duplicates(list: Vec<TunnelConfig>) -> (Vec<TunnelConfig>, Vec<Folded>) {
     let mut kept: Vec<TunnelConfig> = Vec::with_capacity(list.len());
-    // Identity -> index into `report`, for the group that identity opened. One
-    // lookup structure, not two: `kept` and `report` are written in lockstep, so a
-    // second `seen` list of indices into `kept` could only disagree with it.
-    let mut groups: Vec<(String, usize)> = Vec::new();
+    // `(group, identity)` -> index into `report`. The group is part of the key:
+    // two groups may deliberately hold the same forward, and folding them would
+    // delete a definition the user can still switch to. One lookup structure, not
+    // two: `kept` and `report` are written in lockstep, so a second `seen` list of
+    // indices into `kept` could only disagree with it.
+    let mut groups: Vec<((GroupId, String), usize)> = Vec::new();
     let mut report: Vec<Folded> = Vec::new();
 
     for tunnel in list {
-        let identity = tunnel.forward_identity();
-        match groups.iter().find(|(id, _)| *id == identity).map(|(_, at)| *at) {
+        let key = (tunnel.group, tunnel.forward_identity());
+        match groups.iter().find(|(id, _)| *id == key).map(|(_, at)| *at) {
             // A repeat: enough for a report entry, then discarded. The survivor
             // keeps its persisted definition untouched — repairing the *ports*
             // would be a start-up behaviour change nobody asked for.
@@ -95,7 +98,7 @@ pub fn fold_duplicates(list: Vec<TunnelConfig>) -> (Vec<TunnelConfig>, Vec<Folde
             // First of its kind: this is the one that survives, and it opens the
             // group later duplicates point at.
             None => {
-                groups.push((identity, report.len()));
+                groups.push((key, report.len()));
                 report.push(Folded { kept: tunnel.name.clone(), dropped: Vec::new() });
                 kept.push(tunnel);
             }
@@ -114,6 +117,7 @@ mod tests {
     fn t(id: u64, name: &str, local_port: u16, remote_port: u16) -> TunnelConfig {
         TunnelConfig {
             id,
+            group: 1,
             name: name.into(),
             kind: ForwardKind::Local,
             ssh_host: "cloud_pc".into(),

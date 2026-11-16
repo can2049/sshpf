@@ -107,6 +107,15 @@ impl App {
     /// An empty selection and a selection that is already in the desired state
     /// are both no-ops: asking the user to confirm doing nothing is noise.
     pub fn request_batch(&mut self, action: BatchAction) {
+        // Starting is a runtime action, and an idle group has no runtime to
+        // act on: switching is a deliberate `w`, never a side effect of a batch.
+        if matches!(action, BatchAction::Start | BatchAction::Restart) && !self.browsed_group_is_active() {
+            self.set_status(StatusMsg::warn(help::bi(
+                "该分组未在工作：先按 w 让它开始工作",
+                "This group is idle: press w to make it work first",
+            )));
+            return;
+        }
         let ids = self.marked_ids_in_view_order();
         if ids.is_empty() {
             self.set_status(StatusMsg::warn(help::bi("没有选中任何条目", "Nothing marked")));

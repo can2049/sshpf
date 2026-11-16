@@ -30,6 +30,7 @@ mod fixtures {
     pub(crate) fn sample(id: TunnelId, name: &str, port: u16) -> TunnelConfig {
         TunnelConfig {
             id,
+            group: 1,
             name: name.into(),
             kind: ForwardKind::Local,
             ssh_host: "dev-box".into(),

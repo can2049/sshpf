@@ -57,6 +57,9 @@
   不存在"最后一个窗口退出才关服"这回事。
 - **`--no-restore` 只影响本进程**：它表示"本进程启动时不自动恢复 enabled 的转发"，没有
   "传给谁"的问题。
+- **分组是进程内唯一的工作单元**：`active_group` 至多一个，只有它的 enabled 转发会被启动；
+  浏览其它分组只换表格，不改变工作分组。切换分组先停旧分组的运行态（保留 `enabled`），
+  再启动新分组的 enabled 转发。见 [runtime.md](runtime.md#分组--groups)。
 
 同一份 `config.toml` 被两个进程同时打开时，两边各自持有自己的隧道并各自写盘——监听端口会撞车，
 后写者覆盖前写者。这不是支持的多窗口共享，而是**两份独立状态**；要做到界面里只有一份真相，就只开
@@ -69,13 +72,14 @@
 | 目录 | 一句话 |
 |---|---|
 | `src/main.rs`、`src/cli.rs`、`src/cli/args.rs`、`src/lib.rs` | 事件循环 + 信号、`USAGE` 双语文本 + 非 UI 模式、clap flag 声明与错误映射、`pub mod` 声明 |
-| `src/app/` | 状态机：持有隧道、消费事件、确认闸、表单、多选 |
+| `src/app/` | 状态机：持有隧道、消费事件、确认闸、表单、多选、**分组浏览/工作切换** |
 | `src/keys/` | 按键分发，一个上下文一个 handler 文件 |
 | `src/ui/` | 纯渲染（ratatui），每帧重建命中图 |
 | `src/tunnel.rs` | 隧道监督：一线程一 `current_thread` runtime |
 | `src/config.rs` | TOML 持久化（原子写；Unix `0600`，Windows 靠 ACL） |
+| `src/config/group.rs` | 分组查找/编号/别名分配，以及按组做的监听冲突校验 |
 | `src/ssh/` | `~/.ssh/config`、known_hosts、SOCKS5、端口探测、russh 客户端 |
-| `src/model/` | 纯数据：隧道、导入表、状态、表单、失败分类 |
+| `src/model/` | 纯数据：隧道、分组、导入表、状态、表单、失败分类 |
 | `src/text.rs` | 唯一的字符串层：宽度/截断/双语/折行/glob |
 | `src/logging/` | 落盘日志 + 崩溃捕获（**唯一允许 `unsafe`**） |
 | `src/eventlog/` | `event=` 词汇表（唯一真相） |
@@ -96,6 +100,7 @@
 | `src/keys/ports.rs` | `handle_port_key` + 移动/行两个 helper | 对端端口列表 |
 | `src/keys/dropdown.rs` | `handle_dropdown_key` | 主机下拉 |
 | `src/keys/misc.rs` | `handle_help_key`、`handle_detail_key`、`handle_confirm_key`、`handle_filter_key` | 帮助 / 详情 / 确认 / 过滤 |
+| `src/keys/group.rs` | `handle_group_name_key` | 分组别名输入（`N` / `R`） |
 | `src/keys/testkit.rs` | `#[cfg(test)]` 共享夹具，**无生产代码** | 测试夹具 |
 
 **加键 = 改两个文件**：handler 里加 dispatch，`src/help.rs` 对应 section 加一行。漏一个 `tests/help_coverage.rs` 会红。见 [agents.md](agents.md#加按键--add-a-key)。
@@ -118,6 +123,8 @@
 | 新的确认闸动作 | `src/app/confirm.rs` 的 `ConfirmAction` + 文案 | `src/keys/` 触发点；`help` 的 Safety section |
 | 新的批量动作 | `src/model/batch.rs` 的 `BatchAction` | `src/app/select.rs`、`src/ui/selection.rs`、[keymap.md](keymap.md#多选模式--selection-mode) |
 | 新的界面面板（浮层） | `src/app.rs` 的 `Overlay` 变体 + `src/ui/<name>.rs` + `src/keys/<name>.rs` | `HitTarget` 变体 + help section + keymap（清单见 [tui.md](tui.md#加一个可点控件--add-a-clickable-control)） |
+| 新的分组行为（切换 / 别名 / 删除） | `src/app/group.rs` | `src/keys/group.rs` 或 `src/keys/main.rs`、`src/help/main.rs`、`docs/keymap.md` |
+| 新的分组持久化字段 | `src/model/group.rs` + `src/config.rs` / `src/config/group.rs` | `ConfigFile` 迁移与 `--check` |
 | 新的导入列 | `src/model/import/row.rs` 的 `ImportColumn` | `src/ui/import/row.rs`、`src/keys/import.rs`、`src/model/import/filter.rs`、[import.md](import.md) |
 | 新的日志事件 | `src/eventlog/<族>.rs` 一个函数 | [logging/events.md](logging/events.md) 一行 |
 | 新的连通性判定 / 探活 | `src/ssh/client/health.rs`（判据与 `PING_TIMEOUT`） | `src/ssh/client/driver.rs` 的循环 race、[runtime.md](runtime.md#健康检查--health-checks) |

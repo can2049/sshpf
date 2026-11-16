@@ -11,6 +11,7 @@ use crate::model::ForwardKind;
 fn tmp_cfg(id: TunnelId, name: &str, port: u16) -> TunnelConfig {
     TunnelConfig {
         id,
+        group: 1,
         name: name.into(),
         kind: ForwardKind::Local,
         ssh_host: "host".into(),
@@ -481,4 +482,104 @@ fn state_roundtrip() {
     let back = load_state(&path);
     assert_eq!(back.last_run, 42);
     assert_eq!(back.last_state.get("1").map(String::as_str), Some("up"));
+}
+
+#[test]
+fn a_legacy_flat_config_is_adopted_by_one_active_group() {
+    // Before groups existed, every enabled forward was restored on start-up.
+    // The upgrade must keep that promise: the implicit group becomes active.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    fs::write(
+        &path,
+        "[[tunnels]]\nid = 1\nname = \"old\"\nssh_host = \"h\"\nlocal_port = 8080\nremote_port = 80\nenabled = true\n",
+    )
+    .unwrap();
+    let cfg = load(&path).unwrap();
+    assert_eq!(cfg.groups.len(), 1, "an implicit group is created");
+    assert_eq!(cfg.active_group, Some(cfg.groups[0].id), "and it is the working one");
+    assert_eq!(cfg.tunnels[0].group, cfg.groups[0].id, "the tunnel is adopted by it");
+}
+
+#[test]
+fn groups_and_the_active_choice_survive_a_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let mut cfg = ConfigFile {
+        groups: vec![crate::model::GroupConfig::new(1, "work"), crate::model::GroupConfig::new(2, "home")],
+        active_group: Some(2),
+        ..ConfigFile::default()
+    };
+    cfg.tunnels.push(tmp_cfg(1, "a", 8080));
+    save(&path, &cfg).unwrap();
+    let back = load(&path).unwrap();
+    assert_eq!(back.groups.len(), 2);
+    assert_eq!(back.active_group, Some(2));
+    assert_eq!(back.group(2).map(|g| g.alias()), Some("home".to_string()));
+}
+
+#[test]
+fn no_working_group_is_persisted_as_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let cfg = ConfigFile { active_group: None, ..ConfigFile::default() };
+    save(&path, &cfg).unwrap();
+    assert_eq!(load(&path).unwrap().active_group, None, "an explicit idle state must survive a restart");
+}
+
+#[test]
+fn folding_duplicates_is_scoped_to_one_group() {
+    // Two groups may deliberately hold the same forward; only a repeat *inside*
+    // one group is redundant.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let mut cfg = ConfigFile {
+        groups: vec![crate::model::GroupConfig::new(1, "work"), crate::model::GroupConfig::new(2, "home")],
+        active_group: Some(1),
+        ..ConfigFile::default()
+    };
+    cfg.tunnels.push(tmp_cfg_bumped(1, "a", 8001, 80));
+    cfg.tunnels.push(tmp_cfg_bumped(2, "a-2", 8002, 80));
+    let mut other = tmp_cfg_bumped(3, "b", 8003, 80);
+    other.group = 2;
+    cfg.tunnels.push(other);
+    save(&path, &cfg).unwrap();
+
+    let (back, report) = load_with_report(&path).unwrap();
+    assert_eq!(back.tunnels.len(), 2, "one survivor per group");
+    assert_eq!(back.tunnels.iter().filter(|t| t.group == 1).count(), 1);
+    assert_eq!(back.tunnels.iter().filter(|t| t.group == 2).count(), 1);
+    assert_eq!(report.len(), 1);
+}
+
+#[test]
+fn validate_reports_listen_conflicts_only_within_a_group() {
+    let mut cfg = ConfigFile {
+        groups: vec![crate::model::GroupConfig::new(1, "work"), crate::model::GroupConfig::new(2, "home")],
+        active_group: Some(1),
+        ..ConfigFile::default()
+    };
+    let mut a = tmp_cfg(1, "a", 9000);
+    let mut b = tmp_cfg(2, "b", 9000);
+    a.enabled = true;
+    b.enabled = true;
+    b.group = 2;
+    cfg.tunnels = vec![a.clone(), b.clone()];
+    assert!(cfg.validate().is_empty(), "different groups may share a port");
+
+    b.group = 1;
+    cfg.tunnels = vec![a, b];
+    assert_eq!(cfg.validate().len(), 1, "the same group may not");
+}
+
+#[test]
+fn group_ids_and_aliases_are_allocated_without_collisions() {
+    let cfg = ConfigFile {
+        groups: vec![crate::model::GroupConfig::new(1, "work"), crate::model::GroupConfig::new(3, "")],
+        ..ConfigFile::default()
+    };
+    assert_eq!(cfg.next_group_id(), 4);
+    assert_eq!(cfg.unique_group_name("work", None), "work-2");
+    assert_eq!(cfg.unique_group_name("work", Some(1)), "work");
+    assert_eq!(cfg.unique_group_name("  ", None), "");
 }

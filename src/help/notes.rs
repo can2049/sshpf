@@ -15,6 +15,10 @@ pub(super) const MOUSE: HelpSection = HelpSection {
     title_en: "Mouse",
     items: &[
         HelpItem::note(
+            "单击分组栏：切换浏览的分组，不会让它开始工作。",
+            "Click the group bar: browse that group; it never makes the group work.",
+        ),
+        HelpItem::note(
             "单击表格行：移动光标（多选模式下改为切换该行勾选）。",
             "Click a table row: move the cursor (in selection mode it toggles that row's mark).",
         ),

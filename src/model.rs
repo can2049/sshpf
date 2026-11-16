@@ -38,6 +38,7 @@ mod dedup;
 mod event;
 mod failure;
 mod form;
+mod group;
 mod import;
 mod r#match;
 mod msg;
@@ -50,6 +51,8 @@ mod tunnel;
 mod fixtures;
 
 pub type TunnelId = u64;
+/// Identifier of an independently switchable group of forwards.
+pub type GroupId = u64;
 
 // Re-exports keep `crate::model::X` working for every caller that predates the
 // split. New code may name the submodule directly (`crate::model::status::…`);
@@ -59,6 +62,7 @@ pub use dedup::{Folded, fold_duplicates};
 pub use event::TunnelEvent;
 pub use failure::{FailureInfo, FailureKind};
 pub use form::{FormField, FormMode, InputBuf};
+pub use group::{GroupConfig, GroupRepair, normalize_groups};
 pub use import::{
     ForwardEnds, ImportColumn, ImportRow, ImportTable, LocalPortReason, PORT_SCAN_LIMIT, SshForward, col_match,
     plan_local_port,

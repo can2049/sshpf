@@ -16,8 +16,7 @@ use crate::help;
 use crate::logging;
 use crate::model::TunnelEvent;
 use crate::model::{
-    FailureInfo, FormMode, ForwardKind, HostPicker, MultiSelect, PortPick, StatusMsg, TunnelConfig, TunnelId,
-    TunnelView,
+    FailureInfo, FormMode, GroupId, HostPicker, MultiSelect, PortPick, StatusMsg, TunnelConfig, TunnelId, TunnelView,
 };
 use crate::ssh::SshHost;
 use crate::tunnel::Supervisor;
@@ -27,6 +26,7 @@ pub mod duplicate;
 pub mod events;
 pub mod form;
 pub mod form_submit;
+pub mod group;
 pub mod helpers;
 pub mod import;
 pub mod import_pane;
@@ -44,6 +44,7 @@ pub(crate) use helpers::deadline_after;
 pub use helpers::{backoff, build_views, sanitize_config};
 
 pub use form::{EditMode, FormState};
+pub use group::{GroupNameMode, GroupNamePrompt};
 
 /// How many host rows the inline dropdown shows at once.
 ///
@@ -90,9 +91,18 @@ pub(crate) struct RetryState {
 pub struct App {
     pub cfg: ConfigFile,
     pub paths: Paths,
+    /// Every tunnel from every group. Runtime events are keyed by tunnel id, so
+    /// this stays flat; the table shows only `browsed_group`.
     pub tunnels: Vec<TunnelView>,
     /// Index into `visible_indices()`, not into `tunnels`.
     pub selected: usize,
+    /// The only group allowed to run forwards, or `None` when no group is
+    /// working.
+    pub active_group: Option<GroupId>,
+    /// The group the table is showing. Browsing never changes which group works.
+    pub browsed_group: GroupId,
+    /// Alias input for "new group" / "rename group".
+    pub group_prompt: Option<GroupNamePrompt>,
     pub overlay: Overlay,
     pub form: Option<FormState>,
     pub picker: Option<HostPicker>,
@@ -177,11 +187,18 @@ impl App {
         let (cfg, folded_on_load) = Self::load_config_for(&paths);
         let (event_tx, event_rx) = mpsc::channel();
         let tunnels = build_views(&cfg);
+        let active_group = cfg.active_group.filter(|id| cfg.group(*id).is_some());
+        // `load` normalises the list, so the fallback is unreachable; keeping it
+        // total avoids a panic if a future caller builds `App` from a raw file.
+        let browsed_group = active_group.unwrap_or_else(|| cfg.groups.first().map(|g| g.id).unwrap_or(1));
         App {
             cfg,
             paths,
             tunnels,
             selected: 0,
+            active_group,
+            browsed_group,
+            group_prompt: None,
             overlay: Overlay::None,
             form: None,
             picker: None,
@@ -257,47 +274,6 @@ impl App {
         }
     }
 
-    /// Local ports already claimed by other managed tunnels.
-    ///
-    /// The OS-level probe cannot see these: a stopped tunnel is not listening,
-    /// yet starting it later would collide. Feeding them to the local-port
-    /// suggester keeps two entries from fighting over one port.
-    pub fn taken_local_ports(&self) -> Vec<u16> {
-        let editing = self.form.as_ref().and_then(|f| match f.mode {
-            FormMode::Edit(id) => Some(id),
-            FormMode::Create => None,
-        });
-        self.tunnels
-            .iter()
-            .filter(|t| Some(t.cfg.id) != editing)
-            .filter(|t| t.cfg.kind != ForwardKind::Remote)
-            .map(|t| t.cfg.local_port)
-            .collect()
-    }
-
-    /// Recompute the local port suggestion for the open form.
-    ///
-    /// Called after the remote port changes; safe to call at any time.
-    pub fn refresh_local_port_suggestion(&mut self) {
-        let taken = self.taken_local_ports();
-        if let Some(form) = self.form.as_mut() {
-            form.suggest_local_port(&taken);
-            form.revalidate();
-        }
-    }
-
-    fn listen_conflict(&self, candidate: &TunnelConfig) -> Option<String> {
-        for t in &self.tunnels {
-            if t.cfg.id == candidate.id {
-                continue;
-            }
-            if candidate.listen_overlap(&t.cfg) {
-                return Some(t.cfg.name.clone());
-            }
-        }
-        None
-    }
-
     pub fn delete_selected(&mut self) {
         let Some(id) = self.selected_id() else {
             return;
@@ -326,7 +302,8 @@ impl App {
 
     /// `x`: stopping everything is a bulk destructive action.
     pub fn request_stop_all(&mut self) {
-        if self.counts().off == self.tunnels.len() {
+        let c = self.counts();
+        if c.off == c.total {
             self.set_status(StatusMsg::info(help::bi("没有运行中的转发", "No forward is running")));
             return;
         }
@@ -335,6 +312,13 @@ impl App {
 
     /// `a`: starting everything opens listeners; confirm once for the batch.
     pub fn request_start_all(&mut self) {
+        if !self.browsed_group_is_active() {
+            self.set_status(StatusMsg::warn(help::bi(
+                "该分组未在工作：先按 w 让它开始工作",
+                "This group is idle: press w to make it work first",
+            )));
+            return;
+        }
         if self.counts().off == 0 {
             self.set_status(StatusMsg::info(help::bi("没有未启用的转发", "No disabled forward")));
             return;
@@ -343,15 +327,20 @@ impl App {
     }
 
     pub fn start_all(&mut self) {
-        let ids: Vec<TunnelId> =
-            self.tunnels.iter().filter(|t| !t.status.is_running_or_pending()).map(|t| t.cfg.id).collect();
+        let ids: Vec<TunnelId> = self
+            .tunnels
+            .iter()
+            .filter(|t| t.cfg.group == self.browsed_group && !t.status.is_running_or_pending())
+            .map(|t| t.cfg.id)
+            .collect();
         for id in ids {
             self.start_tunnel_with(id, "start_all");
         }
     }
 
     pub fn stop_all(&mut self) {
-        let ids: Vec<TunnelId> = self.tunnels.iter().map(|t| t.cfg.id).collect();
+        let ids: Vec<TunnelId> =
+            self.tunnels.iter().filter(|t| t.cfg.group == self.browsed_group).map(|t| t.cfg.id).collect();
         for id in ids {
             self.stop_tunnel_with(id, "stop_all");
         }

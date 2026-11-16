@@ -106,6 +106,7 @@ fn an_edit_never_batches() {
     {
         let cfg = TunnelConfig {
             id: 1,
+            group: 1,
             name: "existing".into(),
             kind: ForwardKind::Local,
             ssh_host: "dev-box".into(),
@@ -227,6 +228,7 @@ mod duplicate_tests {
     ) -> TunnelConfig {
         TunnelConfig {
             id,
+            group: 1,
             name: name.into(),
             kind: ForwardKind::Local,
             ssh_host: "dev-box".into(),

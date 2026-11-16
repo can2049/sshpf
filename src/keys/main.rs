@@ -44,6 +44,12 @@ pub(super) fn handle_main_key(app: &mut App, key: KeyEvent) {
         // is looking at; a mode that starts empty would need a second gesture
         // before anything can be marked.
         KeyCode::Char('v') | KeyCode::Char('V') => app.toggle_select_mode(),
+        KeyCode::Char('[') => app.browse_group(-1),
+        KeyCode::Char(']') => app.browse_group(1),
+        KeyCode::Char('w') => app.request_toggle_work(),
+        KeyCode::Char('N') => app.open_group_create(),
+        KeyCode::Char('R') => app.open_group_rename(),
+        KeyCode::Char('D') => app.request_delete_group(),
         KeyCode::Esc => app.filter.clear(),
         _ => {}
     }
@@ -158,6 +164,37 @@ mod tests {
         handle_key(&mut app, ch('e'));
         assert!(matches!(app.overlay, Overlay::Form));
         assert_eq!(app.form.as_ref().unwrap().name.value(), "editable");
+    }
+
+    #[test]
+    fn group_keys_browse_edit_and_delete() {
+        use crate::model::GroupConfig;
+        let (_d, mut app) = app_with(vec![tunnel(1, "a", 18001)]);
+        app.cfg.groups.push(GroupConfig::new(2, "home"));
+        app.active_group = Some(1);
+        app.browsed_group = 1;
+
+        handle_key(&mut app, ch(']'));
+        assert_eq!(app.browsed_group, 2, "] browses forward");
+        handle_key(&mut app, ch('['));
+        assert_eq!(app.browsed_group, 1, "[ browses back");
+
+        handle_key(&mut app, ch('N'));
+        assert!(matches!(app.overlay, Overlay::GroupName), "N opens the alias input");
+        handle_key(&mut app, key(KeyCode::Esc));
+        assert!(matches!(app.overlay, Overlay::None));
+
+        handle_key(&mut app, ch('R'));
+        assert!(matches!(app.overlay, Overlay::GroupName), "R renames the current group");
+        handle_key(&mut app, key(KeyCode::Esc));
+
+        handle_key(&mut app, ch('D'));
+        assert!(matches!(app.overlay, Overlay::Confirm { .. }), "D asks before deleting a group");
+        handle_key(&mut app, ch('n'));
+        assert_eq!(app.cfg.groups.len(), 2, "cancel keeps it");
+
+        handle_key(&mut app, ch('w'));
+        assert_eq!(app.active_group, None, "w on the working group stops working");
     }
 
     #[test]

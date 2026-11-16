@@ -76,7 +76,7 @@
 
 | 事件 | 级别 | 关键字段 | 含义 |
 |---|---|---|---|
-| `tunnel.start` | INFO | 隧道字段 + `trigger` | 请求启动（`manual`/`restore`/`retry`/`batch`/`created`/`edited`） |
+| `tunnel.start` | INFO | 隧道字段 + `trigger` | 请求启动（`manual`/`restore`/`retry`/`batch`/`created`/`edited`/`group`） |
 | `tunnel.rejected` | ERROR | 隧道字段 + `stage` `kind` `short` `msg` | 启动被拒；`stage` = `validate`/`preflight_bind`/`resolve_endpoint` |
 | `tunnel.spawn` | INFO | 隧道字段 + `endpoint` `via` `hostkey_policy` | 后台线程开始建连；`via` 是 ProxyJump 链（逗号分隔） |
 | `tunnel.spawn_failed` | ERROR | 隧道字段 + `msg` | 线程都起不来 |
@@ -89,7 +89,7 @@
 | `tunnel.retry_abandoned` | WARN | 隧道字段 + `attempt` `stage` `kind` `short` | **重试链放弃**：在 `stage`（`validate`/`preflight_bind`/`resolve_endpoint`/`spawn`）被拒且重试也修不好，退避到此为止 |
 | `tunnel.thread_panic` | ERROR | `tunnel` `msg` | 隧道线程 panic 已被兜住并转为失败退出；栈另见同时写出的 `crash.panic` |
 | `tunnel.stop_timeout` | WARN | `tunnel` `grace_ms` `msg` | 隧道线程未在宽限期（2s）内退出：UI 已判停止，但线程可能仍占着端口 |
-| `tunnel.stop` | INFO | 隧道字段 + `trigger` | 用户停止（`manual`/`stop_all`/`batch`） |
+| `tunnel.stop` | INFO | 隧道字段 + `trigger` | 用户停止（`manual`/`stop_all`/`batch`/`group`）；`group` 表示切换/停止工作分组时保留 `enabled` 的运行态停止 |
 | `tunnel.created` | INFO | 隧道字段 + `source` | 新定义（`form`/`import`） |
 | `tunnel.updated` | INFO | 隧道字段 | 定义被编辑 |
 | `tunnel.deleted` | INFO | 隧道字段 | 定义被删除 |

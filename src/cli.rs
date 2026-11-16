@@ -97,6 +97,14 @@ sshpf — SSH 端口转发 TUI 管理器 / SSH port-forward manager for the term
   x         全部停用（需确认）/ Stop all forwards (asks first)
   v / V     进入 / 退出多选模式（批量启停、重启、删除）
             Enter / leave selection mode (batch start, restart, delete)
+  [ / ]     浏览上一个 / 下一个分组（只切换列表，不启停）
+            Browse the previous / next group (browse only)
+  w         让当前分组开始 / 停止工作（运行中先确认）
+            Make this group work / stop working (asks first while running)
+  N         新建分组 / Create a group
+  R         重命名当前分组的别名 / Rename the current group
+  D         删除当前分组及其全部转发（先确认）
+            Delete this group and all its forwards (asks first)
   ?         打开 / 关闭帮助浮层（全部按键的中英说明）
             Open / close the help overlay (every key, Chinese + English)
   q         退出（有运行中转发时确认）/ Quit (asks first while forwards run)
@@ -221,8 +229,10 @@ pub fn check_config(paths: &Paths) -> ExitCode {
         Ok(cfg) => {
             let problems = cfg.validate();
             let mut out = format!(
-                "{}: {} 条转发 / {} tunnel(s)\n",
+                "{}: {} 个分组 / {} group(s), {} 条转发 / {} tunnel(s)\n",
                 config::display_path(&paths.config),
+                cfg.groups.len(),
+                cfg.groups.len(),
                 cfg.tunnels.len(),
                 cfg.tunnels.len()
             );

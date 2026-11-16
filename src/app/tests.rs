@@ -9,7 +9,7 @@ use super::*;
 use crate::model::TunnelStatus;
 use std::time::Duration;
 // Some types moved into submodules; the tests still reach for them by name.
-use crate::model::{FailureInfo, FailureKind, FormField};
+use crate::model::{FailureInfo, FailureKind, FormField, ForwardKind};
 
 fn test_paths(dir: &std::path::Path) -> Paths {
     Paths { config: dir.join("config.toml"), state: dir.join("state.toml") }
@@ -18,6 +18,7 @@ fn test_paths(dir: &std::path::Path) -> Paths {
 fn sample_tunnel(id: TunnelId, name: &str, port: u16) -> TunnelConfig {
     TunnelConfig {
         id,
+        group: 1,
         name: name.into(),
         kind: ForwardKind::Local,
         ssh_host: "h".into(),

@@ -32,7 +32,25 @@ main 线程（同步）                        每条隧道一个后台线程
 | `preflight()` | 校验配置 → 端口占用预检 → 解析 `ssh_host` endpoint | 返回失败结论 → `tunnel.rejected`（`stage=validate`/`preflight_bind`/`resolve_endpoint`） |
 | `launch()` | `Supervisor::spawn` → 起线程 → 状态置 `Starting` | `tunnel.spawn_failed` |
 
-`trigger` 字段是稳定 ASCII 值，告诉读者**这次启动是谁发起的**：`manual` / `restore` / `retry` / `batch` / `created` / `edited`。预检在**建连之前**做，因为这两类错误可以立刻确定、不值得等一次 SSH 握手：端口被占、主机解析不出来。
+`trigger` 字段是稳定 ASCII 值，告诉读者**这次启动是谁发起的**：`manual` / `restore` / `retry` / `batch` / `created` / `edited` / `group`。预检在**建连之前**做，因为这两类错误可以立刻确定、不值得等一次 SSH 握手：端口被占、主机解析不出来。
+
+## 分组 / Groups
+
+分组是**运行时的互斥单元**，不是另一个进程或另一份配置：
+
+| 状态 | 谁在跑 | 表格显示 |
+|---|---|---|
+| 浏览 = 工作 | 该分组 enabled 的转发 | 该分组 |
+| 浏览 ≠ 工作 | 工作分组 enabled 的转发 | 被浏览的分组（状态行是 `○`，因为它的运行时确实停了） |
+| 没有工作分组 | 无 | 被浏览的分组 |
+
+三条规则：
+
+1. **启动只发生在工作分组里。** `space` / `r` / `a` / 批量启动在非工作分组里只提示「先按 `w`」，不会隐式切换。新建/导入/编辑在非工作分组里只保存，不建连。
+2. **切换保留意图。** `w` 让被浏览的分组成为唯一工作分组：先停旧分组的运行态（`enabled` 不变），再启动新分组里 `enabled` 的转发；旧分组下一次切回时照常恢复。
+3. **启动恢复只恢复上次工作的分组。** `active_group` 与 `enabled` 一起持久化；启动时只恢复 `active_group` 里的 enabled 转发。旧版本的单层配置在载入时被收进一个隐式分组，并把这个分组置为工作分组，所以升级后行为不变。
+
+切换/停止工作分组只在**原分组有运行中转发**时确认；没有运行中的转发就直接执行。见 `src/app/group.rs`。
 
 ## 就绪判定 / Readiness
 
@@ -57,6 +75,8 @@ main 线程（同步）                        每条隧道一个后台线程
 |---|---|---|
 | **配置类** | 端口占用、权限不足(<1024)、认证失败、主机密钥、远端转发被拒 | `Failed{reason}`（`✗`），**不重试** |
 | **网络类** | 连接拒绝、超时、DNS、进程异常退出 | `Retrying{attempt, next_at}`（`◌`），指数退避 |
+
+重试只属于工作分组：切换分组时旧分组的重试表被 `forget_runtime_state` 清掉，不会在后台把已停的转发重新拉起来。
 
 - 退避：`retry_initial_secs` 起步，翻倍，封顶 `retry_max_secs`（默认 2s→…→30s）；受每条隧道的 `auto_restart` 与全局 `defaults.auto_restart` 控制。
 - `arm_retry` 启动时先插占位记录 `attempt = 0`；`tick_retries` 只处理 `attempt >= 1` 的记录——否则占位符会让程序在启动瞬间无限重连（集成测试抓到过的真实缺陷）。

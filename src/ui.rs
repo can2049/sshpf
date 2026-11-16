@@ -21,7 +21,8 @@
 //! ```text
 //! row 0          title bar      sshpf 0.1.0 · ssh-config N hosts · cfg PATH   HH:MM:SS
 //! row 1          counters       ● 4 已连通/Up  ◐ 2 连接中/Starting  …
-//! rows 2..h-5    tunnel table   名称/Name | T | 本地/Local | 远端/Remote | …
+//! row 2          group bar      ▶ 工作 ●   家庭   分组 Groups
+//! rows 3..h-5    tunnel table   名称/Name | T | 本地/Local | 远端/Remote | …
 //! row h-5        message bar    app.status, or the selected tunnel's full error
 //! row h-4        selection bar  only while selecting (`v`)
 //! rows h-3..h    key hints      three lines, every main-screen key
@@ -40,6 +41,7 @@
 //! | [`palette`] | colours, `fmt_uptime`/`fmt_unix`, `cell` | you need a colour or a column format |
 //! | [`text`] | `pair`/`fit_pair`/`wrap_text`, `warn_once` | you need bilingual text or a once-per-process log |
 //! | [`header`] | title bar, counters, message bar | you change the top chrome |
+//! | [`group`] | the group bar and the alias popup | you change group switching or naming |
 //! | [`hints`] | the three footer hint rows | you add a main-screen key |
 //! | [`table`] | the tunnel table | you change a row/column |
 //! | [`selection`] | the `v`-mode action bar | you add a batch action |
@@ -88,6 +90,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let rows = Layout::vertical([
         Constraint::Length(1),        // title
         Constraint::Length(1),        // counters
+        Constraint::Length(1),        // group bar
         Constraint::Min(1),           // table
         Constraint::Length(1),        // message bar
         Constraint::Length(select_h), // selection-mode action bar
@@ -97,12 +100,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     draw_title(frame, app_ref, band(&rows, 0, "title"));
     draw_counters(frame, app_ref, band(&rows, 1, "counters"));
-    draw_table(frame, app_ref, band(&rows, 2, "table"), &mut hits);
-    draw_message(frame, app_ref, band(&rows, 3, "message"));
+    draw_group_bar(frame, app_ref, band(&rows, 2, "groups"), &mut hits);
+    draw_table(frame, app_ref, band(&rows, 3, "table"), &mut hits);
+    draw_message(frame, app_ref, band(&rows, 4, "message"));
     if select_h > 0 {
-        draw_selection_bar(frame, app_ref, band(&rows, 4, "selection_bar"), &mut hits);
+        draw_selection_bar(frame, app_ref, band(&rows, 5, "selection_bar"), &mut hits);
     }
-    draw_keys(frame, app_ref, band(&rows, 5, "keys"));
+    draw_keys(frame, app_ref, band(&rows, 6, "keys"));
 
     match &app_ref.overlay {
         Overlay::None => {}
@@ -111,6 +115,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Overlay::Confirm { prompt, .. } => draw_confirm(frame, prompt, area, &mut hits),
         Overlay::Detail(id) => draw_detail(frame, app_ref, *id, area, &mut hits),
         Overlay::Filter => draw_filter(frame, app_ref, area, &mut hits),
+        Overlay::GroupName => draw_group_name(frame, app_ref, area, &mut hits),
     }
 
     app.hits = hits;
@@ -148,6 +153,7 @@ use crate::ui::detail::{detail_inner_height, detail_lines, draw_detail};
 use crate::ui::filter::draw_filter;
 use crate::ui::form::draw_form;
 use crate::ui::frame::band;
+use crate::ui::group::{draw_group_bar, draw_group_name};
 use crate::ui::header::{draw_counters, draw_message, draw_title};
 use crate::ui::help::{draw_help, help_inner_height, help_inner_width, help_lines};
 use crate::ui::hints::draw_keys;
@@ -160,6 +166,7 @@ pub mod dropdown;
 pub mod filter;
 pub mod form;
 pub mod frame;
+pub mod group;
 pub mod header;
 pub mod help;
 pub mod hints;
@@ -228,11 +235,13 @@ mod tests {
             Overlay::Confirm { action: ConfirmAction::Delete(1), prompt: "确认删除「api-dev」？".into() },
             Overlay::Detail(1),
             Overlay::Filter,
+            Overlay::GroupName,
         ];
         for ov in overlays {
             let mut app = app_with_tunnels(vec![sample(1, "api-dev", 8080), sample(2, "db", 5432)]);
             app.tunnels[0].status = TunnelStatus::Up { since: Instant::now() };
             app.open_form_create(); // `Form` needs a state, and Detail needs a tunnel
+            app.open_group_create(); // ...as does GroupName
             for &w in &widths {
                 for &h in &heights {
                     // Re-assigned every frame: drawing clamps scrolls and may
@@ -270,9 +279,11 @@ mod tests {
             Overlay::Confirm { action: ConfirmAction::Delete(1), prompt: "确认删除「x」？".into() },
             Overlay::Detail(1),
             Overlay::Filter,
+            Overlay::GroupName,
         ];
         for ov in overlays {
             app.open_form_create(); // give Form a state
+            app.open_group_create(); // give GroupName a state
             app.overlay = ov.clone();
             for (w, h) in [(120u16, 40u16), (80, 24), (40, 12)] {
                 let backend = TestBackend::new(w, h);

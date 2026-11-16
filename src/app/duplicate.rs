@@ -54,7 +54,9 @@ impl App {
         self.cfg
             .tunnels
             .iter()
-            .filter(|t| t.id != cfg.id)
+            // Duplicate detection is per group: two groups may deliberately hold
+            // the same forward.
+            .filter(|t| t.id != cfg.id && t.group == cfg.group)
             .find(|t| t.forward_identity() == identity)
             .map(|t| t.name.clone())
     }
@@ -67,7 +69,11 @@ impl App {
     pub(crate) fn duplicate_in_batch(&self, cfg: &TunnelConfig, batch: &[TunnelConfig]) -> Option<String> {
         self.duplicate_of(cfg).or_else(|| {
             let identity = cfg.forward_identity();
-            batch.iter().find(|other| other.forward_identity() == identity).map(|other| other.name.clone())
+            batch
+                .iter()
+                .filter(|other| other.group == cfg.group)
+                .find(|other| other.forward_identity() == identity)
+                .map(|other| other.name.clone())
         })
     }
 
@@ -89,7 +95,12 @@ impl App {
     /// recipe as [`TunnelConfig::forward_identity`] — the two cannot drift.
     pub(crate) fn saved_forward_name(&self, forward: &crate::model::SshForward) -> Option<String> {
         let identity = forward.forward_identity(&self.cfg.defaults.bind);
-        self.cfg.tunnels.iter().find(|t| t.forward_identity() == identity).map(|t| t.name.clone())
+        self.cfg
+            .tunnels
+            .iter()
+            .filter(|t| t.group == self.browsed_group)
+            .find(|t| t.forward_identity() == identity)
+            .map(|t| t.name.clone())
     }
 }
 
@@ -109,6 +120,7 @@ mod tests {
     fn cfg(id: crate::model::TunnelId, name: &str, kind: ForwardKind) -> TunnelConfig {
         TunnelConfig {
             id,
+            group: 1,
             name: name.into(),
             kind,
             ssh_host: "cloud_pc".into(),

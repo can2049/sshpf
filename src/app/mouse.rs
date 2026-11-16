@@ -60,12 +60,13 @@ impl App {
             HitTarget::BatchAction(action) => self.request_batch(action),
             HitTarget::BatchExit => self.exit_select_mode(),
             HitTarget::BatchSelectAll => self.mark_all_toggle(),
+            HitTarget::GroupTab(id) => self.browse_to(id),
             HitTarget::FilterClear => {
                 self.filter.clear();
                 self.selected = 0;
             }
             // Containers and modal surfaces: consume, do nothing.
-            HitTarget::TunnelList | HitTarget::ImportList | HitTarget::Popup | HitTarget::FilterBar => {}
+            HitTarget::TunnelList | HitTarget::ImportList | HitTarget::Popup | HitTarget::FilterBar => {} // The group bar has no empty area to scroll; chips are handled above.
         }
         true
     }
@@ -150,6 +151,7 @@ mod tests {
     fn tunnel(id: crate::model::TunnelId, name: &str, port: u16) -> TunnelConfig {
         TunnelConfig {
             id,
+            group: 1,
             name: name.into(),
             kind: ForwardKind::Local,
             ssh_host: "h".into(),
