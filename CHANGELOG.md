@@ -10,6 +10,8 @@
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-11-16
+
 ### 新增
 
 - **分组转发。** 转发可以放进独立分组，同一时间最多一个分组处于工作状态；其余分组可浏览
@@ -18,7 +20,8 @@
   启动时只恢复上次工作的分组。不同分组可以重复同一转发、使用同一本地端口；去重 / 监听
   冲突 / 端口推荐均按组隔离，其它分组正在监听的端口不会被表单或导入当成占用。
 - **配置格式 v2**：新增 `[[groups]]`、`active_group` 和 `[[tunnels]]` 的 `group` 字段。
-  旧版单层配置会自动迁移为一个隐式工作分组，升级后仍恢复原来的 enabled 转发。
+  旧版单层配置会自动迁移为一个隐式工作分组，升级后仍恢复原来的 enabled 转发。写回的是 v2，
+  旧版本（≤0.9）读到会明确报「配置版本过高，请升级 sshpf」并退出，不会静默丢掉分组。
 
 ### 重构（无行为变化）
 
@@ -628,7 +631,9 @@ DNS 失败被错报为「未知错误」的分类。无新增依赖、无配置�
 - 不统计流量；同一主机多条转发各自建连，未做连接复用。
 - macOS 走 Unix 分支，未实测。
 
-[Unreleased]: https://github.com/can2049/sshpf/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/can2049/sshpf/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/can2049/sshpf/compare/v0.9.0...v0.10.0
+[0.9.0]: https://github.com/can2049/sshpf/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/can2049/sshpf/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/can2049/sshpf/compare/v0.6.0...v0.7.0
 [0.5.0]: https://github.com/can2049/sshpf/compare/v0.4.1...v0.5.0
