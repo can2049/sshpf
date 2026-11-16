@@ -7,12 +7,22 @@
 
 use crate::app::App;
 use crate::config::{ConfigFile, Paths};
-use crate::model::{ForwardKind, SshForward};
+use crate::model::{ForwardKind, SshForward, TunnelStatus};
 
 fn app_fresh() -> (tempfile::TempDir, App) {
     let dir = tempfile::tempdir().unwrap();
     let paths = Paths { config: dir.path().join("config.toml"), state: dir.path().join("state.toml") };
     crate::config::save(&paths.config, &ConfigFile::default()).unwrap();
+    (dir, App::new(paths))
+}
+
+/// The reported state: one group, and no group is working (`w` was pressed to
+/// stop it). Creating a forward here means "save it", never "dial it".
+fn app_with_no_working_group() -> (tempfile::TempDir, App) {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = Paths { config: dir.path().join("config.toml"), state: dir.path().join("state.toml") };
+    let cfg = ConfigFile { active_group: None, ..ConfigFile::default() };
+    crate::config::save(&paths.config, &cfg).unwrap();
     (dir, App::new(paths))
 }
 
@@ -547,4 +557,26 @@ fn editing_a_tunnel_does_not_collide_with_its_own_definition() {
     let errors = app.form.as_ref().map(|f| f.errors.clone()).unwrap_or_default();
     assert!(errors.is_empty(), "editing a tunnel is not creating a duplicate: {errors:?}");
     assert!(matches!(app.overlay, crate::app::Overlay::Confirm { .. }), "the edit still asks first");
+}
+
+#[test]
+fn creating_while_no_group_works_saves_off_instead_of_starting() {
+    // Reported regression: with no working group, a newly added forward showed
+    // `◐ 连接中` with a running timer and was counted as starting in the header,
+    // even though no runtime had been spawned. The status column is a runtime
+    // fact, not the persisted `enabled` intent, so a save into an idle group
+    // must read `○ 未启用` until `w` makes the group work — and then the kept
+    // intent starts it.
+    let (_d, mut app) = app_with_no_working_group();
+    app.open_form_create();
+    fill_hand_typed(&mut app, "cloud_pc-3082", free_port(), free_port());
+    app.submit_form();
+
+    assert_eq!(app.tunnels.len(), 1, "the forward is saved");
+    assert!(matches!(app.tunnels[0].status, TunnelStatus::Stopped), "saved, not started: {:?}", app.tunnels[0].status);
+    assert!(app.tunnels[0].cfg.enabled, "the intent to run once the group works is kept");
+    assert_eq!(app.group_running_count(app.browsed_group), 0, "the header must not count it as starting");
+    assert!(app.supervisor.ids().is_empty(), "no tunnel thread may be spawned");
+    let msg = app.status.as_ref().map(|s| s.text.clone()).unwrap_or_default();
+    assert!(msg.contains("未工作的分组") && msg.contains('w'), "the save must say how to run it: {msg}");
 }
