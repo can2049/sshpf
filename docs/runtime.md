@@ -83,6 +83,7 @@ main 线程（同步）                        每条隧道一个后台线程
 - `arm_retry` 启动时先插占位记录 `attempt = 0`；`tick_retries` 只处理 `attempt >= 1` 的记录——否则占位符会让程序在启动瞬间无限重连（集成测试抓到过的真实缺陷）。
 - **重试链放弃**记 `tunnel.retry_abandoned`（带 `attempt` + `stage` + `kind`）：重试也修不好（比如端口一直被占），退避到此为止。
 - `tunnel.failed` 带 `retryable` 字段，读者不用猜"等一下会不会自己好"。
+- 认证内部还有一次**小重试**：读 ssh-agent 身份（`读取 ssh-agent 失败: …`）遇到连接被重置 / 提前 EOF 时，重连后再读，最多 3 次（退避 250 ms、500 ms）。GNOME Keyring 48 会代理 `ssh-agent` 并在首次使用时才拉起后端，多个隧道同时恢复会撞上这个窗口；那是一次性故障，按"配置类、不重试"处理会把它变成假性的 `认证失败`。见 `src/ssh/client/auth.rs`。
 
 `tunnel.failed` 与 `tunnel.retry_abandoned` 的区别、以及按 `kind` 统计失败分布，见 [logging.md](logging.md#排查配方--recipes)。
 

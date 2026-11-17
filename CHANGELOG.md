@@ -10,6 +10,16 @@
 
 ## [Unreleased]
 
+### 修复
+
+- **ssh-agent 身份读取被重置时重连重试。** 复现环境是 GNOME Keyring 48：`$SSH_AUTH_SOCK`
+  由 keyring 代理，后端 OpenSSH `ssh-agent` 到首次使用时才被拉起；启动时同时恢复多条隧道会
+  撞上"后端还没就绪"的窗口，代理直接断开连接，客户端读到
+  `读取 ssh-agent 失败: Connection reset by peer (os error 104)`，两条隧道因此记为
+  `认证失败`（手工 `ssh` 只开一条连接、且发生在窗口之后，所以一切正常）。现在这类
+  **传输层**失败会重连后再读身份，最多 3 次（250 ms、500 ms 退避）；`PermissionDenied`、
+  `AgentFailure`、没有 socket 等真正的判定/配置错误仍然一次就报错，不拖延。
+
 ## [0.10.1] - 2026-11-16
 
 ### 变更
