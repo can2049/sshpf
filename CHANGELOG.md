@@ -10,6 +10,8 @@
 
 ## [Unreleased]
 
+## [0.10.2] - 2026-11-17
+
 ### 修复
 
 - **ssh-agent 身份读取被重置时重连重试。** 复现环境是 GNOME Keyring 48：`$SSH_AUTH_SOCK`
@@ -657,7 +659,8 @@ DNS 失败被错报为「未知错误」的分类。无新增依赖、无配置�
 - 不统计流量；同一主机多条转发各自建连，未做连接复用。
 - macOS 走 Unix 分支，未实测。
 
-[Unreleased]: https://github.com/can2049/sshpf/compare/v0.10.1...HEAD
+[Unreleased]: https://github.com/can2049/sshpf/compare/v0.10.2...HEAD
+[0.10.2]: https://github.com/can2049/sshpf/compare/v0.10.1...v0.10.2
 [0.10.1]: https://github.com/can2049/sshpf/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/can2049/sshpf/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/can2049/sshpf/compare/v0.8.0...v0.9.0
