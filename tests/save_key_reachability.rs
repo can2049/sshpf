@@ -18,12 +18,19 @@
 //! was in dispatch — a test that called `App::submit_form` directly would pass
 //! while the user still could not save.
 //!
+//! The pane these tests type into is built by hand (see
+//! [`form_with_typed_forward`]): reading it from the developer's real
+//! `~/.ssh/config` made the outcome depend on that file. A machine with a
+//! `Host cloud_pc` block reached these tests with a *ticked* row, `ctrl+s`
+//! correctly routed to the import batch, and the assertion "the typed forward
+//! was created" failed for a reason that has nothing to do with dispatch.
+//!
 //! Run with `cargo test --test save_key_reachability`.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use sshpf::app::App;
 use sshpf::config::{self, ConfigFile, Paths};
-use sshpf::model::{FormField, ForwardKind, ImportColumn, TunnelConfig};
+use sshpf::model::{FormField, ForwardKind, ImportColumn, ImportTable, SshForward, TunnelConfig};
 use sshpf::ssh::SshHost;
 
 fn ctrl(c: char) -> KeyEvent {
@@ -54,13 +61,32 @@ fn saved(id: u64, name: &str, local: u16, remote: u16, ssh_host: &str) -> Tunnel
     }
 }
 
+/// A `LocalForward` row, shaped like the ones discovery produces.
+fn imported(ssh_host: &str, listen: u16, target: u16, line: usize) -> SshForward {
+    SshForward {
+        kind: ForwardKind::Local,
+        listen_addr: "127.0.0.1".into(),
+        listen_port: listen,
+        target_host: "127.0.0.1".into(),
+        target_port: target,
+        host_alias: ssh_host.into(),
+        line,
+        raw: format!("LocalForward {listen} 127.0.0.1:{target}"),
+    }
+}
+
 /// An app with two saved `cloud_pc` forwards, a create form, `cloud_pc` picked
-/// from the dropdown (which is what fills the import pane), and the fields typed
-/// for the forward the user actually wants: `3081`.
+/// from the dropdown, the fields typed for the forward the user actually wants
+/// (`3081`), and an import pane holding rows that are **all already saved**.
 ///
-/// The pane's rows all name forwards that already exist, so under the current
-/// "already-saved rows cannot be ticked" rule they arrive unticked — the state
-/// the pane is in right after picking a host.
+/// The pane is installed explicitly instead of via
+/// `refresh_import_for_current_host`, which reads the developer's real
+/// `~/.ssh/config`: on a machine with a `Host cloud_pc` block that call puts a
+/// *creatable* (and therefore auto-ticked) row on screen, `ctrl+s` routes to the
+/// batch — correctly, per `docs/import.md` — and these dispatch tests would fail
+/// for a reason unrelated to the key. Fixed rows keep the state the tests
+/// describe, on every machine: the pane is on screen, the user can focus a
+/// filter, but it offers nothing to create.
 fn form_with_typed_forward() -> (tempfile::TempDir, App) {
     let dir = tempfile::tempdir().unwrap();
     let paths = Paths { config: dir.path().join("config.toml"), state: dir.path().join("state.toml") };
@@ -81,7 +107,11 @@ fn form_with_typed_forward() -> (tempfile::TempDir, App) {
     app.open_form_create();
     app.open_host_picker();
     app.picker_accept();
-    app.refresh_import_for_current_host();
+    let pane = ImportTable::with_existing(
+        vec![imported("cloud_pc", 18789, 18789, 9), imported("cloud_pc", 44897, 44897, 10)],
+        vec![Some("cloud_pc-L-18789-2".into()), Some("cloud_pc-L-44897-2".into())],
+    );
+    app.form.as_mut().unwrap().set_import_table("cloud_pc", pane);
     {
         let f = app.form.as_mut().unwrap();
         f.name.set("cloud_pc-3081");
@@ -93,6 +123,23 @@ fn form_with_typed_forward() -> (tempfile::TempDir, App) {
         f.mark_local_port_manual();
     }
     (dir, app)
+}
+
+/// Guards the fixture above: the tests below only prove something about the key
+/// path while the pane is on screen and offers no creatable row. If a future
+/// change made "already saved" rows creatable again, `ctrl+s` would legitimately
+/// switch to the batch and every assertion here would measure the wrong thing.
+#[test]
+fn the_fixture_pane_is_on_screen_and_offers_nothing_to_create() {
+    let (_d, mut app) = form_with_typed_forward();
+    app.begin_import_filter(ImportColumn::Raw);
+
+    let form = app.form.as_ref().expect("the form is open");
+    assert!(app.import_pane_open(), "the pane must be on screen, or the filter focus is not exercised");
+    assert_eq!(form.import.importable_count(), 0, "every row is already saved");
+    assert_eq!(form.import.checked_count(), 0, "nothing ticked, so the batch has no body");
+    assert!(form.import.touched, "focusing a filter as the user did marks the pane used");
+    assert!(form.is_complete(), "the typed fields stand on their own");
 }
 
 /// True when the forward the user typed exists. Creation is what "the save

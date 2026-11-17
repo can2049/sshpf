@@ -127,6 +127,7 @@ Windows 上没有跨进程的断言，因为已经不存在跨进程行为：一
 | `arm_retry` 占位记录导致启动瞬间无限重连 | 集成测试 |
 | 多跳 `ProxyJump` 只用第一跳 | 端到端 |
 | `-R` 假就绪（`Entering interactive session.` 早于真正成功） | 结构性修复，见 [runtime.md](runtime.md#就绪判定--readiness) |
+| `save_key_reachability` 读开发机真实的 `~/.ssh/config`：本机有 `Host cloud_pc` 时 3 条必红 | 夹具不封闭——面板默认勾上的行按文档规则抢走 `ctrl+s`，断言测的就不再是按键派发 |
 
 ## 测试的硬边界 / What tests must not do
 
